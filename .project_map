@@ -1,0 +1,71 @@
+# sagy Project Map
+> Generated: 2026年 8月20日 星期四 01时45分34秒 CST
+> Strategy: Source Focused (src expanded, target collapsed)
+
+## Package
+
+- name: sagy
+- version: 0.1.0
+- edition: 2024
+- description: Cross-platform account-aware launcher and scheduler for Google Antigravity CLI (agy).
+- dependencies (17): anyhow, base64, chacha20poly1305, chrono, clap, directories, flate2, reqwest, serde, serde_json, self-replace, sha2, tar, unicode-width, uuid, zip, toml
+
+## Rust Modules
+
+- crate root: lib, main
+- adapters: mod
+- adapters::antigravity: account, auth, launcher, mod, paths, repo_sync, ui, usage
+- bin: flash, pro, think
+- cli: args, help, launch, mod, repo_sync
+- core: mod, policy, state, storage, ui, update
+
+## Directory Structure
+```text
+|-- [D] .github/
+|   -- [D] workflows/
+|       -- [F] release.yml
+|-- [D] scripts/
+|   -- [F] map_project.py
+|-- [D] src/
+|   |-- [D] adapters/
+|   |   |-- [D] antigravity/
+|   |   |   |-- [F] account.rs
+|   |   |   |-- [F] auth.rs
+|   |   |   |-- [F] launcher.rs
+|   |   |   |-- [F] mod.rs
+|   |   |   |-- [F] paths.rs
+|   |   |   |-- [F] repo_sync.rs
+|   |   |   |-- [F] ui.rs
+|   |   |   -- [F] usage.rs
+|   |   -- [F] mod.rs
+|   |-- [D] bin/
+|   |   |-- [F] flash.rs
+|   |   |-- [F] pro.rs
+|   |   -- [F] think.rs
+|   |-- [D] cli/
+|   |   |-- [F] args.rs
+|   |   |-- [F] help.rs
+|   |   |-- [F] launch.rs
+|   |   |-- [F] mod.rs
+|   |   -- [F] repo_sync.rs
+|   |-- [D] core/
+|   |   |-- [F] mod.rs
+|   |   |-- [F] policy.rs
+|   |   |-- [F] state.rs
+|   |   |-- [F] storage.rs
+|   |   |-- [F] ui.rs
+|   |   -- [F] update.rs
+|   |-- [F] lib.rs
+|   -- [F] main.rs
+|-- [D] target/  [collapsed: 5032 files]
+|-- [F] AGENTS.md
+|-- [F] ARCHITECTURE.md
+|-- [F] Cargo.lock
+|-- [F] Cargo.toml
+|-- [F] CLAUDE.md
+|-- [F] install.ps1
+|-- [F] install.sh
+|-- [F] README.md
+|-- [F] README.zh-CN.md
+-- [F] rust-toolchain.toml
+```

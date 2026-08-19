@@ -1,0 +1,7 @@
+/target
+/.gemini/
+/.sagy-account-pool/
+/accounts/
+/state.json
+/.state.json.tmp
+.DS_Store

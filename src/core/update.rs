@@ -1,0 +1,254 @@
+use std::env;
+use std::fs;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use flate2::read::GzDecoder;
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use serde::Deserialize;
+use tar::Archive;
+use uuid::Uuid;
+use zip::ZipArchive;
+
+use crate::core::storage;
+
+const DEFAULT_REPO: &str = "lauzhihao/sagy";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseTarget {
+    pub triple: &'static str,
+    pub archive_ext: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAsset {
+    pub repo: String,
+    pub tag: String,
+    pub version: String,
+    pub target: ReleaseTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateStatus {
+    Updated,
+    AlreadyCurrent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateOutcome {
+    pub status: UpdateStatus,
+    pub previous_version: String,
+    pub installed_version: String,
+    pub executable_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+}
+
+pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
+    let executable_path =
+        env::current_exe().context("failed to resolve current executable path")?;
+    let previous_version = env!("CARGO_PKG_VERSION").to_string();
+    let asset = resolve_release_asset()?;
+
+    if asset.version == previous_version && !force {
+        return Ok(UpdateOutcome {
+            status: UpdateStatus::AlreadyCurrent,
+            previous_version: previous_version.clone(),
+            installed_version: previous_version,
+            executable_path,
+        });
+    }
+
+    let binary = download_release_binary(&asset)?;
+    let temp_root = storage::tmp_dir(state_dir);
+    fs::create_dir_all(&temp_root)
+        .with_context(|| format!("failed to create {}", temp_root.display()))?;
+    let temp_dir = temp_root.join(format!("update-{}", Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+    let temp_binary = temp_dir.join(binary_filename_for_current_platform("sagy"));
+    fs::write(&temp_binary, &binary)
+        .with_context(|| format!("failed to write {}", temp_binary.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&temp_binary)
+            .with_context(|| format!("failed to stat {}", temp_binary.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&temp_binary, permissions)
+            .with_context(|| format!("failed to chmod {}", temp_binary.display()))?;
+    }
+
+    self_replace::self_replace(&temp_binary)
+        .with_context(|| format!("failed to replace {}", executable_path.display()))?;
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    Ok(UpdateOutcome {
+        status: UpdateStatus::Updated,
+        previous_version,
+        installed_version: asset.version,
+        executable_path,
+    })
+}
+
+fn resolve_release_asset() -> Result<ReleaseAsset> {
+    let target = current_release_target()?;
+    let repo = env::var("SAGY_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
+    let release = fetch_latest_release(&repo)?;
+    let tag = release.tag_name.trim().to_string();
+    let version = tag
+        .strip_prefix('v')
+        .unwrap_or(&tag)
+        .trim()
+        .to_string();
+    Ok(ReleaseAsset {
+        repo,
+        tag,
+        version,
+        target,
+    })
+}
+
+fn fetch_latest_release(repo: &str) -> Result<GithubRelease> {
+    let client = http_client()?;
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("failed to fetch latest release from {url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "GitHub release lookup for {repo} returned HTTP {}",
+            response.status()
+        );
+    }
+    response
+        .json::<GithubRelease>()
+        .with_context(|| format!("failed to decode release payload from {url}"))
+}
+
+fn download_release_binary(asset: &ReleaseAsset) -> Result<Vec<u8>> {
+    let client = http_client()?;
+    let asset_name = format!(
+        "sagy-{}-{}.{}",
+        asset.tag, asset.target.triple, asset.target.archive_ext
+    );
+    let download_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        asset.repo, asset.tag, asset_name
+    );
+    let response = client
+        .get(&download_url)
+        .send()
+        .with_context(|| format!("failed to download asset from {download_url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "failed to download release asset from {download_url}: HTTP {}",
+            response.status()
+        );
+    }
+
+    let bytes = response
+        .bytes()
+        .with_context(|| format!("failed to read payload from {download_url}"))?
+        .to_vec();
+
+    unpack_binary_from_archive(&bytes, asset.target.archive_ext, "sagy")
+}
+
+fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result<Vec<u8>> {
+    let expected_name = binary_filename_for_current_platform(bin_name);
+    match ext {
+        "tar.gz" | "tgz" => {
+            let decoder = GzDecoder::new(Cursor::new(bytes));
+            let mut archive = Archive::new(decoder);
+            for entry in archive.entries().context("invalid tar archive")? {
+                let mut entry = entry.context("invalid tar entry")?;
+                let path = entry.path().context("invalid entry path")?;
+                if let Some(file_name) = path.file_name() {
+                    if file_name == expected_name.as_str() {
+                        let mut buffer = Vec::new();
+                        entry
+                            .read_to_end(&mut buffer)
+                            .context("failed to read binary from archive")?;
+                        return Ok(buffer);
+                    }
+                }
+            }
+            bail!("binary {expected_name} not found in tar archive");
+        }
+        "zip" => {
+            let mut archive =
+                ZipArchive::new(Cursor::new(bytes)).context("invalid zip archive")?;
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).context("invalid zip entry")?;
+                if file.name().ends_with(&expected_name) {
+                    let mut buffer = Vec::new();
+                    file.read_to_end(&mut buffer)
+                        .context("failed to read binary from zip archive")?;
+                    return Ok(buffer);
+                }
+            }
+            bail!("binary {expected_name} not found in zip archive");
+        }
+        _ => bail!("unsupported archive extension: {ext}"),
+    }
+}
+
+fn http_client() -> Result<Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("sagy-updater/0.1.0"),
+    );
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github.v3+json"),
+    );
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("failed to construct HTTP client")
+}
+
+pub fn current_release_target() -> Result<ReleaseTarget> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Ok(ReleaseTarget {
+            triple: "aarch64-apple-darwin",
+            archive_ext: "tar.gz",
+        })
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Ok(ReleaseTarget {
+            triple: "x86_64-apple-darwin",
+            archive_ext: "tar.gz",
+        })
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Ok(ReleaseTarget {
+            triple: "x86_64-unknown-linux-musl",
+            archive_ext: "tar.gz",
+        })
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Ok(ReleaseTarget {
+            triple: "x86_64-pc-windows-msvc",
+            archive_ext: "zip",
+        })
+    } else {
+        bail!("unsupported target platform for auto-update")
+    }
+}
+
+fn binary_filename_for_current_platform(base_name: &str) -> String {
+    if cfg!(windows) {
+        format!("{base_name}.exe")
+    } else {
+        base_name.to_string()
+    }
+}
