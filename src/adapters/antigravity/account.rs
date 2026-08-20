@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
@@ -12,6 +12,25 @@ use crate::adapters::antigravity::paths::{
 };
 use crate::core::state::{AccountRecord, AccountType, State, UsageSnapshot};
 use crate::core::storage;
+
+pub fn is_valid_oauth_credential(json: &Value) -> bool {
+    if !json.is_object() {
+        return false;
+    }
+    json.get("access_token").is_some()
+        || json.get("refresh_token").is_some()
+        || json.get("token").is_some()
+        || json.get("client_secret").is_some()
+        || json.get("type").and_then(Value::as_str) == Some("authorized_user")
+        || json.get("type").and_then(Value::as_str) == Some("service_account")
+}
+
+pub fn is_valid_api_key_credential(json: &Value) -> bool {
+    if !json.is_object() {
+        return false;
+    }
+    json.get("api_key").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).is_some()
+}
 
 impl super::AntigravityAdapter {
     pub fn import_known_sources(&self, state_dir: &Path, state: &mut State) -> Vec<AccountRecord> {
@@ -39,18 +58,11 @@ impl super::AntigravityAdapter {
             }
         }
 
-        // 2. Try importing ~/.gemini/oauth_creds.json or google_accounts.json
+        // 2. Try importing ~/.gemini/oauth_creds.json
         if let Some(gemini_home) = default_gemini_home() {
             let oauth_path = gemini_home.join("oauth_creds.json");
             if oauth_path.is_file() {
                 if let Ok(record) = self.import_auth_path(state_dir, state, &oauth_path) {
-                    imported.push(record);
-                }
-            }
-
-            let accounts_path = gemini_home.join("google_accounts.json");
-            if accounts_path.is_file() {
-                if let Ok(record) = self.import_auth_path(state_dir, state, &accounts_path) {
                     imported.push(record);
                 }
             }
@@ -72,22 +84,57 @@ impl super::AntigravityAdapter {
         let json_val: Value = serde_json::from_str(&content)
             .with_context(|| format!("invalid JSON in {}", raw_path.display()))?;
 
-        // Extract email or identify account
-        let email = json_val
+        // Validate that this JSON actually contains recognizable credentials
+        let is_api = is_valid_api_key_credential(&json_val);
+        let is_service_account = json_val.get("type").and_then(Value::as_str) == Some("service_account");
+        let is_oauth = is_valid_oauth_credential(&json_val);
+
+        if !is_api && !is_service_account && !is_oauth {
+            bail!(
+                "File {} does not contain valid Antigravity or Gemini credentials (must contain token, oauth keys, or api_key)",
+                raw_path.display()
+            );
+        }
+
+        // Try reading active email from google_accounts.json if not present in the cred file
+        let mut email_opt = json_val
             .get("email")
             .or_else(|| json_val.get("client_email"))
             .or_else(|| json_val.get("account"))
             .or_else(|| json_val.get("user"))
             .and_then(Value::as_str)
-            .unwrap_or_else(|| {
-                if let Some(stem) = raw_path.file_stem().and_then(|s| s.to_str()) {
-                    stem
-                } else {
-                    "imported-account@gemini"
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if email_opt.is_none() {
+            if let Some(gemini_home) = default_gemini_home() {
+                let google_accounts_path = gemini_home.join("google_accounts.json");
+                if google_accounts_path.is_file() {
+                    if let Ok(ga_content) = fs::read_to_string(&google_accounts_path) {
+                        if let Ok(ga_json) = serde_json::from_str::<Value>(&ga_content) {
+                            if let Some(active_email) = ga_json.get("active").and_then(Value::as_str) {
+                                let trimmed = active_email.trim();
+                                if !trimmed.is_empty() {
+                                    email_opt = Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
                 }
-            })
-            .trim()
-            .to_string();
+            }
+        }
+
+        let email = email_opt.unwrap_or_else(|| {
+            if let Some(stem) = raw_path.file_stem().and_then(|s| s.to_str()) {
+                if stem == "oauth_creds" {
+                    "google-oauth-user@gemini".to_string()
+                } else {
+                    format!("{stem}@gemini")
+                }
+            } else {
+                "imported-account@gemini".to_string()
+            }
+        });
 
         let account_id = self
             .find_account_by_email(state, &email)
@@ -106,9 +153,9 @@ impl super::AntigravityAdapter {
         let record = AccountRecord {
             id: account_id.clone(),
             email: email.clone(),
-            account_type: if json_val.get("api_key").is_some() {
+            account_type: if is_api {
                 AccountType::ApiKey
-            } else if json_val.get("type").and_then(Value::as_str) == Some("service_account") {
+            } else if is_service_account {
                 AccountType::Vertex
             } else {
                 AccountType::OAuth
@@ -123,7 +170,13 @@ impl super::AntigravityAdapter {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             identity_fingerprint: None,
-            plan: Some("Antigravity".to_string()),
+            plan: if is_api {
+                Some("Gemini API Key".to_string())
+            } else if is_service_account {
+                Some("Vertex AI".to_string())
+            } else {
+                Some("Antigravity OAuth".to_string())
+            },
             auth_path: target_cred.to_string_lossy().into_owned(),
             config_path: None,
             oauth_token: json_val
@@ -198,7 +251,7 @@ impl super::AntigravityAdapter {
             project_id: None,
             account_id: None,
             identity_fingerprint: None,
-            plan: plan_label.map(ToString::to_string).or_else(|| Some("Antigravity".to_string())),
+            plan: plan_label.map(ToString::to_string).or_else(|| Some("Antigravity OAuth".to_string())),
             auth_path: token_path.to_string_lossy().into_owned(),
             config_path: None,
             oauth_token: Some(token.to_string()),
@@ -258,3 +311,56 @@ impl super::AntigravityAdapter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_oauth_credential() {
+        let valid_oauth = serde_json::json!({
+            "access_token": "ya29.sample",
+            "refresh_token": "1//sample",
+            "token_type": "Bearer"
+        });
+        assert!(is_valid_oauth_credential(&valid_oauth));
+
+        let google_accounts_json = serde_json::json!({
+            "active": "user@gmail.com",
+            "old": []
+        });
+        assert!(!is_valid_oauth_credential(&google_accounts_json));
+
+        let random_json = serde_json::json!({
+            "foo": "bar"
+        });
+        assert!(!is_valid_oauth_credential(&random_json));
+    }
+
+    #[test]
+    fn test_is_valid_api_key_credential() {
+        let valid_api = serde_json::json!({
+            "api_key": "AIzaSySampleKey123"
+        });
+        assert!(is_valid_api_key_credential(&valid_api));
+
+        let invalid_api = serde_json::json!({
+            "api_key": "   "
+        });
+        assert!(!is_valid_api_key_credential(&invalid_api));
+    }
+
+    #[test]
+    fn test_import_auth_path_rejects_google_accounts_json() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+        let ga_file = state_dir.join("google_accounts.json");
+        fs::write(&ga_file, r#"{"active":"test@gmail.com","old":[]}"#).expect("write ga");
+
+        let adapter = crate::adapters::antigravity::AntigravityAdapter::default();
+        let mut state = State::default();
+        let result = adapter.import_auth_path(state_dir, &mut state, &ga_file);
+        assert!(result.is_err());
+    }
+}
+

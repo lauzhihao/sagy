@@ -1197,6 +1197,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "toml",
  "unicode-width",
  "uuid",

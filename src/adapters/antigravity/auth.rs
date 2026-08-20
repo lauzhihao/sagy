@@ -3,7 +3,9 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 
+use crate::adapters::antigravity::account::is_valid_oauth_credential;
 use crate::adapters::antigravity::paths::{
     default_antigravity_cli_home, default_gemini_home,
 };
@@ -32,30 +34,50 @@ impl super::AntigravityAdapter {
             bail!("Account credentials not found at {}", auth_path.display());
         }
 
-        // 1. If it's a token file, copy to default antigravity-oauth-token location
-        if let Some(cli_home) = default_antigravity_cli_home() {
-            fs::create_dir_all(&cli_home)
-                .with_context(|| format!("failed to create {}", cli_home.display()))?;
+        match account.account_type {
+            AccountType::OAuth => {
+                // 1. If it has a raw oauth token, copy to ~/.gemini/antigravity-cli/antigravity-oauth-token
+                if let Some(cli_home) = default_antigravity_cli_home() {
+                    fs::create_dir_all(&cli_home)
+                        .with_context(|| format!("failed to create {}", cli_home.display()))?;
 
-            if let Some(token) = &account.oauth_token {
-                let target_token = cli_home.join("antigravity-oauth-token");
-                let temp_token = cli_home.join(".antigravity-oauth-token.tmp");
-                fs::write(&temp_token, token)?;
-                fs::rename(&temp_token, &target_token)?;
+                    if let Some(token) = &account.oauth_token {
+                        let target_token = cli_home.join("antigravity-oauth-token");
+                        let temp_token = cli_home.join(".antigravity-oauth-token.tmp");
+                        fs::write(&temp_token, token)?;
+                        fs::rename(&temp_token, &target_token)?;
+                    } else if auth_path.file_name().and_then(|s| s.to_str()) == Some("antigravity-oauth-token") {
+                        let target_token = cli_home.join("antigravity-oauth-token");
+                        let temp_token = cli_home.join(".antigravity-oauth-token.tmp");
+                        let token = fs::read_to_string(auth_path)?;
+                        fs::write(&temp_token, token)?;
+                        fs::rename(&temp_token, &target_token)?;
+                    }
+                }
+
+                // 2. If it's a full Google OAuth JSON credential, validate and copy to ~/.gemini/oauth_creds.json
+                if let Some(gemini_home) = default_gemini_home() {
+                    if auth_path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        let content = fs::read_to_string(auth_path)?;
+                        if let Ok(json_val) = serde_json::from_str::<Value>(&content) {
+                            if is_valid_oauth_credential(&json_val) {
+                                fs::create_dir_all(&gemini_home)
+                                    .with_context(|| format!("failed to create {}", gemini_home.display()))?;
+                                let target_creds = gemini_home.join("oauth_creds.json");
+                                let temp_creds = gemini_home.join(".oauth_creds.json.tmp");
+                                fs::write(&temp_creds, &content)?;
+                                fs::rename(&temp_creds, &target_creds)?;
+                            }
+                        }
+                    }
+                }
             }
-        }
-
-        // 2. If it's an oauth_creds / general credentials json, copy to ~/.gemini/
-        if let Some(gemini_home) = default_gemini_home() {
-            fs::create_dir_all(&gemini_home)
-                .with_context(|| format!("failed to create {}", gemini_home.display()))?;
-
-            if auth_path.extension().and_then(|s| s.to_str()) == Some("json") {
-                let target_creds = gemini_home.join("oauth_creds.json");
-                let temp_creds = gemini_home.join(".oauth_creds.json.tmp");
-                let content = fs::read_to_string(auth_path)?;
-                fs::write(&temp_creds, content)?;
-                fs::rename(&temp_creds, &target_creds)?;
+            AccountType::ApiKey => {
+                // API key accounts are injected via environment variable (GEMINI_API_KEY) at launch time.
+                // Do NOT touch or overwrite ~/.gemini/oauth_creds.json or antigravity-oauth-token!
+            }
+            AccountType::Vertex => {
+                // Vertex service accounts are injected via GOOGLE_APPLICATION_CREDENTIALS / project_id.
             }
         }
 
@@ -143,3 +165,51 @@ impl super::AntigravityAdapter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_switch_api_key_account_does_not_mutate_oauth_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+        let cred_file = state_dir.join("credentials.json");
+        fs::write(&cred_file, r#"{"api_key":"test_key","email":"api@user"}"#).expect("write");
+
+        let account = AccountRecord {
+            id: "api-acc-1".to_string(),
+            email: "api@user".to_string(),
+            account_type: AccountType::ApiKey,
+            api_key: Some("test_key".to_string()),
+            auth_path: cred_file.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let adapter = super::super::AntigravityAdapter::default();
+        let switch_res = adapter.switch_account(&account);
+        assert!(switch_res.is_ok());
+    }
+
+    #[test]
+    fn test_switch_token_account_writes_token_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+        let token_file = state_dir.join("antigravity-oauth-token");
+        fs::write(&token_file, "jwt_token_sample").expect("write");
+
+        let account = AccountRecord {
+            id: "token-acc-1".to_string(),
+            email: "token@user".to_string(),
+            account_type: AccountType::OAuth,
+            oauth_token: Some("jwt_token_sample".to_string()),
+            auth_path: token_file.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let adapter = super::super::AntigravityAdapter::default();
+        let switch_res = adapter.switch_account(&account);
+        assert!(switch_res.is_ok());
+    }
+}
+

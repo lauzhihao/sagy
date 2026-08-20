@@ -159,15 +159,50 @@ impl super::AntigravityAdapter {
         let decrypted_bytes = decrypt_bytes(&payload, &bundle_key)?;
         let bundle: AccountPoolBundle = serde_json::from_slice(&decrypted_bytes)
             .context("failed to decode decrypted account pool bundle JSON")?;
-
         let mut imported_count = 0;
-        for account in bundle.accounts {
+        for mut account in bundle.accounts {
             let acc_dir = account_dir(state_dir, &account.id);
             fs::create_dir_all(&acc_dir)?;
 
             if let Some(token) = &account.oauth_token {
                 let token_file = super::paths::account_token_file(&acc_dir);
                 fs::write(&token_file, token)?;
+                account.auth_path = token_file.to_string_lossy().into_owned();
+            } else if let Some(api_key) = &account.api_key {
+                let cred_file = super::paths::account_credentials_file(&acc_dir);
+                let creds_json = serde_json::json!({
+                    "api_key": api_key,
+                    "email": account.email,
+                    "project_id": account.project_id,
+                });
+                let _ = fs::write(&cred_file, serde_json::to_string_pretty(&creds_json).unwrap_or_default());
+                account.auth_path = cred_file.to_string_lossy().into_owned();
+            } else {
+                let cred_file = super::paths::account_credentials_file(&acc_dir);
+                if !cred_file.exists() && account.refresh_token.is_some() {
+                    let creds_json = serde_json::json!({
+                        "email": account.email,
+                        "refresh_token": account.refresh_token,
+                        "project_id": account.project_id,
+                    });
+                    let _ = fs::write(&cred_file, serde_json::to_string_pretty(&creds_json).unwrap_or_default());
+                }
+                account.auth_path = cred_file.to_string_lossy().into_owned();
+            }
+
+            if !state.usage_cache.contains_key(&account.id) {
+                state.usage_cache.insert(
+                    account.id.clone(),
+                    crate::core::state::UsageSnapshot {
+                        plan: account.plan.clone(),
+                        status: "Ready".to_string(),
+                        cooldown_until: None,
+                        remaining_quota_percent: Some(100),
+                        last_synced_at: Some(chrono::Utc::now().timestamp()),
+                        last_sync_error: None,
+                        needs_relogin: false,
+                    },
+                );
             }
 
             if let Some(idx) = state.accounts.iter().position(|a| a.id == account.id) {

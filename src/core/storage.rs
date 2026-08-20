@@ -78,6 +78,7 @@ pub fn load_state(state_dir: &Path) -> Result<State> {
         .with_context(|| format!("failed to read {}", state_file.display()))?;
     let mut state: State = serde_json::from_str(&contents)
         .with_context(|| format!("invalid state file: {}", state_file.display()))?;
+    cleanup_invalid_legacy_accounts(&mut state);
     normalize_state_account_paths(state_dir, &mut state);
     Ok(state)
 }
@@ -152,15 +153,116 @@ pub fn expand_user_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn cleanup_invalid_legacy_accounts(state: &mut State) {
+    let mut dropped_ids = Vec::new();
+    state.accounts.retain(|account| {
+        let is_bogus_google_accounts = account.email.eq_ignore_ascii_case("google_accounts")
+            && account.oauth_token.is_none()
+            && account.api_key.is_none()
+            && account.refresh_token.is_none();
+        if is_bogus_google_accounts {
+            dropped_ids.push(account.id.clone());
+        }
+        !is_bogus_google_accounts
+    });
+    for id in &dropped_ids {
+        state.usage_cache.remove(id);
+        if state.current_account_id.as_deref() == Some(id.as_str()) {
+            state.current_account_id = None;
+        }
+    }
+}
+
 fn normalize_state_account_paths(state_dir: &Path, state: &mut State) {
     let accounts_root = accounts_dir(state_dir);
     for account in &mut state.accounts {
         let account_root = accounts_root.join(&account.id);
-        let expected_auth_path = account_root.join("credentials.json");
-        account.auth_path = expected_auth_path.to_string_lossy().into_owned();
+        let token_file = account_root.join("antigravity-oauth-token");
+        let creds_file = account_root.join("credentials.json");
+
+        if let Some(token) = &account.oauth_token {
+            if !token_file.exists() {
+                let _ = fs::create_dir_all(&account_root);
+                let _ = fs::write(&token_file, token);
+            }
+            account.auth_path = token_file.to_string_lossy().into_owned();
+        } else if let Some(api_key) = &account.api_key {
+            if !creds_file.exists() {
+                let _ = fs::create_dir_all(&account_root);
+                let creds_json = serde_json::json!({
+                    "api_key": api_key,
+                    "email": account.email,
+                    "project_id": account.project_id,
+                });
+                let _ = fs::write(&creds_file, serde_json::to_string_pretty(&creds_json).unwrap_or_default());
+            }
+            account.auth_path = creds_file.to_string_lossy().into_owned();
+        } else if token_file.exists() {
+            account.auth_path = token_file.to_string_lossy().into_owned();
+        } else {
+            account.auth_path = creds_file.to_string_lossy().into_owned();
+        }
+
         let expected_config_path = account_root.join("settings.json");
         if expected_config_path.exists() {
             account.config_path = Some(expected_config_path.to_string_lossy().into_owned());
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::state::{AccountRecord, AccountType};
+
+    #[test]
+    fn test_token_account_paths_persist_across_load_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+
+        let mut state = State::default();
+        let acc_id = "test-token-acc-123";
+        let acc_root = accounts_dir(state_dir).join(acc_id);
+        fs::create_dir_all(&acc_root).expect("create acc dir");
+        let token_path = acc_root.join("antigravity-oauth-token");
+        fs::write(&token_path, "sample_jwt_token_12345").expect("write token");
+
+        let record = AccountRecord {
+            id: acc_id.to_string(),
+            email: "user@example.com".to_string(),
+            account_type: AccountType::OAuth,
+            oauth_token: Some("sample_jwt_token_12345".to_string()),
+            auth_path: token_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        state.accounts.push(record);
+        save_state(state_dir, &state).expect("save state");
+
+        // Reload state
+        let loaded = load_state(state_dir).expect("load state");
+        assert_eq!(loaded.accounts.len(), 1);
+        let loaded_acc = &loaded.accounts[0];
+        assert_eq!(loaded_acc.id, acc_id);
+        assert_eq!(loaded_acc.auth_path, token_path.to_string_lossy().as_ref());
+        assert!(Path::new(&loaded_acc.auth_path).exists());
+    }
+
+    #[test]
+    fn test_cleanup_invalid_legacy_google_accounts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+
+        let mut state = State::default();
+        state.accounts.push(AccountRecord {
+            id: "fake-ga-id".to_string(),
+            email: "google_accounts".to_string(),
+            account_type: AccountType::OAuth,
+            ..Default::default()
+        });
+        save_state(state_dir, &state).expect("save state");
+
+        let loaded = load_state(state_dir).expect("load state");
+        assert_eq!(loaded.accounts.len(), 0);
+    }
+}
+
