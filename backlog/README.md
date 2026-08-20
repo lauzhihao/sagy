@@ -39,7 +39,7 @@ backlog/
 一键跑全部：
 
 ```bash
-for s in 001 002 003 004 005 006 007 008 009 011 012; do
+for s in 001 002 004 005 006 007 008 011 012 013; do
   printf '%-10s ' "bugs-$s"; bash backlog/verify/bugs-$s.sh >/dev/null 2>&1 \
     && echo PASS || echo FAIL
 done
@@ -61,33 +61,37 @@ done
 
 ## 当前记分板
 
-对未提交工作树的验收结果（强模型执行，脚本判定）：
+对 ab04cd6 的验收结果（脚本判定，2026-08-20）：
 
 | 编号 | 结果 | 说明 |
 | :--- | :--- | :--- |
 | 001 cargo test 污染凭据 | PASS | |
 | 002 过期 token 阻塞启动 | PASS | |
-| 003 model ID 错误 | PASS | |
-| 004 凭据文件权限 | **FAIL** | 文件已 0600，但 `accounts/` 目录仍是 0755 |
+| 004 凭据文件与目录权限 | **FAIL** | 文件已 0600，`accounts/` 目录仍 0755 |
 | 005 429 冷却不可达 | PASS | |
 | 006 探测无 TTL | PASS | |
 | 007 凭据进 URL | PASS | |
 | 008 自更新无校验 | PASS | |
-| 009 fs::copy 自拷贝 | PASS | |
-| 010 alias 吞子命令 | 阻塞 | 需操作者先定设计意图，见下 |
 | 011 SSH host key | PASS | |
 | 012 死代码清理 | PASS | |
+| 013 删除模型别名 | **FAIL** | 新工单，尚未执行 |
 
-未完成项已转写为 `tasks-v2/bugs-004a-secure-dir-permissions.md`。
+已退役的验收脚本：
 
-## 待操作者决策
+- `bugs-003.sh`（model ID 正确性）——别名删除后由 `bugs-013.sh` 覆盖
+- `bugs-009.sh`（fs::copy 自拷贝守卫）——`sync_sibling_binaries` 随别名一并删除，问题消失
 
-**bugs-010**：`flash list` / `flash update` 目前会被当作 prompt 转发给 agy。
-两种设计都自洽，必须先选一个才能写工单：
+## 待执行工单
 
-- A. alias 就是纯启动器，不接受任何 sagy 子命令。
-  代价：文档要写清楚，`flash update` 静默不更新会让人困惑。
-- B. alias 也能跑 sagy 子命令，按第一个非 flag 参数是否命中 `is_known_subcmd` 分流。
-  代价：必须先修 bugs-009 的自拷贝守卫，否则 `flash update` 会把三个别名二进制清零。
+| 工单 | 自检命令 |
+| :--- | :--- |
+| `tasks-v2/bugs-004a-secure-dir-permissions.md` | `bash backlog/verify/bugs-004.sh` |
+| `tasks-v2/bugs-013-drop-model-aliases.md` | `bash backlog/verify/bugs-013.sh` |
 
-选定之前不下发工单。
+## 已决策事项
+
+- **不按模型分入口。** 不做 sclaude 那样的 opus/sonnet 式模型子入口。
+  `flash` / `pro` / `think` 三个别名二进制全部删除，只保留 `sagy` 与 `sagy-original`。
+- **默认模型固定为 `gemini-3.7-flash-high`。** 需要切换到 pro 或其它模型时，
+  由用户在 agy 交互界面内自行操作，sagy 不介入。
+- **sagy 的职责边界**：账号选择与凭据切换，加上一个默认模型。不做模型编排。
