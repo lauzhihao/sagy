@@ -189,17 +189,28 @@ impl super::AntigravityAdapter {
             }
         });
 
-        let account_id = self
-            .find_account_by_email(state, &email)
+        let secret_payload = json_val
+            .get("token")
+            .or_else(|| json_val.get("access_token"))
+            .or_else(|| json_val.get("api_key"))
+            .or_else(|| json_val.get("refresh_token"))
+            .and_then(Value::as_str)
+            .unwrap_or(&content);
+        let fingerprint = compute_credential_fingerprint(secret_payload);
+
+        let account_id = state
+            .accounts
+            .iter()
+            .find(|a| {
+                a.identity_fingerprint.as_deref() == Some(&fingerprint)
+                    || a.email.eq_ignore_ascii_case(&email)
+            })
             .map(|a| a.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let acc_dir = account_dir(state_dir, &account_id);
-        fs::create_dir_all(&acc_dir)
-            .with_context(|| format!("failed to create account dir {}", acc_dir.display()))?;
-
         let target_cred = account_credentials_file(&acc_dir);
-        fs::write(&target_cred, &content)
+        storage::write_secret_file(&target_cred, content.as_bytes())
             .with_context(|| format!("failed to write {}", target_cred.display()))?;
 
         let now = Utc::now().timestamp();
@@ -222,7 +233,7 @@ impl super::AntigravityAdapter {
                 .get("account_id")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-            identity_fingerprint: None,
+            identity_fingerprint: Some(fingerprint),
             plan: if is_api {
                 Some("Gemini API Key".to_string())
             } else if is_service_account {
@@ -282,17 +293,20 @@ impl super::AntigravityAdapter {
         token: &str,
         plan_label: Option<&str>,
     ) -> Result<AccountRecord> {
-        let account_id = self
-            .find_account_by_email(state, email)
+        let fingerprint = compute_credential_fingerprint(token);
+        let account_id = state
+            .accounts
+            .iter()
+            .find(|a| {
+                a.identity_fingerprint.as_deref() == Some(&fingerprint)
+                    || a.email.eq_ignore_ascii_case(email)
+            })
             .map(|a| a.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let acc_dir = account_dir(state_dir, &account_id);
-        fs::create_dir_all(&acc_dir)
-            .with_context(|| format!("failed to create account dir {}", acc_dir.display()))?;
-
         let token_path = account_token_file(&acc_dir);
-        fs::write(&token_path, token)
+        storage::write_secret_file(&token_path, token.as_bytes())
             .with_context(|| format!("failed to write {}", token_path.display()))?;
 
         let now = Utc::now().timestamp();
@@ -303,7 +317,7 @@ impl super::AntigravityAdapter {
             provider_id: Some("antigravity-oauth".to_string()),
             project_id: None,
             account_id: None,
-            identity_fingerprint: None,
+            identity_fingerprint: Some(fingerprint),
             plan: plan_label
                 .map(ToString::to_string)
                 .or_else(|| Some("Antigravity OAuth".to_string())),
@@ -367,6 +381,13 @@ impl super::AntigravityAdapter {
     }
 }
 
+pub fn compute_credential_fingerprint(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(secret.trim().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +437,26 @@ mod tests {
         let mut state = State::default();
         let result = adapter.import_auth_path(state_dir, &mut state, &ga_file);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_credential_fingerprint_deduplication() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+
+        let raw_token = "eyJh.sample_jwt_payload_1.sig";
+        let rec1 = adapter
+            .import_or_update_token(state_dir, &mut state, "acc1@gmail.com", raw_token, None)
+            .unwrap();
+        assert_eq!(state.accounts.len(), 1);
+
+        // Import same token with different email -> deduplicates to same account ID
+        let rec2 = adapter
+            .import_or_update_token(state_dir, &mut state, "acc2@gmail.com", raw_token, None)
+            .unwrap();
+        assert_eq!(state.accounts.len(), 1);
+        assert_eq!(rec1.id, rec2.id);
     }
 }

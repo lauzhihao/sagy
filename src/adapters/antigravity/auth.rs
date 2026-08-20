@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::adapters::antigravity::account::is_valid_oauth_credential;
@@ -36,22 +36,14 @@ impl super::AntigravityAdapter {
             AccountType::OAuth => {
                 // 1. If it has a raw oauth token, copy to ~/.gemini/antigravity-cli/antigravity-oauth-token
                 if let Some(cli_home) = default_antigravity_cli_home() {
-                    fs::create_dir_all(&cli_home)
-                        .with_context(|| format!("failed to create {}", cli_home.display()))?;
-
+                    let target_token = cli_home.join("antigravity-oauth-token");
                     if let Some(token) = &account.oauth_token {
-                        let target_token = cli_home.join("antigravity-oauth-token");
-                        let temp_token = cli_home.join(".antigravity-oauth-token.tmp");
-                        fs::write(&temp_token, token)?;
-                        fs::rename(&temp_token, &target_token)?;
+                        crate::core::storage::write_secret_file(&target_token, token.as_bytes())?;
                     } else if auth_path.file_name().and_then(|s| s.to_str())
                         == Some("antigravity-oauth-token")
                     {
-                        let target_token = cli_home.join("antigravity-oauth-token");
-                        let temp_token = cli_home.join(".antigravity-oauth-token.tmp");
                         let token = fs::read_to_string(auth_path)?;
-                        fs::write(&temp_token, token)?;
-                        fs::rename(&temp_token, &target_token)?;
+                        crate::core::storage::write_secret_file(&target_token, token.as_bytes())?;
                     }
                 }
 
@@ -61,13 +53,18 @@ impl super::AntigravityAdapter {
                         let content = fs::read_to_string(auth_path)?;
                         if let Ok(json_val) = serde_json::from_str::<Value>(&content) {
                             if is_valid_oauth_credential(&json_val) {
-                                fs::create_dir_all(&gemini_home).with_context(|| {
-                                    format!("failed to create {}", gemini_home.display())
-                                })?;
                                 let target_creds = gemini_home.join("oauth_creds.json");
-                                let temp_creds = gemini_home.join(".oauth_creds.json.tmp");
-                                fs::write(&temp_creds, &content)?;
-                                fs::rename(&temp_creds, &target_creds)?;
+                                // Backup original file if exists and not yet backed up
+                                if target_creds.exists() {
+                                    let backup_path = gemini_home.join("oauth_creds.json.bak");
+                                    if !backup_path.exists() {
+                                        let _ = fs::copy(&target_creds, &backup_path);
+                                    }
+                                }
+                                crate::core::storage::write_secret_file(
+                                    &target_creds,
+                                    content.as_bytes(),
+                                )?;
                             }
                         }
                     }

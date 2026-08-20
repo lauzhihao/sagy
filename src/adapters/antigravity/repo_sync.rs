@@ -19,11 +19,14 @@ use crate::core::storage;
 const DEFAULT_BUNDLE_DIR: &str = ".sagy-account-pool";
 const BUNDLE_FILENAME: &str = "bundle.enc.json";
 const BUNDLE_KEY_ENV: &str = "SAGY_POOL_KEY";
-const BUNDLE_ALGORITHM: &str = "xchacha20poly1305-sha256";
+const BUNDLE_ALGORITHM: &str = "xchacha20poly1305-argon2id";
+const LEGACY_ALGORITHM: &str = "xchacha20poly1305-sha256";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedBundlePayload {
     pub algorithm: String,
+    #[serde(default)]
+    pub salt: Option<String>,
     pub nonce: String,
     pub ciphertext: String,
 }
@@ -265,10 +268,23 @@ fn resolve_bundle_key() -> Result<String> {
     bail!("Environment variable `{BUNDLE_KEY_ENV}` is not set. Please provide an encryption key.")
 }
 
+fn derive_key_argon2id(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params =
+        Params::new(19456, 2, 1, Some(32)).map_err(|e| anyhow!("Argon2 params error: {e}"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key_bytes = [0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut key_bytes)
+        .map_err(|e| anyhow!("KDF failed: {e}"))?;
+    Ok(key_bytes)
+}
+
 fn encrypt_bytes(data: &[u8], password: &str) -> Result<EncryptedBundlePayload> {
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    let key_bytes = hasher.finalize();
+    let mut salt_bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut salt_bytes);
+
+    let key_bytes = derive_key_argon2id(password, &salt_bytes)?;
     let key = Key::from_slice(&key_bytes);
 
     let cipher = XChaCha20Poly1305::new(key);
@@ -282,21 +298,34 @@ fn encrypt_bytes(data: &[u8], password: &str) -> Result<EncryptedBundlePayload> 
 
     Ok(EncryptedBundlePayload {
         algorithm: BUNDLE_ALGORITHM.to_string(),
+        salt: Some(BASE64_STANDARD.encode(salt_bytes)),
         nonce: BASE64_STANDARD.encode(nonce_bytes),
         ciphertext: BASE64_STANDARD.encode(ciphertext),
     })
 }
 
 fn decrypt_bytes(payload: &EncryptedBundlePayload, password: &str) -> Result<Vec<u8>> {
-    if payload.algorithm != BUNDLE_ALGORITHM {
+    let key_bytes = if payload.algorithm == BUNDLE_ALGORITHM {
+        let salt_b64 = payload
+            .salt
+            .as_deref()
+            .ok_or_else(|| anyhow!("Missing salt in encrypted bundle payload"))?;
+        let salt_bytes = BASE64_STANDARD
+            .decode(salt_b64)
+            .context("Invalid base64 salt")?;
+        derive_key_argon2id(password, &salt_bytes)?
+    } else if payload.algorithm == LEGACY_ALGORITHM {
+        let mut hasher = Sha256::new();
+        hasher.update(password.as_bytes());
+        let hash = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash);
+        arr
+    } else {
         bail!("Unsupported encryption algorithm: {}", payload.algorithm);
-    }
+    };
 
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    let key_bytes = hasher.finalize();
     let key = Key::from_slice(&key_bytes);
-
     let cipher = XChaCha20Poly1305::new(key);
     let nonce_bytes = BASE64_STANDARD
         .decode(&payload.nonce)

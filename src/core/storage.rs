@@ -122,6 +122,20 @@ pub fn write_file_atomically(target: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn write_secret_file(target: &Path, content: &[u8]) -> Result<()> {
+    write_file_atomically(target, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(target) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            let _ = fs::set_permissions(target, perms);
+        }
+    }
+    Ok(())
+}
+
 pub fn save_state(state_dir: &Path, state: &State) -> Result<()> {
     let target = state_dir.join("state.json");
     let contents = serde_json::to_string_pretty(state).context("failed to serialize state")?;
@@ -197,21 +211,21 @@ fn normalize_state_account_paths(state_dir: &Path, state: &mut State) {
 
         if let Some(token) = &account.oauth_token {
             if !token_file.exists() {
-                let _ = fs::create_dir_all(&account_root);
-                let _ = fs::write(&token_file, token);
+                let _ = write_secret_file(&token_file, token.as_bytes());
             }
             account.auth_path = token_file.to_string_lossy().into_owned();
         } else if let Some(api_key) = &account.api_key {
             if !creds_file.exists() {
-                let _ = fs::create_dir_all(&account_root);
                 let creds_json = serde_json::json!({
                     "api_key": api_key,
                     "email": account.email,
                     "project_id": account.project_id,
                 });
-                let _ = fs::write(
+                let _ = write_secret_file(
                     &creds_file,
-                    serde_json::to_string_pretty(&creds_json).unwrap_or_default(),
+                    serde_json::to_string_pretty(&creds_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
                 );
             }
             account.auth_path = creds_file.to_string_lossy().into_owned();

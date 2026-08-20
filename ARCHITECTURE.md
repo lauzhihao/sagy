@@ -60,7 +60,7 @@
 
 ## 4. Encrypted Account Pool Synchronization
 
-- **Algorithm**: `XChaCha20Poly1305` authenticated encryption with SHA-256 key derivation.
+- **Algorithm**: `XChaCha20Poly1305` authenticated encryption with Argon2id key derivation.
 - **Key Source**: `SAGY_POOL_KEY` environment variable.
 - **Payload Format**: Encrypted bundle (`.sagy-account-pool/bundle.enc.json`) committed to a private Git repository.
 - **Cross-Host Workflow**:
