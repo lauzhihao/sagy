@@ -65,14 +65,6 @@ impl AccountRecord {
     pub fn is_oauth(&self) -> bool {
         matches!(self.account_type, AccountType::OAuth)
     }
-
-    pub fn is_api_key(&self) -> bool {
-        matches!(self.account_type, AccountType::ApiKey)
-    }
-
-    pub fn is_vertex(&self) -> bool {
-        matches!(self.account_type, AccountType::Vertex)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -109,12 +101,6 @@ impl UsageSnapshot {
             }
         }
         true
-    }
-
-    pub fn is_in_cooldown(&self, now: i64) -> bool {
-        self.cooldown_until
-            .map(|until| now < until)
-            .unwrap_or(false)
     }
 }
 

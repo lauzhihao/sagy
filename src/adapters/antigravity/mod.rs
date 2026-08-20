@@ -1,8 +1,6 @@
-use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::Value;
 
 pub mod account;
 pub mod auth;
@@ -22,63 +20,6 @@ use crate::core::state::{AccountRecord, LiveIdentity, State, UsageSnapshot};
 pub struct AntigravityAdapter;
 
 impl AntigravityAdapter {
-    pub fn read_live_identity(&self) -> Option<LiveIdentity> {
-        // 1. Check ~/.gemini/google_accounts.json
-        if let Some(gemini_home) = paths::default_gemini_home() {
-            let ga_file = gemini_home.join("google_accounts.json");
-            if ga_file.is_file() {
-                if let Ok(content) = fs::read_to_string(&ga_file) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                        if let Some(active) = json.get("active").and_then(Value::as_str) {
-                            let trimmed = active.trim();
-                            if !trimmed.is_empty() {
-                                return Some(LiveIdentity {
-                                    email: trimmed.to_string(),
-                                    account_id: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. Check ~/.gemini/oauth_creds.json
-            let oauth_file = gemini_home.join("oauth_creds.json");
-            if oauth_file.is_file() {
-                if let Ok(content) = fs::read_to_string(&oauth_file) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                        if let Some(email) = json.get("email").and_then(Value::as_str) {
-                            let trimmed = email.trim();
-                            if !trimmed.is_empty() {
-                                return Some(LiveIdentity {
-                                    email: trimmed.to_string(),
-                                    account_id: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Check ~/.gemini/antigravity-cli/antigravity-oauth-token
-        if let Some(cli_home) = paths::default_antigravity_cli_home() {
-            let token_file = cli_home.join("antigravity-oauth-token");
-            if token_file.is_file() {
-                if let Ok(token_str) = fs::read_to_string(&token_file) {
-                    if !token_str.trim().is_empty() {
-                        return Some(LiveIdentity {
-                            email: "antigravity-cli-session".to_string(),
-                            account_id: None,
-                        });
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
     pub fn active_identity_from_state(&self, state: &State) -> Option<LiveIdentity> {
         let current_id = state.current_account_id.as_ref()?;
         let account = state

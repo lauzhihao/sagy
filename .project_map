@@ -1,5 +1,5 @@
 # sagy Project Map
-> Generated: 2026年 8月20日 星期四 09时51分11秒 CST
+> Generated: 2026年 8月20日 星期四 11时22分01秒 CST
 > Strategy: Source Focused (src expanded, target collapsed)
 
 ## Package
@@ -8,14 +8,13 @@
 - version: 0.1.0
 - edition: 2024
 - description: Cross-platform account-aware launcher and scheduler for Google Antigravity CLI (agy).
-- dependencies (17): anyhow, base64, chacha20poly1305, chrono, clap, directories, flate2, reqwest, serde, serde_json, self-replace, sha2, tar, unicode-width, uuid, zip, toml
+- dependencies (17): anyhow, argon2, base64, chacha20poly1305, chrono, clap, directories, flate2, reqwest, serde, serde_json, self-replace, sha2, tar, unicode-width, uuid, zip
 
 ## Rust Modules
 
 - crate root: lib, main
 - adapters: mod
 - adapters::antigravity: account, auth, launcher, mod, paths, repo_sync, ui, usage
-- bin: flash, pro, think
 - cli: args, help, launch, mod, repo_sync
 - core: mod, policy, state, storage, ui, update
 
@@ -24,6 +23,41 @@
 |-- [D] .github/
 |   -- [D] workflows/
 |       -- [F] release.yml
+|-- [D] backlog/
+|   |-- [D] tasks/
+|   |   |-- [F] bugs-001-cargo-test-overwrites-real-credentials.md
+|   |   |-- [F] bugs-002-oauth-probe-blocks-launch.md
+|   |   |-- [F] bugs-003-wrong-agy-model-ids.md
+|   |   |-- [F] bugs-004-state-json-plaintext-world-readable.md
+|   |   |-- [F] bugs-005-rate-limit-cooldown-unreachable.md
+|   |   |-- [F] bugs-006-probe-latency-no-cache.md
+|   |   |-- [F] bugs-007-credentials-in-url-query.md
+|   |   |-- [F] bugs-008-self-update-no-checksum-and-downgrade.md
+|   |   |-- [F] bugs-009-fs-copy-self-truncation.md
+|   |   |-- [F] bugs-010-alias-swallows-subcommands.md
+|   |   |-- [F] bugs-011-ssh-host-key-check-disabled.md
+|   |   -- [F] bugs-012-dead-code-and-duplication.md
+|   |-- [D] tasks-v2/
+|   |   |-- [F] bugs-004a-secure-dir-permissions.md
+|   |   |-- [F] bugs-010-alias-launcher-doc.md
+|   |   |-- [F] bugs-013-drop-model-aliases.md
+|   |   |-- [F] bugs-014-cleanup-dead-api-and-install-upgrade.md
+|   |   -- [F] TEMPLATE.md
+|   |-- [D] verify/
+|   |   |-- [F] bugs-001.sh
+|   |   |-- [F] bugs-002.sh
+|   |   |-- [F] bugs-004.sh
+|   |   |-- [F] bugs-005.sh
+|   |   |-- [F] bugs-006.sh
+|   |   |-- [F] bugs-007.sh
+|   |   |-- [F] bugs-008.sh
+|   |   |-- [F] bugs-011.sh
+|   |   |-- [F] bugs-012.sh
+|   |   |-- [F] bugs-013.sh
+|   |   |-- [F] bugs-014.sh
+|   |   |-- [F] fixtures.sh
+|   |   -- [F] lib.sh
+|   -- [F] README.md
 |-- [D] scripts/
 |   -- [F] map_project.py
 |-- [D] src/
@@ -38,10 +72,6 @@
 |   |   |   |-- [F] ui.rs
 |   |   |   -- [F] usage.rs
 |   |   -- [F] mod.rs
-|   |-- [D] bin/
-|   |   |-- [F] flash.rs
-|   |   |-- [F] pro.rs
-|   |   -- [F] think.rs
 |   |-- [D] cli/
 |   |   |-- [F] args.rs
 |   |   |-- [F] help.rs
@@ -57,7 +87,7 @@
 |   |   -- [F] update.rs
 |   |-- [F] lib.rs
 |   -- [F] main.rs
-|-- [D] target/  [collapsed: 6113 files]
+|-- [D] target/  [collapsed: 15371 files]
 |-- [F] AGENTS.md
 |-- [F] ARCHITECTURE.md
 |-- [F] Cargo.lock

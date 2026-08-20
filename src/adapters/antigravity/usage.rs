@@ -130,17 +130,6 @@ impl super::AntigravityAdapter {
             usage.last_synced_at = Some(now);
         }
     }
-
-    pub fn mark_needs_relogin(&self, state: &mut State, account_id: &str, error_msg: &str) {
-        let now = Utc::now().timestamp();
-        if let Some(usage) = state.usage_cache.get_mut(account_id) {
-            usage.status = "AuthError".to_string();
-            usage.needs_relogin = true;
-            usage.remaining_quota_percent = Some(0);
-            usage.last_sync_error = Some(error_msg.to_string());
-            usage.last_synced_at = Some(now);
-        }
-    }
 }
 
 fn probe_account(account: &AccountRecord, usage: &mut UsageSnapshot, now: i64) {
@@ -324,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_rate_limited_and_relogin() {
+    fn test_mark_rate_limited() {
         let mut state = State::default();
         let acc_id = "test-acc-usage";
         state.usage_cache.insert(
@@ -340,10 +329,5 @@ mod tests {
         let usage = state.usage_cache.get(acc_id).unwrap();
         assert_eq!(usage.status, "RateLimited");
         assert!(usage.cooldown_until.is_some());
-
-        adapter.mark_needs_relogin(&mut state, acc_id, "Auth error 401");
-        let usage_relogin = state.usage_cache.get(acc_id).unwrap();
-        assert_eq!(usage_relogin.status, "AuthError");
-        assert!(usage_relogin.needs_relogin);
     }
 }

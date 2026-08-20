@@ -11,8 +11,6 @@ use crate::core::state::State;
 const DEFAULT_STATE_BASENAME: &str = "sagy";
 const STATE_DIR_ENV: &str = "SAGY_HOME";
 const REPO_SYNC_CONFIG_FILENAME: &str = "repo-sync.json";
-const BIN_DIR_NAME: &str = "bin";
-const RUNTIME_DIR_NAME: &str = "runtime";
 const TMP_DIR_NAME: &str = "tmp";
 
 pub fn resolve_state_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
@@ -25,14 +23,6 @@ pub fn resolve_state_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
     }
 
     default_state_dir()
-}
-
-pub fn bin_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join(BIN_DIR_NAME)
-}
-
-pub fn runtime_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join(RUNTIME_DIR_NAME)
 }
 
 pub fn tmp_dir(state_dir: &Path) -> PathBuf {

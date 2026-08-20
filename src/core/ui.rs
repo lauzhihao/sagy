@@ -69,22 +69,6 @@ impl Messages {
         matches!(self.language, UiLanguage::ZhHans)
     }
 
-    pub fn cli_about(&self) -> &'static str {
-        if self.is_zh() {
-            "面向 Google Antigravity CLI (agy) 的智能多账号与快速启动器。"
-        } else {
-            "Smart multi-account launcher and orchestrator for Google Antigravity CLI (agy)."
-        }
-    }
-
-    pub fn no_usable_account(&self) -> &'static str {
-        if self.is_zh() {
-            "没有找到可用账号。"
-        } else {
-            "No usable account found."
-        }
-    }
-
     pub fn no_usable_account_hint(&self) -> &'static str {
         if self.is_zh() {
             "没有可用账号，请先执行 `sagy add` 或 `sagy login`，或执行 `sagy import-known` 导入当前配置。"

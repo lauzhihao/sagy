@@ -55,6 +55,16 @@ $targetExe = Join-Path $InstallBin "sagy.exe"
 
 Copy-Item $extractedExe $targetExe -Force
 
+# 清理旧版本安装的模型别名二进制
+foreach ($legacy in @("flash", "pro", "think")) {
+    $legacyFile = "$legacy.exe"
+    $legacyPath = Join-Path $InstallBin $legacyFile
+    if (Test-Path $legacyPath) {
+        Remove-Item $legacyPath -Force
+        Write-Host "Removed legacy model alias $legacyPath"
+    }
+}
+
 # Install sagy-original passthrough wrapper for Windows cmd/powershell
 $originalWrapperCmd = Join-Path $InstallBin "sagy-original.cmd"
 @"

@@ -142,6 +142,16 @@ EOF
   chmod 0755 "${ORIGINAL_WRAPPER_PATH}"
 }
 
+remove_legacy_aliases() {
+  local legacy
+  for legacy in flash pro think; do
+    if [[ -f "${INSTALL_BIN}/${legacy}" ]]; then
+      rm -f "${INSTALL_BIN}/${legacy}"
+      echo "Removed legacy model alias ${INSTALL_BIN}/${legacy}"
+    fi
+  done
+}
+
 post_install_import() {
   if [[ -d "${HOME}/.gemini" ]]; then
     if "${WRAPPER_PATH}" import-known >/dev/null 2>&1; then
@@ -167,5 +177,6 @@ TARGET="$(detect_target)"
 VERSION="$(resolve_version)"
 download_and_install "${VERSION}" "${TARGET}"
 install_original_wrapper
+remove_legacy_aliases
 post_install_import
 print_next_steps
