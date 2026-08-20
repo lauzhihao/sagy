@@ -13,13 +13,8 @@ pub fn ensure_launch_account(
     no_login: bool,
     perform_switch: bool,
 ) -> Result<Option<(AccountRecord, UsageSnapshot, bool)>> {
-    let result = adapter.ensure_best_account(
-        state_dir,
-        state,
-        no_import_known,
-        no_login,
-        perform_switch,
-    )?;
+    let result =
+        adapter.ensure_best_account(state_dir, state, no_import_known, no_login, perform_switch)?;
 
     Ok(result.map(|(acc, usage)| (acc, usage, false)))
 }

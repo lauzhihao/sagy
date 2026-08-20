@@ -77,16 +77,18 @@ impl Cli {
             }
         }
 
-        let exe_name = raw_args.first().and_then(|p| {
-            Path::new(p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_ascii_lowercase())
-        }).unwrap_or_default();
+        let exe_name = raw_args
+            .first()
+            .and_then(|p| {
+                Path::new(p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+            })
+            .unwrap_or_default();
 
-        let is_alias = exe_name.contains("flash")
-            || exe_name.contains("pro")
-            || exe_name.contains("think");
+        let is_alias =
+            exe_name.contains("flash") || exe_name.contains("pro") || exe_name.contains("think");
 
         if is_alias {
             let rewritten = rewrite_alias_args(&raw_args);
@@ -124,11 +126,7 @@ fn has_subcommand(raw_args: &[OsString]) -> bool {
 fn is_sagy_launch_flag(s: &str) -> bool {
     matches!(
         s,
-        "--dry-run"
-            | "--no-resume"
-            | "--no-launch"
-            | "--no-login"
-            | "--no-import-known"
+        "--dry-run" | "--no-resume" | "--no-launch" | "--no-login" | "--no-import-known"
     )
 }
 
@@ -202,7 +200,7 @@ fn rewrite_passthrough_launch_args(raw_args: &[OsString]) -> Vec<OsString> {
 
 pub fn run(cli: Cli) -> Result<i32> {
     let ui = ui::messages();
-    let adapter = AntigravityAdapter::default();
+    let adapter = AntigravityAdapter;
     let state_dir = storage::resolve_state_dir(cli.state_dir.as_deref())?;
     let mut state = storage::load_state(&state_dir)?;
     let command = cli.command.unwrap_or(Command::Launch(LaunchArgs {

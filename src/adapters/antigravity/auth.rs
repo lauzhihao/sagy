@@ -6,9 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::adapters::antigravity::account::is_valid_oauth_credential;
-use crate::adapters::antigravity::paths::{
-    default_antigravity_cli_home, default_gemini_home,
-};
+use crate::adapters::antigravity::paths::{default_antigravity_cli_home, default_gemini_home};
 use crate::core::state::{AccountRecord, AccountType, State};
 
 #[derive(Debug, Clone)]
@@ -46,7 +44,9 @@ impl super::AntigravityAdapter {
                         let temp_token = cli_home.join(".antigravity-oauth-token.tmp");
                         fs::write(&temp_token, token)?;
                         fs::rename(&temp_token, &target_token)?;
-                    } else if auth_path.file_name().and_then(|s| s.to_str()) == Some("antigravity-oauth-token") {
+                    } else if auth_path.file_name().and_then(|s| s.to_str())
+                        == Some("antigravity-oauth-token")
+                    {
                         let target_token = cli_home.join("antigravity-oauth-token");
                         let temp_token = cli_home.join(".antigravity-oauth-token.tmp");
                         let token = fs::read_to_string(auth_path)?;
@@ -61,8 +61,9 @@ impl super::AntigravityAdapter {
                         let content = fs::read_to_string(auth_path)?;
                         if let Ok(json_val) = serde_json::from_str::<Value>(&content) {
                             if is_valid_oauth_credential(&json_val) {
-                                fs::create_dir_all(&gemini_home)
-                                    .with_context(|| format!("failed to create {}", gemini_home.display()))?;
+                                fs::create_dir_all(&gemini_home).with_context(|| {
+                                    format!("failed to create {}", gemini_home.display())
+                                })?;
                                 let target_creds = gemini_home.join("oauth_creds.json");
                                 let temp_creds = gemini_home.join(".oauth_creds.json.tmp");
                                 fs::write(&temp_creds, &content)?;
@@ -102,11 +103,23 @@ impl super::AntigravityAdapter {
                 if token.is_empty() {
                     bail!("Token cannot be empty");
                 }
-                self.import_or_update_token(state_dir, state, email, token, Some("Antigravity OAuth"))
+                self.import_or_update_token(
+                    state_dir,
+                    state,
+                    email,
+                    token,
+                    Some("Antigravity OAuth"),
+                )
             }
             LoginMode::Token { token, email } => {
                 let email_str = email.unwrap_or("token-user@gemini");
-                self.import_or_update_token(state_dir, state, email_str, token, Some("Antigravity Token"))
+                self.import_or_update_token(
+                    state_dir,
+                    state,
+                    email_str,
+                    token,
+                    Some("Antigravity Token"),
+                )
             }
             LoginMode::ApiKey {
                 api_key,
@@ -186,7 +199,7 @@ mod tests {
             ..Default::default()
         };
 
-        let adapter = super::super::AntigravityAdapter::default();
+        let adapter = super::super::AntigravityAdapter;
         let switch_res = adapter.switch_account(&account);
         assert!(switch_res.is_ok());
     }
@@ -207,9 +220,8 @@ mod tests {
             ..Default::default()
         };
 
-        let adapter = super::super::AntigravityAdapter::default();
+        let adapter = super::super::AntigravityAdapter;
         let switch_res = adapter.switch_account(&account);
         assert!(switch_res.is_ok());
     }
 }
-

@@ -1,17 +1,19 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const STATE_VERSION: u32 = 1;
 pub const DEFAULT_COOLDOWN_SECONDS: i64 = 300; // 5 minutes cooldown after 429
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum AccountType {
     #[default]
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth,
+    #[serde(rename = "api_key")]
     ApiKey,
+    #[serde(rename = "vertex")]
     Vertex,
 }
 
@@ -112,7 +114,9 @@ impl UsageSnapshot {
     }
 
     pub fn is_in_cooldown(&self, now: i64) -> bool {
-        self.cooldown_until.map(|until| now < until).unwrap_or(false)
+        self.cooldown_until
+            .map(|until| now < until)
+            .unwrap_or(false)
     }
 }
 
@@ -147,4 +151,55 @@ impl Default for State {
 
 const fn default_state_version() -> u32 {
     STATE_VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_account_type_serde_consistency() {
+        let oauth_type = AccountType::OAuth;
+        assert_eq!(oauth_type.as_str(), "oauth");
+        let serialized = serde_json::to_string(&oauth_type).unwrap();
+        assert_eq!(serialized, "\"oauth\"");
+
+        // Test backward-compatible alias "o_auth"
+        let deserialized: AccountType = serde_json::from_str("\"o_auth\"").unwrap();
+        assert_eq!(deserialized, AccountType::OAuth);
+
+        let api_key_type = AccountType::ApiKey;
+        assert_eq!(api_key_type.as_str(), "api_key");
+        let serialized_api = serde_json::to_string(&api_key_type).unwrap();
+        assert_eq!(serialized_api, "\"api_key\"");
+        let deserialized_api: AccountType = serde_json::from_str(&serialized_api).unwrap();
+        assert_eq!(deserialized_api, AccountType::ApiKey);
+    }
+
+    #[test]
+    fn test_usage_snapshot_health() {
+        let now = 1000;
+        let healthy = UsageSnapshot {
+            status: "Ready".to_string(),
+            cooldown_until: None,
+            needs_relogin: false,
+            ..Default::default()
+        };
+        assert!(healthy.is_healthy(now));
+
+        let cooldown = UsageSnapshot {
+            status: "RateLimited".to_string(),
+            cooldown_until: Some(2000),
+            needs_relogin: false,
+            ..Default::default()
+        };
+        assert!(!cooldown.is_healthy(now));
+
+        let relogin = UsageSnapshot {
+            status: "AuthError".to_string(),
+            needs_relogin: true,
+            ..Default::default()
+        };
+        assert!(!relogin.is_healthy(now));
+    }
 }

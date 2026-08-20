@@ -1,10 +1,12 @@
-use std::path::Path;
-use std::time::Duration;
 use chrono::Utc;
 use reqwest::blocking::Client;
 use serde_json::Value;
+use std::path::Path;
+use std::time::Duration;
 
-use crate::core::state::{AccountRecord, AccountType, DEFAULT_COOLDOWN_SECONDS, State, UsageSnapshot};
+use crate::core::state::{
+    AccountRecord, AccountType, DEFAULT_COOLDOWN_SECONDS, State, UsageSnapshot,
+};
 
 const PROBE_TIMEOUT_SECS: u64 = 5;
 
@@ -105,12 +107,17 @@ fn probe_account(account: &AccountRecord, usage: &mut UsageSnapshot, now: i64) {
                             usage.needs_relogin = false;
                             usage.cooldown_until = Some(now + DEFAULT_COOLDOWN_SECONDS);
                             usage.remaining_quota_percent = Some(0);
-                            usage.last_sync_error = Some("Rate limit exceeded (HTTP 429)".to_string());
-                        } else if status.as_u16() == 400 || status.as_u16() == 401 || status.as_u16() == 403 {
+                            usage.last_sync_error =
+                                Some("Rate limit exceeded (HTTP 429)".to_string());
+                        } else if status.as_u16() == 400
+                            || status.as_u16() == 401
+                            || status.as_u16() == 403
+                        {
                             usage.status = "InvalidKey".to_string();
                             usage.needs_relogin = true;
                             usage.remaining_quota_percent = Some(0);
-                            usage.last_sync_error = Some(format!("Invalid API key (HTTP {})", status.as_u16()));
+                            usage.last_sync_error =
+                                Some(format!("Invalid API key (HTTP {})", status.as_u16()));
                         } else {
                             usage.last_sync_error = Some(format!("Probe HTTP {}", status.as_u16()));
                         }
@@ -143,7 +150,8 @@ fn probe_account(account: &AccountRecord, usage: &mut UsageSnapshot, now: i64) {
                                 usage.status = "Expired".to_string();
                                 usage.needs_relogin = true;
                                 usage.remaining_quota_percent = Some(0);
-                                usage.last_sync_error = Some("OAuth access token expired or revoked".to_string());
+                                usage.last_sync_error =
+                                    Some("OAuth access token expired or revoked".to_string());
                             }
                         }
                         Err(e) => {
@@ -157,7 +165,8 @@ fn probe_account(account: &AccountRecord, usage: &mut UsageSnapshot, now: i64) {
                             usage.status = "Expired".to_string();
                             usage.needs_relogin = true;
                             usage.remaining_quota_percent = Some(0);
-                            usage.last_sync_error = Some("Antigravity OAuth JWT token expired".to_string());
+                            usage.last_sync_error =
+                                Some("Antigravity OAuth JWT token expired".to_string());
                         } else {
                             usage.status = "Ready".to_string();
                             usage.needs_relogin = false;
@@ -189,10 +198,53 @@ fn extract_jwt_exp(jwt: &str) -> Option<i64> {
         _ => payload_b64.to_string(),
     };
 
-    let decoded = URL_SAFE_NO_PAD.decode(padded.as_bytes())
+    let decoded = URL_SAFE_NO_PAD
+        .decode(padded.as_bytes())
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()))
         .ok()?;
 
     let json: Value = serde_json::from_slice(&decoded).ok()?;
     json.get("exp").and_then(Value::as_i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_jwt_exp() {
+        // Base64Url encode {"exp": 1787199999, "email": "test@google.com"}
+        // Header: eyJhbGciOiJIUzI1NiJ9
+        // Payload: eyJleHAiOjE3ODcxOTk5OTksImVtYWlsIjoidGVzdEBnb29nbGUuY29tIn0
+        let fake_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3ODcxOTk5OTksImVtYWlsIjoidGVzdEBnb29nbGUuY29tIn0.fake_signature";
+        let exp = extract_jwt_exp(fake_jwt);
+        assert_eq!(exp, Some(1787199999));
+
+        let invalid_jwt = "invalid_jwt_format";
+        assert_eq!(extract_jwt_exp(invalid_jwt), None);
+    }
+
+    #[test]
+    fn test_mark_rate_limited_and_relogin() {
+        let mut state = State::default();
+        let acc_id = "test-acc-usage";
+        state.usage_cache.insert(
+            acc_id.to_string(),
+            UsageSnapshot {
+                status: "Ready".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let adapter = super::super::AntigravityAdapter;
+        adapter.mark_rate_limited(&mut state, acc_id);
+        let usage = state.usage_cache.get(acc_id).unwrap();
+        assert_eq!(usage.status, "RateLimited");
+        assert!(usage.cooldown_until.is_some());
+
+        adapter.mark_needs_relogin(&mut state, acc_id, "Auth error 401");
+        let usage_relogin = state.usage_cache.get(acc_id).unwrap();
+        assert_eq!(usage_relogin.status, "AuthError");
+        assert!(usage_relogin.needs_relogin);
+    }
 }

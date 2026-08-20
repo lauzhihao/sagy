@@ -23,7 +23,7 @@
 | - Storage (atomic persistence) | | - Binary Discovery (agy)    |
 | - Policy (scoring & cooldown)  | | - Account Model (OAuth/API) |
 | - UI (ANSI tables & messages)  | | - Env & Profile Switcher    |
-| - Update (GitHub release DL)   | | - AES-256-GCM Repo Sync     |
+| - Update (GitHub release DL)   | | - XChaCha20Poly1305 Repo Sync |
 +--------------------------------+ +-----------------------------+
                  |                               |
                  +---------------+---------------+

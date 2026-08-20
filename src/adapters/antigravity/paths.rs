@@ -20,7 +20,8 @@ pub fn find_agy_bin(state_dir: Option<&Path>) -> Option<PathBuf> {
 
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
         let candidates = [
-            home.join(".gemini/antigravity-cli/bin").join(bin_name("agy")),
+            home.join(".gemini/antigravity-cli/bin")
+                .join(bin_name("agy")),
             home.join(".local/bin").join(bin_name("agy")),
             home.join(".cargo/bin").join(bin_name("agy")),
         ];
@@ -54,13 +55,7 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
         PathBuf::from("/opt/homebrew/bin").join(&name_ext),
         PathBuf::from("/usr/bin").join(&name_ext),
     ];
-    for candidate in well_known {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    None
+    well_known.into_iter().find(|candidate| candidate.is_file())
 }
 
 pub fn default_antigravity_cli_home() -> Option<PathBuf> {
@@ -102,5 +97,35 @@ fn bin_name(base: &str) -> String {
         format!("{base}.exe")
     } else {
         base.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_account_paths() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+        let acc_id = "test-acc-123";
+
+        let acc_dir = account_dir(state_dir, acc_id);
+        assert_eq!(acc_dir, state_dir.join("accounts").join(acc_id));
+
+        let creds_file = account_credentials_file(&acc_dir);
+        assert_eq!(creds_file, acc_dir.join("credentials.json"));
+
+        let token_file = account_token_file(&acc_dir);
+        assert_eq!(token_file, acc_dir.join("antigravity-oauth-token"));
+
+        let settings_file = account_settings_file(&acc_dir);
+        assert_eq!(settings_file, acc_dir.join("settings.json"));
+    }
+
+    #[test]
+    fn test_find_git_bin() {
+        let git = find_git_bin();
+        assert!(git.is_some());
     }
 }

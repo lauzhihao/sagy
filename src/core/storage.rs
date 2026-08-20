@@ -83,22 +83,49 @@ pub fn load_state(state_dir: &Path) -> Result<State> {
     Ok(state)
 }
 
-pub fn save_state(state_dir: &Path, state: &State) -> Result<()> {
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("failed to create state directory {}", state_dir.display()))?;
-    let target = state_dir.join("state.json");
-    let temporary = state_dir.join(".state.json.tmp");
-    let contents = serde_json::to_string_pretty(state).context("failed to serialize state")?;
-    fs::write(&temporary, contents)
-        .with_context(|| format!("failed to write temporary file {}", temporary.display()))?;
-    fs::rename(&temporary, &target).with_context(|| {
+pub fn write_file_atomically(target: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let pid = std::process::id();
+    let unique_id = uuid::Uuid::new_v4();
+    let temp_name = format!(".{file_name}.{pid}.{unique_id}.tmp");
+    let temp_path = target
+        .parent()
+        .map(|p| p.join(&temp_name))
+        .unwrap_or_else(|| PathBuf::from(&temp_name));
+
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&temp_path)
+            .with_context(|| format!("failed to create temporary file {}", temp_path.display()))?;
+        file.write_all(content)
+            .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync temporary file {}", temp_path.display()))?;
+    }
+
+    fs::rename(&temp_path, target).with_context(|| {
         format!(
             "failed to replace {} with {}",
             target.display(),
-            temporary.display()
+            temp_path.display()
         )
     })?;
+
     Ok(())
+}
+
+pub fn save_state(state_dir: &Path, state: &State) -> Result<()> {
+    let target = state_dir.join("state.json");
+    let contents = serde_json::to_string_pretty(state).context("failed to serialize state")?;
+    write_file_atomically(&target, contents.as_bytes())
 }
 
 pub fn load_repo_sync_config(state_dir: &Path) -> Result<RepoSyncConfig> {
@@ -114,22 +141,10 @@ pub fn load_repo_sync_config(state_dir: &Path) -> Result<RepoSyncConfig> {
 }
 
 pub fn save_repo_sync_config(state_dir: &Path, config: &RepoSyncConfig) -> Result<()> {
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("failed to create state directory {}", state_dir.display()))?;
     let target = state_dir.join(REPO_SYNC_CONFIG_FILENAME);
-    let temporary = state_dir.join(".repo-sync.json.tmp");
     let contents =
         serde_json::to_string_pretty(config).context("failed to serialize repo sync config")?;
-    fs::write(&temporary, contents)
-        .with_context(|| format!("failed to write temporary file {}", temporary.display()))?;
-    fs::rename(&temporary, &target).with_context(|| {
-        format!(
-            "failed to replace {} with {}",
-            target.display(),
-            temporary.display()
-        )
-    })?;
-    Ok(())
+    write_file_atomically(&target, contents.as_bytes())
 }
 
 pub fn ensure_exists(path: &Path, label: &str) -> Result<()> {
@@ -194,7 +209,10 @@ fn normalize_state_account_paths(state_dir: &Path, state: &mut State) {
                     "email": account.email,
                     "project_id": account.project_id,
                 });
-                let _ = fs::write(&creds_file, serde_json::to_string_pretty(&creds_json).unwrap_or_default());
+                let _ = fs::write(
+                    &creds_file,
+                    serde_json::to_string_pretty(&creds_json).unwrap_or_default(),
+                );
             }
             account.auth_path = creds_file.to_string_lossy().into_owned();
         } else if token_file.exists() {
@@ -264,5 +282,32 @@ mod tests {
         let loaded = load_state(state_dir).expect("load state");
         assert_eq!(loaded.accounts.len(), 0);
     }
-}
 
+    #[test]
+    fn test_write_file_atomically_concurrent() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let target_file = temp_dir.path().join("sub").join("atomic.txt");
+        let content = b"hello atomic world";
+        write_file_atomically(&target_file, content).expect("atomic write");
+
+        assert!(target_file.exists());
+        assert_eq!(fs::read(&target_file).expect("read"), content);
+    }
+
+    #[test]
+    fn test_repo_sync_config_roundtrip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path();
+
+        let cfg = RepoSyncConfig {
+            last_repo: Some("git@github.com:test/pool.git".to_string()),
+        };
+        save_repo_sync_config(state_dir, &cfg).expect("save config");
+
+        let loaded = load_repo_sync_config(state_dir).expect("load config");
+        assert_eq!(
+            loaded.last_repo,
+            Some("git@github.com:test/pool.git".to_string())
+        );
+    }
+}

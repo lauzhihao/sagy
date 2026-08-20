@@ -225,7 +225,10 @@ impl Messages {
         if self.is_zh() {
             format!("已成功从 v{from} 更新至 v{to} ({})", path.display())
         } else {
-            format!("Successfully updated from v{from} to v{to} ({})", path.display())
+            format!(
+                "Successfully updated from v{from} to v{to} ({})",
+                path.display()
+            )
         }
     }
 

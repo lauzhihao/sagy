@@ -16,8 +16,9 @@ impl super::AntigravityAdapter {
         extra_args: &[OsString],
         resume: bool,
     ) -> Result<i32> {
-        let agy_bin = find_agy_bin(Some(state_dir))
-            .ok_or_else(|| anyhow::anyhow!("Antigravity CLI (agy) binary not found in PATH or standard locations"))?;
+        let agy_bin = find_agy_bin(Some(state_dir)).ok_or_else(|| {
+            anyhow::anyhow!("Antigravity CLI (agy) binary not found in PATH or standard locations")
+        })?;
 
         // 1. Prepare base command
         let mut cmd = Command::new(&agy_bin);

@@ -89,6 +89,7 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
 
     self_replace::self_replace(&temp_binary)
         .with_context(|| format!("failed to replace {}", executable_path.display()))?;
+    sync_sibling_binaries(&executable_path);
     let _ = fs::remove_dir_all(&temp_dir);
 
     Ok(UpdateOutcome {
@@ -99,16 +100,35 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
     })
 }
 
+fn sync_sibling_binaries(source_exe: &Path) {
+    if let Some(parent) = source_exe.parent() {
+        let aliases = ["flash", "pro", "think"];
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        for alias in aliases {
+            let alias_name = format!("{alias}{ext}");
+            let target_path = parent.join(&alias_name);
+            if target_path.exists() {
+                let _ = fs::copy(source_exe, &target_path);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = fs::metadata(&target_path) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = fs::set_permissions(&target_path, perms);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn resolve_release_asset() -> Result<ReleaseAsset> {
     let target = current_release_target()?;
     let repo = env::var("SAGY_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
     let release = fetch_latest_release(&repo)?;
     let tag = release.tag_name.trim().to_string();
-    let version = tag
-        .strip_prefix('v')
-        .unwrap_or(&tag)
-        .trim()
-        .to_string();
+    let version = tag.strip_prefix('v').unwrap_or(&tag).trim().to_string();
     Ok(ReleaseAsset {
         repo,
         tag,
@@ -186,8 +206,7 @@ fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result
             bail!("binary {expected_name} not found in tar archive");
         }
         "zip" => {
-            let mut archive =
-                ZipArchive::new(Cursor::new(bytes)).context("invalid zip archive")?;
+            let mut archive = ZipArchive::new(Cursor::new(bytes)).context("invalid zip archive")?;
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i).context("invalid zip entry")?;
                 if file.name().ends_with(&expected_name) {
@@ -205,10 +224,7 @@ fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result
 
 fn http_client() -> Result<Client> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static("sagy-updater/0.1.0"),
-    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("sagy-updater/0.1.0"));
     headers.insert(
         ACCEPT,
         HeaderValue::from_static("application/vnd.github.v3+json"),

@@ -11,18 +11,6 @@ description = "Cross-platform account-aware launcher and scheduler for Google An
 name = "sagy"
 path = "src/main.rs"
 
-[[bin]]
-name = "flash"
-path = "src/bin/flash.rs"
-
-[[bin]]
-name = "pro"
-path = "src/bin/pro.rs"
-
-[[bin]]
-name = "think"
-path = "src/bin/think.rs"
-
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
@@ -40,10 +28,6 @@ tar = "0.4"
 unicode-width = "0.2"
 uuid = { version = "1.18", features = ["v4"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
-toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3"

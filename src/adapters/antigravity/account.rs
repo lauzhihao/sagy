@@ -7,8 +7,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::adapters::antigravity::paths::{
-    account_credentials_file, account_dir, account_token_file,
-    default_antigravity_cli_home, default_gemini_home,
+    account_credentials_file, account_dir, account_token_file, default_antigravity_cli_home,
+    default_gemini_home,
 };
 use crate::core::state::{AccountRecord, AccountType, State, UsageSnapshot};
 use crate::core::storage;
@@ -29,7 +29,10 @@ pub fn is_valid_api_key_credential(json: &Value) -> bool {
     if !json.is_object() {
         return false;
     }
-    json.get("api_key").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).is_some()
+    json.get("api_key")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .is_some()
 }
 
 impl super::AntigravityAdapter {
@@ -110,7 +113,9 @@ impl super::AntigravityAdapter {
 
         // 5. Clean up old duplicate placeholder accounts if unified email exists
         if resolved_email != "default-antigravity-user@gemini" {
-            state.accounts.retain(|a| a.email != "default-antigravity-user@gemini");
+            state
+                .accounts
+                .retain(|a| a.email != "default-antigravity-user@gemini");
         }
 
         imported
@@ -131,7 +136,8 @@ impl super::AntigravityAdapter {
 
         // Validate that this JSON actually contains recognizable credentials
         let is_api = is_valid_api_key_credential(&json_val);
-        let is_service_account = json_val.get("type").and_then(Value::as_str) == Some("service_account");
+        let is_service_account =
+            json_val.get("type").and_then(Value::as_str) == Some("service_account");
         let is_oauth = is_valid_oauth_credential(&json_val);
 
         if !is_api && !is_service_account && !is_oauth {
@@ -157,7 +163,9 @@ impl super::AntigravityAdapter {
                 if google_accounts_path.is_file() {
                     if let Ok(ga_content) = fs::read_to_string(&google_accounts_path) {
                         if let Ok(ga_json) = serde_json::from_str::<Value>(&ga_content) {
-                            if let Some(active_email) = ga_json.get("active").and_then(Value::as_str) {
+                            if let Some(active_email) =
+                                ga_json.get("active").and_then(Value::as_str)
+                            {
                                 let trimmed = active_email.trim();
                                 if !trimmed.is_empty() {
                                     email_opt = Some(trimmed.to_string());
@@ -296,7 +304,9 @@ impl super::AntigravityAdapter {
             project_id: None,
             account_id: None,
             identity_fingerprint: None,
-            plan: plan_label.map(ToString::to_string).or_else(|| Some("Antigravity OAuth".to_string())),
+            plan: plan_label
+                .map(ToString::to_string)
+                .or_else(|| Some("Antigravity OAuth".to_string())),
             auth_path: token_path.to_string_lossy().into_owned(),
             config_path: None,
             oauth_token: Some(token.to_string()),
@@ -402,10 +412,9 @@ mod tests {
         let ga_file = state_dir.join("google_accounts.json");
         fs::write(&ga_file, r#"{"active":"test@gmail.com","old":[]}"#).expect("write ga");
 
-        let adapter = crate::adapters::antigravity::AntigravityAdapter::default();
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
         let mut state = State::default();
         let result = adapter.import_auth_path(state_dir, &mut state, &ga_file);
         assert!(result.is_err());
     }
 }
-

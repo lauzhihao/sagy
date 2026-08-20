@@ -28,5 +28,7 @@ pub fn resolve_repo_sync_repo(state_dir: &Path, repo_arg: Option<&str>) -> Resul
         }
     }
 
-    bail!("No Git repository specified. Please provide a repository URL, e.g. `sagy push git@github.com:user/sagy-accounts.git`")
+    bail!(
+        "No Git repository specified. Please provide a repository URL, e.g. `sagy push git@github.com:user/sagy-accounts.git`"
+    )
 }

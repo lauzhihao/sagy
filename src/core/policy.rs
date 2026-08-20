@@ -1,5 +1,5 @@
-use std::cmp::Ordering;
 use chrono::Utc;
+use std::cmp::Ordering;
 
 use crate::core::state::{AccountRecord, State, UsageSnapshot};
 
@@ -85,7 +85,10 @@ fn score_account(account: &AccountRecord, usage: &UsageSnapshot, now: i64) -> f6
     // Plan preferences (Pro / Paid plans have higher priority)
     if let Some(plan) = &account.plan {
         let plan_lower = plan.to_ascii_lowercase();
-        if plan_lower.contains("pro") || plan_lower.contains("advanced") || plan_lower.contains("ultra") {
+        if plan_lower.contains("pro")
+            || plan_lower.contains("advanced")
+            || plan_lower.contains("ultra")
+        {
             score += 100.0;
         }
     }
@@ -225,5 +228,3 @@ mod tests {
         assert!(selected.is_none());
     }
 }
-
-

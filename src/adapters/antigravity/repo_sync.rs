@@ -84,7 +84,9 @@ impl super::AntigravityAdapter {
             state
                 .accounts
                 .iter()
-                .filter(|a| a.oauth_token.is_some() || a.api_key.is_some() || a.refresh_token.is_some())
+                .filter(|a| {
+                    a.oauth_token.is_some() || a.api_key.is_some() || a.refresh_token.is_some()
+                })
                 .cloned()
                 .collect()
         };
@@ -106,7 +108,12 @@ impl super::AntigravityAdapter {
         fs::create_dir_all(&bundle_root)?;
         fs::write(&bundle_path, enc_json)?;
 
-        git_cmd(&git_bin, &checkout.checkout_dir, &["add", bundle_dir_str], identity_file)?;
+        git_cmd(
+            &git_bin,
+            &checkout.checkout_dir,
+            &["add", bundle_dir_str],
+            identity_file,
+        )?;
 
         let status_out = git_cmd(
             &git_bin,
@@ -136,7 +143,12 @@ impl super::AntigravityAdapter {
             identity_file,
         )?;
 
-        git_cmd(&git_bin, &checkout.checkout_dir, &["push", "origin", "HEAD"], identity_file)?;
+        git_cmd(
+            &git_bin,
+            &checkout.checkout_dir,
+            &["push", "origin", "HEAD"],
+            identity_file,
+        )?;
 
         Ok(PushOutcome {
             changed: true,
@@ -157,7 +169,10 @@ impl super::AntigravityAdapter {
         let bundle_dir_str = bundle_dir.unwrap_or(DEFAULT_BUNDLE_DIR);
 
         let checkout = clone_repo(&git_bin, state_dir, repo, identity_file)?;
-        let bundle_path = checkout.checkout_dir.join(bundle_dir_str).join(BUNDLE_FILENAME);
+        let bundle_path = checkout
+            .checkout_dir
+            .join(bundle_dir_str)
+            .join(BUNDLE_FILENAME);
 
         if !bundle_path.exists() {
             bail!(
@@ -190,7 +205,10 @@ impl super::AntigravityAdapter {
                     "email": account.email,
                     "project_id": account.project_id,
                 });
-                let _ = fs::write(&cred_file, serde_json::to_string_pretty(&creds_json).unwrap_or_default());
+                let _ = fs::write(
+                    &cred_file,
+                    serde_json::to_string_pretty(&creds_json).unwrap_or_default(),
+                );
                 account.auth_path = cred_file.to_string_lossy().into_owned();
             } else {
                 let cred_file = super::paths::account_credentials_file(&acc_dir);
@@ -200,7 +218,10 @@ impl super::AntigravityAdapter {
                         "refresh_token": account.refresh_token,
                         "project_id": account.project_id,
                     });
-                    let _ = fs::write(&cred_file, serde_json::to_string_pretty(&creds_json).unwrap_or_default());
+                    let _ = fs::write(
+                        &cred_file,
+                        serde_json::to_string_pretty(&creds_json).unwrap_or_default(),
+                    );
                 }
                 account.auth_path = cred_file.to_string_lossy().into_owned();
             }
@@ -241,9 +262,7 @@ fn resolve_bundle_key() -> Result<String> {
             return Ok(trimmed);
         }
     }
-    bail!(
-        "Environment variable `{BUNDLE_KEY_ENV}` is not set. Please provide an encryption key."
-    )
+    bail!("Environment variable `{BUNDLE_KEY_ENV}` is not set. Please provide an encryption key.")
 }
 
 fn encrypt_bytes(data: &[u8], password: &str) -> Result<EncryptedBundlePayload> {
@@ -374,4 +393,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

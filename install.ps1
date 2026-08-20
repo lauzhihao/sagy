@@ -39,8 +39,40 @@ Copy-Item $targetExe (Join-Path $InstallBin "flash.exe") -Force
 Copy-Item $targetExe (Join-Path $InstallBin "pro.exe") -Force
 Copy-Item $targetExe (Join-Path $InstallBin "think.exe") -Force
 
+# Install sagy-original passthrough wrapper for Windows cmd/powershell
+$originalWrapperCmd = Join-Path $InstallBin "sagy-original.cmd"
+@"
+@echo off
+if defined AGY_BIN (
+    "%AGY_BIN%" %*
+    exit /b %ERRORLEVEL%
+)
+where agy >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    agy %*
+    exit /b %ERRORLEVEL%
+)
+if exist "%USERPROFILE%\.gemini\antigravity-cli\bin\agy.cmd" (
+    "%USERPROFILE%\.gemini\antigravity-cli\bin\agy.cmd" %*
+    exit /b %ERRORLEVEL%
+)
+echo agy not found in PATH or ~/.gemini/antigravity-cli/bin/agy.cmd 1>&2
+exit /b 1
+"@ | Out-File -FilePath $originalWrapperCmd -Encoding ascii -Force
+
 Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
 
+# Post-install auto import of existing ~/.gemini credentials
+$geminiDir = Join-Path $HOME ".gemini"
+if (Test-Path $geminiDir) {
+    try {
+        & $targetExe import-known *>$null
+        Write-Host "Imported current Antigravity credentials into sagy state."
+    } catch {
+        Write-Host "Installed sagy, but auto-importing current credentials skipped."
+    }
+}
+
 Write-Host "sagy installed successfully to $targetExe"
-Write-Host "Binaries: sagy, flash, pro, think"
+Write-Host "Binaries: sagy, flash, pro, think, sagy-original"
 Write-Host "Please ensure '$InstallBin' is in your PATH."

@@ -15,12 +15,22 @@ impl super::AntigravityAdapter {
         }
 
         let now = Utc::now().timestamp();
-        let headers = [" ", "Email / Label", "Type", "Plan", "Status", "Quota", "Last Used"];
+        let headers = [
+            " ",
+            "Email / Label",
+            "Type",
+            "Plan",
+            "Status",
+            "Quota",
+            "Last Used",
+        ];
         let mut rows = Vec::new();
 
         for account in &state.accounts {
             let is_active = state.current_account_id.as_deref() == Some(&account.id)
-                || active_identity.map(|id| id.email.eq_ignore_ascii_case(&account.email)).unwrap_or(false);
+                || active_identity
+                    .map(|id| id.email.eq_ignore_ascii_case(&account.email))
+                    .unwrap_or(false);
 
             let active_str = if is_active { "*" } else { " " };
             let email_str = account.email.as_str();
@@ -106,7 +116,7 @@ impl super::AntigravityAdapter {
         for row in rows {
             for (i, cell) in row.iter().enumerate() {
                 let pad = col_widths[i] - UnicodeWidthStr::width(cell.as_str());
-                output.push_str(&cell);
+                output.push_str(cell);
                 output.push_str(&" ".repeat(pad + 2));
             }
             output.push('\n');
