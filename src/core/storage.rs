@@ -68,10 +68,38 @@ pub struct RepoSyncConfig {
     pub last_repo: Option<String>,
 }
 
+pub fn create_secure_dir_all(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o700);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    Ok(())
+}
+
 pub fn load_state(state_dir: &Path) -> Result<State> {
     let state_file = state_dir.join("state.json");
     if !state_file.exists() {
         return Ok(State::default());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(&state_file) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(&state_file, perms);
+            }
+        }
     }
 
     let contents = fs::read_to_string(&state_file)
@@ -85,8 +113,7 @@ pub fn load_state(state_dir: &Path) -> Result<State> {
 
 pub fn write_file_atomically(target: &Path, content: &[u8]) -> Result<()> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        create_secure_dir_all(parent)?;
     }
 
     let file_name = target
@@ -139,7 +166,7 @@ pub fn write_secret_file(target: &Path, content: &[u8]) -> Result<()> {
 pub fn save_state(state_dir: &Path, state: &State) -> Result<()> {
     let target = state_dir.join("state.json");
     let contents = serde_json::to_string_pretty(state).context("failed to serialize state")?;
-    write_file_atomically(&target, contents.as_bytes())
+    write_secret_file(&target, contents.as_bytes())
 }
 
 pub fn load_repo_sync_config(state_dir: &Path) -> Result<RepoSyncConfig> {

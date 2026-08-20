@@ -22,7 +22,7 @@ pub use args::{
 };
 
 use args::resolve_login_mode;
-use help::{render_help, requested_help_topic};
+use help::{is_known_subcmd, render_help, requested_help_topic};
 use launch::{ensure_launch_account, print_selection};
 use repo_sync::resolve_repo_sync_repo;
 
@@ -90,14 +90,25 @@ impl Cli {
         let is_alias =
             exe_name.contains("flash") || exe_name.contains("pro") || exe_name.contains("think");
 
+        let first_subcmd = find_first_subcmd(&raw_args);
+        let has_known_subcmd = first_subcmd
+            .as_deref()
+            .map(is_known_subcmd)
+            .unwrap_or(false);
+
         if is_alias {
-            let rewritten = rewrite_alias_args(&raw_args);
+            if has_known_subcmd {
+                let mut rewritten = vec![OsString::from("sagy")];
+                rewritten.extend(raw_args.iter().skip(1).cloned());
+                return Self::parse_from(rewritten);
+            }
+            let rewritten = rewrite_launch_args(&raw_args);
             return Self::parse_from(rewritten);
         }
 
         // If no explicit subcommand is given, rewrite flags directly to launch
-        if raw_args.len() > 1 && !has_subcommand(&raw_args) {
-            let rewritten = rewrite_passthrough_launch_args(&raw_args);
+        if raw_args.len() > 1 && !has_known_subcmd {
+            let rewritten = rewrite_launch_args(&raw_args);
             return Self::parse_from(rewritten);
         }
 
@@ -105,7 +116,7 @@ impl Cli {
     }
 }
 
-fn has_subcommand(raw_args: &[OsString]) -> bool {
+fn find_first_subcmd(raw_args: &[OsString]) -> Option<String> {
     let mut iter = raw_args.iter().skip(1);
     while let Some(arg) = iter.next() {
         let s = arg.to_string_lossy();
@@ -117,10 +128,10 @@ fn has_subcommand(raw_args: &[OsString]) -> bool {
             continue;
         }
         if !s.starts_with('-') {
-            return true;
+            return Some(s.to_string());
         }
     }
-    false
+    None
 }
 
 fn is_sagy_launch_flag(s: &str) -> bool {
@@ -130,41 +141,7 @@ fn is_sagy_launch_flag(s: &str) -> bool {
     )
 }
 
-fn rewrite_alias_args(raw_args: &[OsString]) -> Vec<OsString> {
-    let mut rewritten = Vec::new();
-    rewritten.push(OsString::from("sagy"));
-
-    let mut launch_flags = Vec::new();
-    let mut extra_args = Vec::new();
-    let mut iter = raw_args.iter().skip(1);
-
-    while let Some(arg) = iter.next() {
-        let s = arg.to_string_lossy();
-        if s == "--state-dir" {
-            rewritten.push(arg.clone());
-            if let Some(val) = iter.next() {
-                rewritten.push(val.clone());
-            }
-        } else if s.starts_with("--state-dir=") {
-            rewritten.push(arg.clone());
-        } else if is_sagy_launch_flag(&s) {
-            launch_flags.push(arg.clone());
-        } else {
-            extra_args.push(arg.clone());
-        }
-    }
-
-    rewritten.push(OsString::from("launch"));
-    rewritten.extend(launch_flags);
-    if !extra_args.is_empty() {
-        rewritten.push(OsString::from("--"));
-        rewritten.extend(extra_args);
-    }
-
-    rewritten
-}
-
-fn rewrite_passthrough_launch_args(raw_args: &[OsString]) -> Vec<OsString> {
+fn rewrite_launch_args(raw_args: &[OsString]) -> Vec<OsString> {
     let mut rewritten = Vec::new();
     rewritten.push(OsString::from("sagy"));
 
@@ -245,9 +222,9 @@ pub fn run(cli: Cli) -> Result<i32> {
                                 !args.no_resume,
                             )?;
 
-                            // If exit code indicates rate limit (429), trigger cooldown immediately
-                            if code == 429 {
-                                adapter.mark_rate_limited(&mut state, &account.id);
+                            if code != 0 {
+                                adapter
+                                    .refresh_account_usage(&state_dir, &mut state, &account, true);
                                 storage::save_state(&state_dir, &state)?;
                             }
 
@@ -294,7 +271,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Login(args) => {
             let mode = resolve_login_mode(&args)?;
             let record = adapter.run_login_mode(&state_dir, &mut state, mode)?;
-            let usage = adapter.refresh_account_usage(&state_dir, &mut state, &record);
+            let usage = adapter.refresh_account_usage(&state_dir, &mut state, &record, true);
             println!("{}", ui.added_account(&record.email));
             adapter.switch_account(&record)?;
             state.current_account_id = Some(record.id.clone());
@@ -309,7 +286,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Add(args) => {
             let mode = resolve_login_mode(&args.login)?;
             let record = adapter.run_login_mode(&state_dir, &mut state, mode)?;
-            let usage = adapter.refresh_account_usage(&state_dir, &mut state, &record);
+            let usage = adapter.refresh_account_usage(&state_dir, &mut state, &record, true);
             println!("{}", ui.added_account(&record.email));
             if args.switch {
                 adapter.switch_account(&record)?;
@@ -388,9 +365,12 @@ pub fn run(cli: Cli) -> Result<i32> {
                 &state_dir,
                 &state,
                 &repo,
-                args.path.as_deref(),
-                args.identity_file.as_deref(),
-                args.all,
+                crate::adapters::antigravity::PushOptions {
+                    bundle_dir: args.path.as_deref(),
+                    identity_file: args.identity_file.as_deref(),
+                    include_all: args.all,
+                    insecure_host_key: args.insecure_host_key,
+                },
             )?;
             if outcome.changed {
                 println!(
@@ -408,29 +388,32 @@ pub fn run(cli: Cli) -> Result<i32> {
                 &state_dir,
                 &mut state,
                 &repo,
-                args.path.as_deref(),
-                args.identity_file.as_deref(),
+                crate::adapters::antigravity::PullOptions {
+                    bundle_dir: args.path.as_deref(),
+                    identity_file: args.identity_file.as_deref(),
+                    insecure_host_key: args.insecure_host_key,
+                },
             )?;
             storage::save_state(&state_dir, &state)?;
             println!(
                 "{}",
                 ui.repo_pull_completed(&repo, outcome.imported_accounts)
             );
-            adapter.refresh_all_accounts(&state_dir, &mut state);
+            adapter.refresh_all_accounts(&state_dir, &mut state, false);
             storage::save_state(&state_dir, &state)?;
             let active = adapter.active_identity_from_state(&state);
             println!("{}", adapter.render_account_table(&state, active.as_ref()));
             0
         }
         Command::List => {
-            adapter.refresh_all_accounts(&state_dir, &mut state);
+            adapter.refresh_all_accounts(&state_dir, &mut state, false);
             storage::save_state(&state_dir, &state)?;
             let active = adapter.active_identity_from_state(&state);
             println!("{}", adapter.render_account_table(&state, active.as_ref()));
             0
         }
         Command::Refresh => {
-            adapter.refresh_all_accounts(&state_dir, &mut state);
+            adapter.refresh_all_accounts(&state_dir, &mut state, true);
             storage::save_state(&state_dir, &state)?;
             let active = adapter.active_identity_from_state(&state);
             println!("{}", adapter.render_account_table(&state, active.as_ref()));
@@ -500,8 +483,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                     print_selection(ui.selection_switched(), &account, &usage);
                     storage::save_state(&state_dir, &state)?;
                     let code = adapter.run_passthrough(&state_dir, &account, &args)?;
-                    if code == 429 {
-                        adapter.mark_rate_limited(&mut state, &account.id);
+                    if code != 0 {
+                        adapter.refresh_account_usage(&state_dir, &mut state, &account, true);
                         storage::save_state(&state_dir, &state)?;
                     }
                     code

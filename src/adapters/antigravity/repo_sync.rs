@@ -44,6 +44,21 @@ pub struct PushOutcome {
     pub exported_accounts: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PushOptions<'a> {
+    pub bundle_dir: Option<&'a str>,
+    pub identity_file: Option<&'a Path>,
+    pub include_all: bool,
+    pub insecure_host_key: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PullOptions<'a> {
+    pub bundle_dir: Option<&'a str>,
+    pub identity_file: Option<&'a Path>,
+    pub insecure_host_key: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullOutcome {
     pub imported_accounts: usize,
@@ -65,9 +80,7 @@ impl super::AntigravityAdapter {
         state_dir: &Path,
         state: &State,
         repo: &str,
-        bundle_dir: Option<&str>,
-        identity_file: Option<&Path>,
-        _include_all: bool,
+        opts: PushOptions<'_>,
     ) -> Result<PushOutcome> {
         if state.accounts.is_empty() {
             bail!("No accounts to push in local state");
@@ -75,13 +88,19 @@ impl super::AntigravityAdapter {
 
         let git_bin = find_git_bin().ok_or_else(|| anyhow!("git binary not found in PATH"))?;
         let bundle_key = resolve_bundle_key()?;
-        let bundle_dir_str = bundle_dir.unwrap_or(DEFAULT_BUNDLE_DIR);
+        let bundle_dir_str = opts.bundle_dir.unwrap_or(DEFAULT_BUNDLE_DIR);
 
-        let checkout = clone_repo(&git_bin, state_dir, repo, identity_file)?;
+        let checkout = clone_repo(
+            &git_bin,
+            state_dir,
+            repo,
+            opts.identity_file,
+            opts.insecure_host_key,
+        )?;
         let bundle_root = checkout.checkout_dir.join(bundle_dir_str);
         let bundle_path = bundle_root.join(BUNDLE_FILENAME);
 
-        let accounts_to_export: Vec<AccountRecord> = if _include_all {
+        let accounts_to_export: Vec<AccountRecord> = if opts.include_all {
             state.accounts.clone()
         } else {
             state
@@ -115,14 +134,16 @@ impl super::AntigravityAdapter {
             &git_bin,
             &checkout.checkout_dir,
             &["add", bundle_dir_str],
-            identity_file,
+            opts.identity_file,
+            opts.insecure_host_key,
         )?;
 
         let status_out = git_cmd(
             &git_bin,
             &checkout.checkout_dir,
             &["status", "--porcelain"],
-            identity_file,
+            opts.identity_file,
+            opts.insecure_host_key,
         )?;
         if status_out.stdout.is_empty() {
             return Ok(PushOutcome {
@@ -143,14 +164,16 @@ impl super::AntigravityAdapter {
                 "-m",
                 "chore(sagy): sync encrypted account pool",
             ],
-            identity_file,
+            opts.identity_file,
+            opts.insecure_host_key,
         )?;
 
         git_cmd(
             &git_bin,
             &checkout.checkout_dir,
             &["push", "origin", "HEAD"],
-            identity_file,
+            opts.identity_file,
+            opts.insecure_host_key,
         )?;
 
         Ok(PushOutcome {
@@ -164,14 +187,19 @@ impl super::AntigravityAdapter {
         state_dir: &Path,
         state: &mut State,
         repo: &str,
-        bundle_dir: Option<&str>,
-        identity_file: Option<&Path>,
+        opts: PullOptions<'_>,
     ) -> Result<PullOutcome> {
         let git_bin = find_git_bin().ok_or_else(|| anyhow!("git binary not found in PATH"))?;
         let bundle_key = resolve_bundle_key()?;
-        let bundle_dir_str = bundle_dir.unwrap_or(DEFAULT_BUNDLE_DIR);
+        let bundle_dir_str = opts.bundle_dir.unwrap_or(DEFAULT_BUNDLE_DIR);
 
-        let checkout = clone_repo(&git_bin, state_dir, repo, identity_file)?;
+        let checkout = clone_repo(
+            &git_bin,
+            state_dir,
+            repo,
+            opts.identity_file,
+            opts.insecure_host_key,
+        )?;
         let bundle_path = checkout
             .checkout_dir
             .join(bundle_dir_str)
@@ -195,11 +223,11 @@ impl super::AntigravityAdapter {
         let mut imported_count = 0;
         for mut account in bundle.accounts {
             let acc_dir = account_dir(state_dir, &account.id);
-            fs::create_dir_all(&acc_dir)?;
+            storage::create_secure_dir_all(&acc_dir)?;
 
             if let Some(token) = &account.oauth_token {
                 let token_file = super::paths::account_token_file(&acc_dir);
-                fs::write(&token_file, token)?;
+                storage::write_secret_file(&token_file, token.as_bytes())?;
                 account.auth_path = token_file.to_string_lossy().into_owned();
             } else if let Some(api_key) = &account.api_key {
                 let cred_file = super::paths::account_credentials_file(&acc_dir);
@@ -208,9 +236,11 @@ impl super::AntigravityAdapter {
                     "email": account.email,
                     "project_id": account.project_id,
                 });
-                let _ = fs::write(
+                let _ = storage::write_secret_file(
                     &cred_file,
-                    serde_json::to_string_pretty(&creds_json).unwrap_or_default(),
+                    serde_json::to_string_pretty(&creds_json)
+                        .unwrap_or_default()
+                        .as_bytes(),
                 );
                 account.auth_path = cred_file.to_string_lossy().into_owned();
             } else {
@@ -221,9 +251,11 @@ impl super::AntigravityAdapter {
                         "refresh_token": account.refresh_token,
                         "project_id": account.project_id,
                     });
-                    let _ = fs::write(
+                    let _ = storage::write_secret_file(
                         &cred_file,
-                        serde_json::to_string_pretty(&creds_json).unwrap_or_default(),
+                        serde_json::to_string_pretty(&creds_json)
+                            .unwrap_or_default()
+                            .as_bytes(),
                     );
                 }
                 account.auth_path = cred_file.to_string_lossy().into_owned();
@@ -349,16 +381,17 @@ fn clone_repo(
     state_dir: &Path,
     repo: &str,
     identity_file: Option<&Path>,
+    insecure_host_key: bool,
 ) -> Result<TempCheckout> {
     let tmp_root = storage::tmp_dir(state_dir);
-    fs::create_dir_all(&tmp_root)?;
+    storage::create_secure_dir_all(&tmp_root)?;
     let checkout_dir = tmp_root.join(format!("repo-sync-{}", Uuid::new_v4()));
 
     let mut args = vec!["clone", "--depth", "1", repo];
     let checkout_str = checkout_dir.to_string_lossy();
     args.push(&checkout_str);
 
-    git_cmd(git_bin, state_dir, &args, identity_file)?;
+    git_cmd(git_bin, state_dir, &args, identity_file, insecure_host_key)?;
 
     Ok(TempCheckout { checkout_dir })
 }
@@ -368,19 +401,21 @@ fn git_cmd(
     cwd: &Path,
     args: &[&str],
     identity_file: Option<&Path>,
+    insecure_host_key: bool,
 ) -> Result<Output> {
     let mut cmd = Command::new(git_bin);
     cmd.current_dir(cwd);
     cmd.args(args);
 
     if let Some(id_file) = identity_file {
-        cmd.env(
-            "GIT_SSH_COMMAND",
-            format!(
-                "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no",
-                id_file.display()
-            ),
-        );
+        let mut ssh_cmd = format!("ssh -i {} -o IdentitiesOnly=yes", id_file.display());
+        if insecure_host_key {
+            eprintln!(
+                "[sagy] WARNING: StrictHostKeyChecking is disabled (--insecure-host-key). This connection is vulnerable to MITM attacks."
+            );
+            ssh_cmd.push_str(" -o StrictHostKeyChecking=no");
+        }
+        cmd.env("GIT_SSH_COMMAND", ssh_cmd);
     }
 
     let output = cmd

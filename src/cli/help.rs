@@ -38,7 +38,7 @@ pub fn requested_help_topic(args: &[OsString]) -> Option<Option<String>> {
     None
 }
 
-fn is_known_subcmd(s: &str) -> bool {
+pub fn is_known_subcmd(s: &str) -> bool {
     matches!(
         s,
         "launch"
@@ -71,9 +71,9 @@ pub fn render_help(topic: Option<String>) -> String {
 
 用法:
   sagy [命令] [参数...]
-  flash [参数...]        使用 gemini-3.7-flash (effort: low) 快速启动
-  pro [参数...]          使用 gemini-3.7-pro (effort: high) 快速启动
-  think [参数...]        使用 gemini-3.7-flash (effort: high) 深度思考模式启动
+  flash [参数...]        使用 gemini-3.7-flash-low 快速启动
+  pro [参数...]          使用 gemini-3.1-pro-high 快速启动
+  think [参数...]        使用 gemini-3.7-flash-high 深度思考模式启动
 
 核心命令:
   sagy [launch]          选择最佳账号，切换后启动或恢复 Antigravity CLI
@@ -101,9 +101,9 @@ pub fn render_help(topic: Option<String>) -> String {
 
 Usage:
   sagy [command] [args...]
-  flash [args...]        Launch with gemini-3.7-flash (effort: low)
-  pro [args...]          Launch with gemini-3.7-pro (effort: high)
-  think [args...]        Launch with gemini-3.7-flash (effort: high)
+  flash [args...]        Launch with gemini-3.7-flash-low
+  pro [args...]          Launch with gemini-3.1-pro-high
+  think [args...]        Launch with gemini-3.7-flash-high
 
 Commands:
   sagy [launch]          Select best account, switch, and launch Antigravity CLI

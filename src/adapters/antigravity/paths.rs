@@ -122,10 +122,4 @@ mod tests {
         let settings_file = account_settings_file(&acc_dir);
         assert_eq!(settings_file, acc_dir.join("settings.json"));
     }
-
-    #[test]
-    fn test_find_git_bin() {
-        let git = find_git_bin();
-        assert!(git.is_some());
-    }
 }

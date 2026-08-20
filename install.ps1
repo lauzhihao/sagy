@@ -30,6 +30,25 @@ $zipPath = Join-Path $TmpRoot $assetName
 Write-Host "Downloading $downloadUrl..."
 Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
 
+# Verify SHA256 Checksum
+$sumsUrl = "https://github.com/$Repo/releases/download/$Version/SHA256SUMS.txt"
+$sumsPath = Join-Path $TmpRoot "SHA256SUMS.txt"
+try {
+    Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing -TimeoutSec 15
+    if (Test-Path $sumsPath) {
+        $expectedHash = (Get-Content $sumsPath | Select-String $assetName | ForEach-Object { ($_ -split '\s+')[0] })
+        if ($expectedHash) {
+            $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+            if ($actualHash -ne $expectedHash.ToLower()) {
+                throw "SHA-256 checksum mismatch for $assetName! Expected: $expectedHash, got: $actualHash"
+            }
+            Write-Host "Checksum verified: $expectedHash"
+        }
+    }
+} catch {
+    Write-Warning "Checksum verification skipped or failed: $_"
+}
+
 Expand-Archive -Path $zipPath -DestinationPath $TmpRoot -Force
 $extractedExe = Join-Path $TmpRoot "sagy.exe"
 $targetExe = Join-Path $InstallBin "sagy.exe"

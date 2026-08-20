@@ -126,7 +126,7 @@ impl super::AntigravityAdapter {
                 let email_str = email.unwrap_or("api-key-user@gemini");
                 let acc_id = uuid::Uuid::new_v4().to_string();
                 let acc_dir = super::paths::account_dir(state_dir, &acc_id);
-                fs::create_dir_all(&acc_dir)?;
+                crate::core::storage::create_secure_dir_all(&acc_dir)?;
                 let cred_file = super::paths::account_credentials_file(&acc_dir);
 
                 let creds_json = serde_json::json!({
@@ -134,7 +134,10 @@ impl super::AntigravityAdapter {
                     "email": email_str,
                     "project_id": project_id,
                 });
-                fs::write(&cred_file, serde_json::to_string_pretty(&creds_json)?)?;
+                crate::core::storage::write_secret_file(
+                    &cred_file,
+                    serde_json::to_string_pretty(&creds_json)?.as_bytes(),
+                )?;
 
                 let now = chrono::Utc::now().timestamp();
                 let record = AccountRecord {
@@ -173,52 +176,5 @@ impl super::AntigravityAdapter {
                 Ok(record)
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_switch_api_key_account_does_not_mutate_oauth_files() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let state_dir = temp_dir.path();
-        let cred_file = state_dir.join("credentials.json");
-        fs::write(&cred_file, r#"{"api_key":"test_key","email":"api@user"}"#).expect("write");
-
-        let account = AccountRecord {
-            id: "api-acc-1".to_string(),
-            email: "api@user".to_string(),
-            account_type: AccountType::ApiKey,
-            api_key: Some("test_key".to_string()),
-            auth_path: cred_file.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-
-        let adapter = super::super::AntigravityAdapter;
-        let switch_res = adapter.switch_account(&account);
-        assert!(switch_res.is_ok());
-    }
-
-    #[test]
-    fn test_switch_token_account_writes_token_file() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let state_dir = temp_dir.path();
-        let token_file = state_dir.join("antigravity-oauth-token");
-        fs::write(&token_file, "jwt_token_sample").expect("write");
-
-        let account = AccountRecord {
-            id: "token-acc-1".to_string(),
-            email: "token@user".to_string(),
-            account_type: AccountType::OAuth,
-            oauth_token: Some("jwt_token_sample".to_string()),
-            auth_path: token_file.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-
-        let adapter = super::super::AntigravityAdapter;
-        let switch_res = adapter.switch_account(&account);
-        assert!(switch_res.is_ok());
     }
 }

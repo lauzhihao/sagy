@@ -8,6 +8,11 @@ use anyhow::{Context, Result};
 use super::paths::find_agy_bin;
 use crate::core::state::AccountRecord;
 
+// Verified model IDs accepted by agy (source: `agy models`)
+pub const FLASH_MODEL_ID: &str = "gemini-3.7-flash-low";
+pub const PRO_MODEL_ID: &str = "gemini-3.1-pro-high";
+pub const THINK_MODEL_ID: &str = "gemini-3.7-flash-high";
+
 impl super::AntigravityAdapter {
     pub fn launch_agy(
         &self,
@@ -44,40 +49,22 @@ impl super::AntigravityAdapter {
                 && !contains_flag(extra_args, "--model")
             {
                 final_args.push(OsString::from("--model"));
-                final_args.push(OsString::from("gemini-3.7-flash"));
-                if !contains_flag(extra_args, "--effort") {
-                    final_args.push(OsString::from("--effort"));
-                    final_args.push(OsString::from("low"));
-                }
+                final_args.push(OsString::from(FLASH_MODEL_ID));
             } else if (exe_lower.contains("pro") || exe_lower == "sagy-pro")
                 && !contains_flag(extra_args, "--model")
             {
                 final_args.push(OsString::from("--model"));
-                final_args.push(OsString::from("gemini-3.7-pro"));
-                if !contains_flag(extra_args, "--effort") {
-                    final_args.push(OsString::from("--effort"));
-                    final_args.push(OsString::from("high"));
-                }
+                final_args.push(OsString::from(PRO_MODEL_ID));
             } else if (exe_lower.contains("think") || exe_lower == "sagy-think")
                 && !contains_flag(extra_args, "--model")
             {
                 final_args.push(OsString::from("--model"));
-                final_args.push(OsString::from("gemini-3.7-flash"));
-                if !contains_flag(extra_args, "--effort") {
-                    final_args.push(OsString::from("--effort"));
-                    final_args.push(OsString::from("high"));
-                }
+                final_args.push(OsString::from(THINK_MODEL_ID));
             }
         }
 
-        // 4. Session continuation / resume logic
-        if resume
-            && !contains_flag(extra_args, "--continue")
-            && !contains_flag(extra_args, "-c")
-            && !contains_flag(extra_args, "--prompt")
-            && !contains_flag(extra_args, "-p")
-            && !contains_flag(extra_args, "--conversation")
-        {
+        // 4. Session continuation / resume logic: only inject --continue if no prompt or continuation flag is given
+        if resume && !has_prompt_or_continue_args(extra_args) {
             final_args.push(OsString::from("--continue"));
         }
 
@@ -115,4 +102,29 @@ impl super::AntigravityAdapter {
 fn contains_flag(args: &[OsString], flag: &str) -> bool {
     args.iter()
         .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case(flag))
+}
+
+fn has_prompt_or_continue_args(extra_args: &[OsString]) -> bool {
+    let mut has_positional = false;
+    for arg in extra_args {
+        let s = arg.to_string_lossy();
+        if s == "--continue"
+            || s == "-c"
+            || s == "--prompt"
+            || s == "-p"
+            || s == "--print"
+            || s == "-i"
+            || s == "--prompt-interactive"
+            || s == "--conversation"
+            || s.starts_with("--prompt=")
+            || s.starts_with("--print=")
+            || s.starts_with("--conversation=")
+        {
+            return true;
+        }
+        if !s.starts_with('-') {
+            has_positional = true;
+        }
+    }
+    has_positional
 }

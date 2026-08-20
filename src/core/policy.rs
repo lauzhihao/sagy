@@ -69,6 +69,11 @@ fn score_account(account: &AccountRecord, usage: &UsageSnapshot, now: i64) -> f6
         }
     }
 
+    // Soft penalty for stale tokens that can be refreshed by agy
+    if usage.status == "Stale" {
+        score -= 200.0;
+    }
+
     // Quota percentage bonus
     if let Some(remaining) = usage.remaining_quota_percent {
         score += (remaining as f64) * 5.0;
@@ -226,5 +231,31 @@ mod tests {
 
         let selected = select_best_account(&state, &state.accounts);
         assert!(selected.is_none());
+    }
+
+    #[test]
+    fn test_select_best_account_selects_stale_refreshable_account() {
+        let mut state = State::default();
+        let acc1 = AccountRecord {
+            id: "acc-1".to_string(),
+            email: "user1@gmail.com".to_string(),
+            account_type: AccountType::OAuth,
+            refresh_token: Some("1//sample_refresh".to_string()),
+            ..Default::default()
+        };
+        state.accounts = vec![acc1];
+        state.usage_cache.insert(
+            "acc-1".to_string(),
+            UsageSnapshot {
+                status: "Stale".to_string(),
+                remaining_quota_percent: Some(50),
+                needs_relogin: false,
+                ..Default::default()
+            },
+        );
+
+        let selected = select_best_account(&state, &state.accounts);
+        assert!(selected.is_some());
+        assert_eq!(selected.unwrap().0.id, "acc-1");
     }
 }

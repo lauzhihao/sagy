@@ -43,9 +43,9 @@ cargo build --release
 | 命令 | 对应模型与行为 |
 | :--- | :--- |
 | **`sagy`** | 默认主命令，智能优选最佳账号后启动 `agy` |
-| **`flash`** | 快捷绑定 `gemini-3.7-flash` (effort: `low`) 极速启动 |
-| **`pro`** | 快捷绑定 `gemini-3.7-pro` (effort: `high`) 旗舰推理启动 |
-| **`think`** | 快捷绑定 `gemini-3.7-flash` (effort: `high`) 深度思考模式 |
+| **`flash`** | 快捷绑定 `gemini-3.7-flash-low` 极速启动 |
+| **`pro`** | 快捷绑定 `gemini-3.1-pro-high` 旗舰推理启动 |
+| **`think`** | 快捷绑定 `gemini-3.7-flash-high` 深度思考模式 |
 | **`sagy-original`** | 到底层官方 `agy` 二进制的透明直通辅助命令 |
 
 ---

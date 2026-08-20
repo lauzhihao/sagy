@@ -93,6 +93,28 @@ download_and_install() {
   echo "Downloading ${url}"
   curl -fsSL "${url}" -o "${archive_path}"
 
+  local sums_url sums_path expected_hash actual_hash
+  sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.txt"
+  sums_path="${tmp_dir}/SHA256SUMS.txt"
+  if curl -fsSL "${sums_url}" -o "${sums_path}" 2>/dev/null; then
+    echo "Verifying SHA256 checksum..."
+    expected_hash="$(grep -F "${asset}" "${sums_path}" | awk '{print $1}' || true)"
+    if [[ -n "${expected_hash}" ]]; then
+      if need_cmd shasum; then
+        actual_hash="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+      elif need_cmd sha256sum; then
+        actual_hash="$(sha256sum "${archive_path}" | awk '{print $1}')"
+      else
+        actual_hash=""
+      fi
+      if [[ -n "${actual_hash}" && "${actual_hash}" != "${expected_hash}" ]]; then
+        echo "Checksum mismatch for ${asset}! Expected: ${expected_hash}, got: ${actual_hash}" >&2
+        exit 1
+      fi
+      echo "Checksum verified: ${expected_hash}"
+    fi
+  fi
+
   mkdir -p "${INSTALL_BIN}"
   tar -xzf "${archive_path}" -C "${tmp_dir}"
   extracted_path="${tmp_dir}/sagy"

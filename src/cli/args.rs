@@ -98,6 +98,12 @@ pub struct RepoSyncArgs {
     #[arg(long, help = "Include all accounts regardless of portability")]
     pub all: bool,
 
+    #[arg(
+        long,
+        help = "Disable SSH strict host key verification (insecure, opt-in)"
+    )]
+    pub insecure_host_key: bool,
+
     #[arg(help = "Git repository URL (e.g. git@github.com:user/sagy-pool.git)")]
     pub repo: Option<String>,
 }

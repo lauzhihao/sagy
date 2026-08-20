@@ -43,9 +43,9 @@ cargo build --release
 | Binary | Target Model & Mode |
 | :--- | :--- |
 | **`sagy`** | Default launcher, auto-selects healthiest account and starts `agy` |
-| **`flash`** | Launches with `gemini-3.7-flash` (effort: `low`) for rapid turnaround |
-| **`pro`** | Launches with `gemini-3.7-pro` (effort: `high`) for complex reasoning |
-| **`think`** | Launches with `gemini-3.7-flash` (effort: `high`) deep thinking mode |
+| **`flash`** | Launches with `gemini-3.7-flash-low` for rapid turnaround |
+| **`pro`** | Launches with `gemini-3.1-pro-high` for complex reasoning |
+| **`think`** | Launches with `gemini-3.7-flash-high` deep thinking mode |
 | **`sagy-original`** | Passthrough helper straight to official underlying `agy` |
 
 ---

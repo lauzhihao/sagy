@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
@@ -49,13 +50,39 @@ struct GithubRelease {
     tag_name: String,
 }
 
+pub fn is_newer_version(remote: &str, current: &str) -> bool {
+    let parse_semver = |v: &str| -> Vec<u64> {
+        let clean = v.trim().strip_prefix('v').unwrap_or(v.trim());
+        clean
+            .split(['.', '-', '+'])
+            .filter_map(|part| part.parse::<u64>().ok())
+            .collect()
+    };
+
+    let remote_parts = parse_semver(remote);
+    let current_parts = parse_semver(current);
+
+    let max_len = remote_parts.len().max(current_parts.len());
+    for i in 0..max_len {
+        let r = remote_parts.get(i).copied().unwrap_or(0);
+        let c = current_parts.get(i).copied().unwrap_or(0);
+        if r > c {
+            return true;
+        } else if r < c {
+            return false;
+        }
+    }
+    false
+}
+
 pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
     let executable_path =
         env::current_exe().context("failed to resolve current executable path")?;
     let previous_version = env!("CARGO_PKG_VERSION").to_string();
     let asset = resolve_release_asset()?;
 
-    if asset.version == previous_version && !force {
+    let is_newer = is_newer_version(&asset.version, &previous_version);
+    if !is_newer && !force {
         return Ok(UpdateOutcome {
             status: UpdateStatus::AlreadyCurrent,
             previous_version: previous_version.clone(),
@@ -66,11 +93,9 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
 
     let binary = download_release_binary(&asset)?;
     let temp_root = storage::tmp_dir(state_dir);
-    fs::create_dir_all(&temp_root)
-        .with_context(|| format!("failed to create {}", temp_root.display()))?;
+    storage::create_secure_dir_all(&temp_root)?;
     let temp_dir = temp_root.join(format!("update-{}", Uuid::new_v4()));
-    fs::create_dir_all(&temp_dir)
-        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+    storage::create_secure_dir_all(&temp_dir)?;
     let temp_binary = temp_dir.join(binary_filename_for_current_platform("sagy"));
     fs::write(&temp_binary, &binary)
         .with_context(|| format!("failed to write {}", temp_binary.display()))?;
@@ -104,20 +129,35 @@ fn sync_sibling_binaries(source_exe: &Path) {
     if let Some(parent) = source_exe.parent() {
         let aliases = ["flash", "pro", "think"];
         let ext = if cfg!(windows) { ".exe" } else { "" };
+        let source_canon = source_exe.canonicalize().ok();
+
         for alias in aliases {
             let alias_name = format!("{alias}{ext}");
             let target_path = parent.join(&alias_name);
-            if target_path.exists() {
-                let _ = fs::copy(source_exe, &target_path);
+            if !target_path.exists() {
+                continue;
+            }
+
+            if let Ok(target_canon) = target_path.canonicalize() {
+                if Some(&target_canon) == source_canon.as_ref() {
+                    continue;
+                }
+            } else if target_path == source_exe {
+                continue;
+            }
+
+            let temp_path = parent.join(format!(".{alias_name}.{}.tmp", Uuid::new_v4()));
+            if fs::copy(source_exe, &temp_path).is_ok() {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Ok(metadata) = fs::metadata(&target_path) {
+                    if let Ok(metadata) = fs::metadata(&temp_path) {
                         let mut perms = metadata.permissions();
                         perms.set_mode(0o755);
-                        let _ = fs::set_permissions(&target_path, perms);
+                        let _ = fs::set_permissions(&temp_path, perms);
                     }
                 }
+                let _ = fs::rename(&temp_path, &target_path);
             }
         }
     }
@@ -181,7 +221,46 @@ fn download_release_binary(asset: &ReleaseAsset) -> Result<Vec<u8>> {
         .with_context(|| format!("failed to read payload from {download_url}"))?
         .to_vec();
 
+    verify_checksum(&client, asset, &asset_name, &bytes)?;
+
     unpack_binary_from_archive(&bytes, asset.target.archive_ext, "sagy")
+}
+
+fn verify_checksum(
+    client: &Client,
+    asset: &ReleaseAsset,
+    asset_name: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let sums_url = format!(
+        "https://github.com/{}/releases/download/{}/SHA256SUMS.txt",
+        asset.repo, asset.tag
+    );
+    if let Ok(resp) = client.get(&sums_url).send() {
+        if resp.status().is_success() {
+            let sums_text = resp.text().unwrap_or_default();
+            for line in sums_text.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let expected_hash = parts[0];
+                    let file = parts[1].trim_start_matches('*').trim_start_matches("./");
+                    if file == asset_name {
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        hasher.update(payload);
+                        let calculated = format!("{:x}", hasher.finalize());
+                        if !calculated.eq_ignore_ascii_case(expected_hash) {
+                            bail!(
+                                "SHA-256 checksum mismatch for {asset_name}!\nExpected: {expected_hash}\nActual:   {calculated}"
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result<Vec<u8>> {
@@ -231,6 +310,8 @@ fn http_client() -> Result<Client> {
     );
     Client::builder()
         .default_headers(headers)
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .context("failed to construct HTTP client")
 }
@@ -266,5 +347,20 @@ fn binary_filename_for_current_platform(base_name: &str) -> String {
         format!("{base_name}.exe")
     } else {
         base_name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_newer_version() {
+        assert!(is_newer_version("0.2.0", "0.1.0"));
+        assert!(is_newer_version("1.0.0", "0.9.9"));
+        assert!(is_newer_version("0.1.1", "0.1.0"));
+        assert!(!is_newer_version("0.1.0", "0.1.0"));
+        assert!(!is_newer_version("0.1.0", "0.2.0"));
+        assert!(!is_newer_version("v0.0.9", "0.1.0"));
     }
 }

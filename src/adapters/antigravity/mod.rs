@@ -13,7 +13,7 @@ pub mod ui;
 pub mod usage;
 
 pub use auth::LoginMode;
-pub use repo_sync::{PullOutcome, PushOutcome};
+pub use repo_sync::{PullOptions, PullOutcome, PushOptions, PushOutcome};
 
 use crate::core::policy;
 use crate::core::state::{AccountRecord, LiveIdentity, State, UsageSnapshot};
@@ -96,7 +96,7 @@ impl AntigravityAdapter {
         state_dir: &Path,
         state: &mut State,
         no_import_known: bool,
-        no_login: bool,
+        _no_login: bool,
         perform_switch: bool,
     ) -> Result<Option<(AccountRecord, UsageSnapshot)>> {
         if !no_import_known && state.accounts.is_empty() {
@@ -104,13 +104,10 @@ impl AntigravityAdapter {
         }
 
         if state.accounts.is_empty() {
-            if no_login {
-                return Ok(None);
-            }
             return Ok(None);
         }
 
-        self.refresh_all_accounts(state_dir, state);
+        self.refresh_all_accounts(state_dir, state, false);
 
         if let Some((best_acc, usage)) = policy::select_best_account(state, &state.accounts) {
             let record = best_acc.clone();
