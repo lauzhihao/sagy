@@ -114,7 +114,7 @@ fn find_first_subcmd(raw_args: &[OsString]) -> Option<String> {
 fn is_sagy_launch_flag(s: &str) -> bool {
     matches!(
         s,
-        "--dry-run" | "--no-resume" | "--no-launch" | "--no-login" | "--no-import-known"
+        "--dry-run" | "--no-resume" | "--no-launch" | "--no-import-known"
     )
 }
 
@@ -159,7 +159,6 @@ pub fn run(cli: Cli) -> Result<i32> {
     let mut state = storage::load_state(&state_dir)?;
     let command = cli.command.unwrap_or(Command::Launch(LaunchArgs {
         no_import_known: false,
-        no_login: false,
         dry_run: false,
         no_resume: false,
         no_launch: false,
@@ -173,7 +172,6 @@ pub fn run(cli: Cli) -> Result<i32> {
                 &state_dir,
                 &mut state,
                 args.no_import_known,
-                args.no_login,
                 !args.dry_run,
             )? {
                 Some((account, usage, _pulled)) => {
@@ -222,7 +220,6 @@ pub fn run(cli: Cli) -> Result<i32> {
                 &state_dir,
                 &mut state,
                 args.no_import_known,
-                args.no_login,
                 !args.dry_run,
             )? {
                 Some((account, usage, _pulled)) => {
@@ -451,7 +448,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             0
         }
         Command::Passthrough(args) => {
-            match ensure_launch_account(&adapter, &state_dir, &mut state, false, false, true)? {
+            match ensure_launch_account(&adapter, &state_dir, &mut state, false, true)? {
                 Some((account, usage, _pulled)) => {
                     let now = Utc::now().timestamp();
                     if let Some(pos) = state.accounts.iter().position(|a| a.id == account.id) {

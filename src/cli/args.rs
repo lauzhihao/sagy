@@ -16,11 +16,6 @@ pub struct LaunchArgs {
     pub no_import_known: bool,
     #[arg(
         long,
-        help = "Do not prompt for interactive login if no usable account is found"
-    )]
-    pub no_login: bool,
-    #[arg(
-        long,
         help = "Preview the selected account without switching or launching"
     )]
     pub dry_run: bool,
@@ -46,8 +41,6 @@ pub struct LaunchArgs {
 pub struct AutoArgs {
     #[arg(long, help = "Skip automatic discovery of local ~/.gemini credentials")]
     pub no_import_known: bool,
-    #[arg(long, help = "Do not prompt for login if no accounts are available")]
-    pub no_login: bool,
     #[arg(long, help = "Preview the selected account without switching")]
     pub dry_run: bool,
 }

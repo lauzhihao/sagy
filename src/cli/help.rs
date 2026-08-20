@@ -128,9 +128,9 @@ fn render_topic_help(topic: &str, is_zh: bool) -> String {
     match lower.as_str() {
         "launch" => {
             if is_zh {
-                "sagy launch [选项] [-- 额外参数...]\n\n选择健康度最高的可用账号，切换环境后启动或恢复 Antigravity CLI。\n\n选项:\n  --dry-run          仅预览选中账号，不切换也不拉起 CLI\n  --no-resume        不自动恢复上一次对话会话\n  --no-login         若无可用账号则直接退出，不进入登录引导\n  --no-import-known  跳过对 ~/.gemini 本地凭据的自动扫描\n  --no-launch        仅完成账号切换，不启动 CLI\n".to_string()
+                "sagy launch [选项] [-- 额外参数...]\n\n选择健康度最高的可用账号，切换环境后启动或恢复 Antigravity CLI。\n\n选项:\n  --dry-run          仅预览选中账号，不切换也不拉起 CLI\n  --no-resume        不自动恢复上一次对话会话\n  --no-import-known  跳过对 ~/.gemini 本地凭据的自动扫描\n  --no-launch        仅完成账号切换，不启动 CLI\n".to_string()
             } else {
-                "sagy launch [options] [-- extra_args...]\n\nSelect the healthiest account, switch credentials, and launch or resume Antigravity CLI.\n\nOptions:\n  --dry-run          Preview the selected account without switching or launching\n  --no-resume        Do not automatically resume the previous conversation session\n  --no-login         Exit immediately if no usable account is found\n  --no-import-known  Skip automatic discovery of local credentials\n  --no-launch        Switch credentials and exit without launching\n".to_string()
+                "sagy launch [options] [-- extra_args...]\n\nSelect the healthiest account, switch credentials, and launch or resume Antigravity CLI.\n\nOptions:\n  --dry-run          Preview the selected account without switching or launching\n  --no-resume        Do not automatically resume the previous conversation session\n  --no-import-known  Skip automatic discovery of local credentials\n  --no-launch        Switch credentials and exit without launching\n".to_string()
             }
         }
         "push" => {
@@ -149,9 +149,9 @@ fn render_topic_help(topic: &str, is_zh: bool) -> String {
         }
         "auto" => {
             if is_zh {
-                "sagy auto [选项]\n\n仅优选并切换到最佳账号，不拉起 CLI。\n\n选项:\n  --dry-run          仅预览选中账号\n  --no-login         无账号时不尝试登录\n  --no-import-known  跳过本地凭据扫描\n".to_string()
+                "sagy auto [选项]\n\n仅优选并切换到最佳账号，不拉起 CLI。\n\n选项:\n  --dry-run          仅预览选中账号\n  --no-import-known  跳过本地凭据扫描\n".to_string()
             } else {
-                "sagy auto [options]\n\nSelect and switch to the best account without launching the CLI.\n\nOptions:\n  --dry-run          Preview selection only\n  --no-login         Do not prompt for login\n  --no-import-known  Skip local scan\n".to_string()
+                "sagy auto [options]\n\nSelect and switch to the best account without launching the CLI.\n\nOptions:\n  --dry-run          Preview selection only\n  --no-import-known  Skip local scan\n".to_string()
             }
         }
         _ => {

@@ -37,7 +37,6 @@ impl AntigravityAdapter {
         state_dir: &Path,
         state: &mut State,
         no_import_known: bool,
-        _no_login: bool,
         perform_switch: bool,
     ) -> Result<Option<(AccountRecord, UsageSnapshot)>> {
         if !no_import_known && state.accounts.is_empty() {
