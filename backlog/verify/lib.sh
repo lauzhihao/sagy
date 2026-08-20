@@ -42,20 +42,6 @@ sagy_run() {
   "$REPO_ROOT/target/release/sagy" "$@"
 }
 
-# 以别名身份运行(flash/pro/think)
-sagy_run_as() {
-  local alias_name="$1"; shift
-  cp "$REPO_ROOT/target/release/sagy" "$SBX/bin/$alias_name"
-  HOME="$SBX/home" \
-  SAGY_HOME="$SBX/home/.sagy" \
-  ANTIGRAVITY_CONFIG_DIR="$SBX/agcli" \
-  GEMINI_HOME="$SBX/gemini" \
-  FAKE_AGY_LOG="$FAKE_AGY_LOG" \
-  FAKE_AGY_EXIT="${FAKE_AGY_EXIT:-0}" \
-  PATH="$SBX/bin:$PATH" \
-  "$SBX/bin/$alias_name" "$@"
-}
-
 build_release() {
   ( cd "$REPO_ROOT" && cargo build --release 2>&1 | tail -3 )
   if [ ! -x "$REPO_ROOT/target/release/sagy" ]; then
