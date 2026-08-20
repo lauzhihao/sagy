@@ -78,10 +78,25 @@ impl super::AntigravityAdapter {
         let bundle_root = checkout.checkout_dir.join(bundle_dir_str);
         let bundle_path = bundle_root.join(BUNDLE_FILENAME);
 
+        let accounts_to_export: Vec<AccountRecord> = if _include_all {
+            state.accounts.clone()
+        } else {
+            state
+                .accounts
+                .iter()
+                .filter(|a| a.oauth_token.is_some() || a.api_key.is_some() || a.refresh_token.is_some())
+                .cloned()
+                .collect()
+        };
+
+        if accounts_to_export.is_empty() {
+            bail!("No exportable accounts with active credentials to push (use --all to force)");
+        }
+
         let pool_bundle = AccountPoolBundle {
             version: STATE_VERSION,
             exported_at: chrono::Utc::now().timestamp(),
-            accounts: state.accounts.clone(),
+            accounts: accounts_to_export,
         };
 
         let raw_json = serde_json::to_vec_pretty(&pool_bundle)?;

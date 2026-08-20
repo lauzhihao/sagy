@@ -1,8 +1,9 @@
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 
 use crate::adapters::antigravity::AntigravityAdapter;
@@ -26,7 +27,11 @@ use launch::{ensure_launch_account, print_selection};
 use repo_sync::resolve_repo_sync_repo;
 
 #[derive(Debug, Parser)]
-#[command(name = "sagy")]
+#[command(
+    name = "sagy",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Google Antigravity CLI (agy) smart multi-account manager & launcher"
+)]
 pub struct Cli {
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
@@ -57,13 +62,142 @@ pub enum Command {
 
 impl Cli {
     pub fn parse_args() -> Self {
-        let args = env::args_os().collect::<Vec<_>>();
-        if let Some(topic) = requested_help_topic(&args) {
+        let raw_args = env::args_os().collect::<Vec<_>>();
+        if let Some(topic) = requested_help_topic(&raw_args) {
             print!("{}", render_help(topic));
             std::process::exit(0);
         }
+
+        // Handle --version / -V explicitly
+        if raw_args.len() > 1 {
+            let first = raw_args[1].to_string_lossy();
+            if first == "--version" || first == "-V" {
+                println!("sagy {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+        }
+
+        let exe_name = raw_args.first().and_then(|p| {
+            Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+        }).unwrap_or_default();
+
+        let is_alias = exe_name.contains("flash")
+            || exe_name.contains("pro")
+            || exe_name.contains("think");
+
+        if is_alias {
+            let rewritten = rewrite_alias_args(&raw_args);
+            return Self::parse_from(rewritten);
+        }
+
+        // If no explicit subcommand is given, rewrite flags directly to launch
+        if raw_args.len() > 1 && !has_subcommand(&raw_args) {
+            let rewritten = rewrite_passthrough_launch_args(&raw_args);
+            return Self::parse_from(rewritten);
+        }
+
         Self::parse()
     }
+}
+
+fn has_subcommand(raw_args: &[OsString]) -> bool {
+    let mut iter = raw_args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        if s == "--state-dir" {
+            iter.next();
+            continue;
+        }
+        if s.starts_with("--state-dir=") {
+            continue;
+        }
+        if !s.starts_with('-') {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_sagy_launch_flag(s: &str) -> bool {
+    matches!(
+        s,
+        "--dry-run"
+            | "--no-resume"
+            | "--no-launch"
+            | "--no-login"
+            | "--no-import-known"
+    )
+}
+
+fn rewrite_alias_args(raw_args: &[OsString]) -> Vec<OsString> {
+    let mut rewritten = Vec::new();
+    rewritten.push(OsString::from("sagy"));
+
+    let mut launch_flags = Vec::new();
+    let mut extra_args = Vec::new();
+    let mut iter = raw_args.iter().skip(1);
+
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        if s == "--state-dir" {
+            rewritten.push(arg.clone());
+            if let Some(val) = iter.next() {
+                rewritten.push(val.clone());
+            }
+        } else if s.starts_with("--state-dir=") {
+            rewritten.push(arg.clone());
+        } else if is_sagy_launch_flag(&s) {
+            launch_flags.push(arg.clone());
+        } else {
+            extra_args.push(arg.clone());
+        }
+    }
+
+    rewritten.push(OsString::from("launch"));
+    rewritten.extend(launch_flags);
+    if !extra_args.is_empty() {
+        rewritten.push(OsString::from("--"));
+        rewritten.extend(extra_args);
+    }
+
+    rewritten
+}
+
+fn rewrite_passthrough_launch_args(raw_args: &[OsString]) -> Vec<OsString> {
+    let mut rewritten = Vec::new();
+    rewritten.push(OsString::from("sagy"));
+
+    let mut launch_flags = Vec::new();
+    let mut extra_args = Vec::new();
+    let mut iter = raw_args.iter().skip(1);
+
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        if s == "--state-dir" {
+            rewritten.push(arg.clone());
+            if let Some(val) = iter.next() {
+                rewritten.push(val.clone());
+            }
+        } else if s.starts_with("--state-dir=") {
+            rewritten.push(arg.clone());
+        } else if is_sagy_launch_flag(&s) {
+            launch_flags.push(arg.clone());
+        } else {
+            extra_args.push(arg.clone());
+        }
+    }
+
+    rewritten.push(OsString::from("launch"));
+    rewritten.extend(launch_flags);
+    if !extra_args.is_empty() {
+        rewritten.push(OsString::from("--"));
+        rewritten.extend(extra_args);
+    }
+
+    rewritten
 }
 
 pub fn run(cli: Cli) -> Result<i32> {
@@ -96,17 +230,30 @@ pub fn run(cli: Cli) -> Result<i32> {
                         storage::save_state(&state_dir, &state)?;
                         0
                     } else {
+                        let now = Utc::now().timestamp();
+                        if let Some(pos) = state.accounts.iter().position(|a| a.id == account.id) {
+                            state.accounts[pos].last_used_at = Some(now);
+                        }
                         print_selection(ui.selection_switched(), &account, &usage);
                         storage::save_state(&state_dir, &state)?;
+
                         if args.no_launch {
                             0
                         } else {
-                            adapter.launch_agy(
+                            let code = adapter.launch_agy(
                                 &state_dir,
                                 &account,
                                 &args.extra_args,
                                 !args.no_resume,
-                            )?
+                            )?;
+
+                            // If exit code indicates rate limit (429), trigger cooldown immediately
+                            if code == 429 {
+                                adapter.mark_rate_limited(&mut state, &account.id);
+                                storage::save_state(&state_dir, &state)?;
+                            }
+
+                            code
                         }
                     }
                 }
@@ -130,6 +277,10 @@ pub fn run(cli: Cli) -> Result<i32> {
                     if args.dry_run {
                         print_selection(ui.selection_would_select(), &account, &usage);
                     } else {
+                        let now = Utc::now().timestamp();
+                        if let Some(pos) = state.accounts.iter().position(|a| a.id == account.id) {
+                            state.accounts[pos].last_used_at = Some(now);
+                        }
                         print_selection(ui.selection_switched(), &account, &usage);
                     }
                     storage::save_state(&state_dir, &state)?;
@@ -149,6 +300,10 @@ pub fn run(cli: Cli) -> Result<i32> {
             println!("{}", ui.added_account(&record.email));
             adapter.switch_account(&record)?;
             state.current_account_id = Some(record.id.clone());
+            let now = Utc::now().timestamp();
+            if let Some(pos) = state.accounts.iter().position(|a| a.id == record.id) {
+                state.accounts[pos].last_used_at = Some(now);
+            }
             print_selection(ui.selection_switched(), &record, &usage);
             storage::save_state(&state_dir, &state)?;
             0
@@ -161,6 +316,10 @@ pub fn run(cli: Cli) -> Result<i32> {
             if args.switch {
                 adapter.switch_account(&record)?;
                 state.current_account_id = Some(record.id.clone());
+                let now = Utc::now().timestamp();
+                if let Some(pos) = state.accounts.iter().position(|a| a.id == record.id) {
+                    state.accounts[pos].last_used_at = Some(now);
+                }
                 print_selection(ui.selection_switched(), &record, &usage);
             }
             storage::save_state(&state_dir, &state)?;
@@ -175,6 +334,10 @@ pub fn run(cli: Cli) -> Result<i32> {
             };
             adapter.switch_account(&record)?;
             state.current_account_id = Some(record.id.clone());
+            let now = Utc::now().timestamp();
+            if let Some(pos) = state.accounts.iter().position(|a| a.id == record.id) {
+                state.accounts[pos].last_used_at = Some(now);
+            }
             let usage = state
                 .usage_cache
                 .get(&record.id)
@@ -332,9 +495,18 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Passthrough(args) => {
             match ensure_launch_account(&adapter, &state_dir, &mut state, false, false, true)? {
                 Some((account, usage, _pulled)) => {
+                    let now = Utc::now().timestamp();
+                    if let Some(pos) = state.accounts.iter().position(|a| a.id == account.id) {
+                        state.accounts[pos].last_used_at = Some(now);
+                    }
                     print_selection(ui.selection_switched(), &account, &usage);
                     storage::save_state(&state_dir, &state)?;
-                    adapter.run_passthrough(&state_dir, &account, &args)?
+                    let code = adapter.run_passthrough(&state_dir, &account, &args)?;
+                    if code == 429 {
+                        adapter.mark_rate_limited(&mut state, &account.id);
+                        storage::save_state(&state_dir, &state)?;
+                    }
+                    code
                 }
                 None => {
                     println!("{}", ui.no_usable_account_hint());

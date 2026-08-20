@@ -1,5 +1,5 @@
 # sagy Project Map
-> Generated: 2026年 8月20日 星期四 01时45分34秒 CST
+> Generated: 2026年 8月20日 星期四 09时51分11秒 CST
 > Strategy: Source Focused (src expanded, target collapsed)
 
 ## Package
@@ -57,7 +57,7 @@
 |   |   -- [F] update.rs
 |   |-- [F] lib.rs
 |   -- [F] main.rs
-|-- [D] target/  [collapsed: 5032 files]
+|-- [D] target/  [collapsed: 6113 files]
 |-- [F] AGENTS.md
 |-- [F] ARCHITECTURE.md
 |-- [F] Cargo.lock

@@ -36,36 +36,81 @@ impl super::AntigravityAdapter {
     pub fn import_known_sources(&self, state_dir: &Path, state: &mut State) -> Vec<AccountRecord> {
         let mut imported = Vec::new();
 
-        // 1. Try importing existing ~/.gemini/antigravity-cli/antigravity-oauth-token
-        if let Some(cli_home) = default_antigravity_cli_home() {
-            let token_path = cli_home.join("antigravity-oauth-token");
-            if token_path.is_file() {
-                if let Ok(token_str) = fs::read_to_string(&token_path) {
-                    let trimmed = token_str.trim();
-                    if !trimmed.is_empty() {
-                        let record = self.import_or_update_token(
-                            state_dir,
-                            state,
-                            "default-antigravity-user@gemini",
-                            trimmed,
-                            Some("Antigravity OAuth"),
-                        );
-                        if let Ok(record) = record {
-                            imported.push(record);
+        // 1. Resolve local active email if available
+        let mut active_email: Option<String> = None;
+        if let Some(gemini_home) = default_gemini_home() {
+            let ga_path = gemini_home.join("google_accounts.json");
+            if ga_path.is_file() {
+                if let Ok(content) = fs::read_to_string(&ga_path) {
+                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                        if let Some(act) = json.get("active").and_then(Value::as_str) {
+                            let trimmed = act.trim();
+                            if !trimmed.is_empty() {
+                                active_email = Some(trimmed.to_string());
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 2. Try importing ~/.gemini/oauth_creds.json
+        // 2. Read ~/.gemini/antigravity-cli/antigravity-oauth-token
+        let mut local_token: Option<String> = None;
+        if let Some(cli_home) = default_antigravity_cli_home() {
+            let token_path = cli_home.join("antigravity-oauth-token");
+            if token_path.is_file() {
+                if let Ok(token_str) = fs::read_to_string(&token_path) {
+                    let trimmed = token_str.trim().to_string();
+                    if !trimmed.is_empty() {
+                        local_token = Some(trimmed);
+                    }
+                }
+            }
+        }
+
+        // 3. Read ~/.gemini/oauth_creds.json
+        let mut oauth_cred_record: Option<AccountRecord> = None;
         if let Some(gemini_home) = default_gemini_home() {
             let oauth_path = gemini_home.join("oauth_creds.json");
             if oauth_path.is_file() {
                 if let Ok(record) = self.import_auth_path(state_dir, state, &oauth_path) {
-                    imported.push(record);
+                    oauth_cred_record = Some(record);
                 }
             }
+        }
+
+        // 4. Merge into a single coherent account record
+        let resolved_email = active_email
+            .or_else(|| oauth_cred_record.as_ref().map(|r| r.email.clone()))
+            .unwrap_or_else(|| "antigravity-user@gemini".to_string());
+
+        if let Some(token) = local_token {
+            let record = self.import_or_update_token(
+                state_dir,
+                state,
+                &resolved_email,
+                &token,
+                Some("Antigravity OAuth"),
+            );
+            if let Ok(mut rec) = record {
+                // If oauth_creds.json had refresh_token, attach it
+                if let Some(oauth_rec) = &oauth_cred_record {
+                    if rec.refresh_token.is_none() && oauth_rec.refresh_token.is_some() {
+                        rec.refresh_token = oauth_rec.refresh_token.clone();
+                        if let Some(pos) = state.accounts.iter().position(|a| a.id == rec.id) {
+                            state.accounts[pos].refresh_token = rec.refresh_token.clone();
+                        }
+                    }
+                }
+                imported.push(rec);
+            }
+        } else if let Some(oauth_rec) = oauth_cred_record {
+            imported.push(oauth_rec);
+        }
+
+        // 5. Clean up old duplicate placeholder accounts if unified email exists
+        if resolved_email != "default-antigravity-user@gemini" {
+            state.accounts.retain(|a| a.email != "default-antigravity-user@gemini");
         }
 
         imported

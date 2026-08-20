@@ -14,7 +14,7 @@ impl super::AntigravityAdapter {
         state_dir: &Path,
         account: &AccountRecord,
         extra_args: &[OsString],
-        _resume: bool,
+        resume: bool,
     ) -> Result<i32> {
         let agy_bin = find_agy_bin(Some(state_dir))
             .ok_or_else(|| anyhow::anyhow!("Antigravity CLI (agy) binary not found in PATH or standard locations"))?;
@@ -69,11 +69,22 @@ impl super::AntigravityAdapter {
             }
         }
 
+        // 4. Session continuation / resume logic
+        if resume
+            && !contains_flag(extra_args, "--continue")
+            && !contains_flag(extra_args, "-c")
+            && !contains_flag(extra_args, "--prompt")
+            && !contains_flag(extra_args, "-p")
+            && !contains_flag(extra_args, "--conversation")
+        {
+            final_args.push(OsString::from("--continue"));
+        }
+
         // Append user extra args
         final_args.extend_from_slice(extra_args);
         cmd.args(&final_args);
 
-        // 4. Stdio inheritance for interactive TUI
+        // 5. Stdio inheritance for interactive TUI
         cmd.stdin(Stdio::inherit());
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
@@ -86,7 +97,8 @@ impl super::AntigravityAdapter {
             .wait()
             .with_context(|| format!("failed to wait on `{}`", agy_bin.display()))?;
 
-        Ok(status.code().unwrap_or(0))
+        let code = status.code().unwrap_or(0);
+        Ok(code)
     }
 
     pub fn run_passthrough(

@@ -45,7 +45,11 @@ pub fn select_best_account<'a>(
     // Sort descending by score
     candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
 
-    candidates.first().map(|(acc, usage, _)| (*acc, usage.clone()))
+    // Only return healthy candidate with positive score
+    candidates
+        .into_iter()
+        .find(|(_, _, score)| *score > 0.0)
+        .map(|(acc, usage, _)| (acc, usage))
 }
 
 fn score_account(account: &AccountRecord, usage: &UsageSnapshot, now: i64) -> f64 {
@@ -175,5 +179,51 @@ mod tests {
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().0.id, "acc-2");
     }
+
+    #[test]
+    fn test_select_best_account_returns_none_when_all_in_cooldown() {
+        let mut state = State::default();
+        let acc1 = AccountRecord {
+            id: "acc-1".to_string(),
+            email: "user1@gmail.com".to_string(),
+            ..Default::default()
+        };
+        state.accounts = vec![acc1];
+        let now = Utc::now().timestamp();
+        state.usage_cache.insert(
+            "acc-1".to_string(),
+            UsageSnapshot {
+                status: "RateLimited".to_string(),
+                cooldown_until: Some(now + 300),
+                ..Default::default()
+            },
+        );
+
+        let selected = select_best_account(&state, &state.accounts);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn test_select_best_account_returns_none_when_needs_relogin() {
+        let mut state = State::default();
+        let acc1 = AccountRecord {
+            id: "acc-1".to_string(),
+            email: "user1@gmail.com".to_string(),
+            ..Default::default()
+        };
+        state.accounts = vec![acc1];
+        state.usage_cache.insert(
+            "acc-1".to_string(),
+            UsageSnapshot {
+                status: "AuthError".to_string(),
+                needs_relogin: true,
+                ..Default::default()
+            },
+        );
+
+        let selected = select_best_account(&state, &state.accounts);
+        assert!(selected.is_none());
+    }
 }
+
 
