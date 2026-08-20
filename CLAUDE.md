@@ -29,11 +29,7 @@ scripts/
   map_project.py        # Project map generator
 src/
   main.rs               # Binary entrypoint (sagy)
-  lib.rs                # Library entry shared with bin targets
-  bin/                  # Model-specific launcher binaries
-    flash.rs
-    pro.rs
-    think.rs
+  lib.rs                # Library entry shared with the bin target
   cli/                  # Command router and args
     mod.rs
     args.rs

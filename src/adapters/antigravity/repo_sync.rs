@@ -127,7 +127,7 @@ impl super::AntigravityAdapter {
         let encrypted_payload = encrypt_bytes(&raw_json, &bundle_key)?;
         let enc_json = serde_json::to_vec_pretty(&encrypted_payload)?;
 
-        fs::create_dir_all(&bundle_root)?;
+        storage::create_secure_dir_all(&bundle_root)?;
         fs::write(&bundle_path, enc_json)?;
 
         git_cmd(

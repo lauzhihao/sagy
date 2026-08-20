@@ -5,11 +5,11 @@
 ## 1. System Overview
 
 ```text
-               +----------------------------------+
-               |  CLI Entrypoints (sagy / flash)  |
-               +-----------------+----------------+
-                                 |
-                                 v
+               +-----------------------------------------+
+               |  CLI Entrypoints (sagy / sagy-original) |
+               +--------------------+--------------------+
+                                    |
+                                    v
                +----------------------------------+
                |            CLI Router            |
                | (args.rs, launch.rs, help.rs)    |
@@ -41,7 +41,7 @@
 - **Layout**:
   ```text
   ~/.sagy/
-    bin/              # Installed executable binaries (sagy, flash, pro, think, sagy-original)
+    bin/              # Installed executable binaries (sagy, sagy-original)
     runtime/          # Optional local toolchains or runtimes
     tmp/              # Temporary download, extraction and repo-sync working trees
     accounts/         # Isolated account directories (<account-id>/credentials.json, token)

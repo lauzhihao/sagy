@@ -54,9 +54,6 @@ $extractedExe = Join-Path $TmpRoot "sagy.exe"
 $targetExe = Join-Path $InstallBin "sagy.exe"
 
 Copy-Item $extractedExe $targetExe -Force
-Copy-Item $targetExe (Join-Path $InstallBin "flash.exe") -Force
-Copy-Item $targetExe (Join-Path $InstallBin "pro.exe") -Force
-Copy-Item $targetExe (Join-Path $InstallBin "think.exe") -Force
 
 # Install sagy-original passthrough wrapper for Windows cmd/powershell
 $originalWrapperCmd = Join-Path $InstallBin "sagy-original.cmd"
@@ -93,5 +90,5 @@ if (Test-Path $geminiDir) {
 }
 
 Write-Host "sagy installed successfully to $targetExe"
-Write-Host "Binaries: sagy, flash, pro, think, sagy-original"
+Write-Host "Binaries: sagy, sagy-original"
 Write-Host "Please ensure '$InstallBin' is in your PATH."

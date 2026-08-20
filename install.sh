@@ -7,9 +7,6 @@ export SAGY_HOME
 INSTALL_BIN="${INSTALL_BIN:-${SAGY_HOME}/bin}"
 TMP_ROOT="${SAGY_HOME}/tmp"
 WRAPPER_PATH="${INSTALL_BIN}/sagy"
-FLASH_PATH="${INSTALL_BIN}/flash"
-PRO_PATH="${INSTALL_BIN}/pro"
-THINK_PATH="${INSTALL_BIN}/think"
 ORIGINAL_WRAPPER_PATH="${INSTALL_BIN}/sagy-original"
 VERSION="${SAGY_VERSION:-}"
 
@@ -124,9 +121,6 @@ download_and_install() {
   fi
 
   install -m 0755 "${extracted_path}" "${WRAPPER_PATH}"
-  cp "${WRAPPER_PATH}" "${FLASH_PATH}"
-  cp "${WRAPPER_PATH}" "${PRO_PATH}"
-  cp "${WRAPPER_PATH}" "${THINK_PATH}"
 }
 
 install_original_wrapper() {
@@ -159,7 +153,6 @@ post_install_import() {
 print_next_steps() {
   echo "SAGY_HOME is ${SAGY_HOME}"
   echo "Installed to ${WRAPPER_PATH}"
-  echo "Installed model entrypoints to ${FLASH_PATH}, ${PRO_PATH}, ${THINK_PATH}"
   echo "Installed passthrough helper to ${ORIGINAL_WRAPPER_PATH}"
   if [[ ":$PATH:" != *":${INSTALL_BIN}:"* ]]; then
     echo

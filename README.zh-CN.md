@@ -2,7 +2,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-`sagy` 是一个基于 Rust 开发的 Google Antigravity CLI (`agy`) 智能多账号管理与环境包装启动器。它支持多账号自动优选轮换、429 限流冷却降级、模型快捷入口（`flash`、`pro`、`think`）以及基于 Git 的多机加密账号池同步。
+`sagy` 是一个基于 Rust 开发的 Google Antigravity CLI (`agy`) 智能多账号管理与环境包装启动器。它支持多账号自动优选轮换、429 限流冷却降级以及基于 Git 的多机加密账号池同步。
 
 这个仓库只包含纯开源代码，不包含任何个人账号数据、凭据或私有环境文件。
 
@@ -36,16 +36,13 @@ cargo build --release
 
 ---
 
-## 二、入口命令与模型快捷方式
+## 二、安装的二进制命令
 
 安装后，`sagy` 会在 `$SAGY_HOME/bin` 中提供以下便捷入口：
 
 | 命令 | 对应模型与行为 |
 | :--- | :--- |
-| **`sagy`** | 默认主命令，智能优选最佳账号后启动 `agy` |
-| **`flash`** | 快捷绑定 `gemini-3.7-flash-low` 极速启动 |
-| **`pro`** | 快捷绑定 `gemini-3.1-pro-high` 旗舰推理启动 |
-| **`think`** | 快捷绑定 `gemini-3.7-flash-high` 深度思考模式 |
+| **`sagy`** | 默认主命令，智能优选最佳账号后启动 `agy`（默认注入 `gemini-3.7-flash-high`；切换其它模型请在 agy 界面内操作） |
 | **`sagy-original`** | 到底层官方 `agy` 二进制的透明直通辅助命令 |
 
 ---
@@ -95,7 +92,7 @@ cargo build --release
 
 ```text
 ~/.sagy/
-  bin/              # 二进制文件 (sagy, flash, pro, think, sagy-original)
+  bin/              # 二进制文件 (sagy, sagy-original)
   accounts/         # 各独立受管账号凭据与配置
   tmp/              # 临时解压与同步工作区
   state.json        # 本地状态清单与健康缓存

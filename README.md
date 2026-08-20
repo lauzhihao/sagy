@@ -2,7 +2,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-`sagy` is a high-performance, cross-platform CLI launcher and smart account manager for Google Antigravity CLI (`agy`), built in Rust. It provides automated multi-account rotation, rate-limit cooldown management, model shortcuts (`flash`, `pro`, `think`), and encrypted account pool synchronization via Git.
+`sagy` is a high-performance, cross-platform CLI launcher and smart account manager for Google Antigravity CLI (`agy`), built in Rust. It provides automated multi-account rotation, rate-limit cooldown management, and encrypted account pool synchronization via Git.
 
 This repository contains only open-source code and never contains private accounts, tokens, or credential pools.
 
@@ -36,16 +36,13 @@ cargo build --release
 
 ---
 
-## 2. Model Shortcuts & Binaries
+## 2. Installed Binaries
 
 `sagy` installs convenient entrypoints in `$SAGY_HOME/bin`:
 
 | Binary | Target Model & Mode |
 | :--- | :--- |
-| **`sagy`** | Default launcher, auto-selects healthiest account and starts `agy` |
-| **`flash`** | Launches with `gemini-3.7-flash-low` for rapid turnaround |
-| **`pro`** | Launches with `gemini-3.1-pro-high` for complex reasoning |
-| **`think`** | Launches with `gemini-3.7-flash-high` deep thinking mode |
+| **`sagy`** | Default launcher, auto-selects healthiest account and starts `agy` (defaults to `gemini-3.7-flash-high`; switch other models inside agy) |
 | **`sagy-original`** | Passthrough helper straight to official underlying `agy` |
 
 ---

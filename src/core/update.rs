@@ -114,7 +114,6 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
 
     self_replace::self_replace(&temp_binary)
         .with_context(|| format!("failed to replace {}", executable_path.display()))?;
-    sync_sibling_binaries(&executable_path);
     let _ = fs::remove_dir_all(&temp_dir);
 
     Ok(UpdateOutcome {
@@ -123,44 +122,6 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
         installed_version: asset.version,
         executable_path,
     })
-}
-
-fn sync_sibling_binaries(source_exe: &Path) {
-    if let Some(parent) = source_exe.parent() {
-        let aliases = ["flash", "pro", "think"];
-        let ext = if cfg!(windows) { ".exe" } else { "" };
-        let source_canon = source_exe.canonicalize().ok();
-
-        for alias in aliases {
-            let alias_name = format!("{alias}{ext}");
-            let target_path = parent.join(&alias_name);
-            if !target_path.exists() {
-                continue;
-            }
-
-            if let Ok(target_canon) = target_path.canonicalize() {
-                if Some(&target_canon) == source_canon.as_ref() {
-                    continue;
-                }
-            } else if target_path == source_exe {
-                continue;
-            }
-
-            let temp_path = parent.join(format!(".{alias_name}.{}.tmp", Uuid::new_v4()));
-            if fs::copy(source_exe, &temp_path).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(metadata) = fs::metadata(&temp_path) {
-                        let mut perms = metadata.permissions();
-                        perms.set_mode(0o755);
-                        let _ = fs::set_permissions(&temp_path, perms);
-                    }
-                }
-                let _ = fs::rename(&temp_path, &target_path);
-            }
-        }
-    }
 }
 
 fn resolve_release_asset() -> Result<ReleaseAsset> {

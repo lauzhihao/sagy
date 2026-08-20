@@ -37,9 +37,10 @@ assert_grep_absent 'FLASH_PATH|PRO_PATH|THINK_PATH' "$REPO_ROOT/install.sh"  "in
 assert_grep_absent 'flash\.exe|pro\.exe|think\.exe' "$REPO_ROOT/install.ps1" "install.ps1 不再安装别名"
 
 # 6. 文档不再宣传别名入口
-assert_grep_absent '\*\*`flash`\*\*|\*\*`pro`\*\*|\*\*`think`\*\*' "$REPO_ROOT/README.md" \
-  "README.md 已移除模型快捷入口表"
-assert_grep_absent '\*\*`flash`\*\*|\*\*`pro`\*\*|\*\*`think`\*\*' "$REPO_ROOT/README.zh-CN.md" \
-  "README.zh-CN.md 已移除模型快捷入口表"
+# 任何面向用户的文档都不得再提到这三个别名(表格、目录布局、正文皆算)
+for doc in README.md README.zh-CN.md ARCHITECTURE.md CLAUDE.md; do
+  assert_grep_absent '(flash|pro|think)\.rs|`flash`|`pro`|`think`|, flash, pro, think|flash, pro, think' \
+    "$REPO_ROOT/$doc" "$doc 中不再提及已删除的别名入口"
+done
 
 report

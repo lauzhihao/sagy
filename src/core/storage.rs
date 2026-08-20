@@ -69,15 +69,22 @@ pub struct RepoSyncConfig {
 }
 
 pub fn create_secure_dir_all(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("failed to create directory {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o700);
-            let _ = fs::set_permissions(path, perms);
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if current.as_os_str().is_empty() || current.exists() {
+            continue;
+        }
+        fs::create_dir(&current)
+            .with_context(|| format!("failed to create directory {}", current.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&current) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o700);
+                let _ = fs::set_permissions(&current, perms);
+            }
         }
     }
     Ok(())

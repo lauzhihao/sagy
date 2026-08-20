@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -77,34 +77,11 @@ impl Cli {
             }
         }
 
-        let exe_name = raw_args
-            .first()
-            .and_then(|p| {
-                Path::new(p)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_ascii_lowercase())
-            })
-            .unwrap_or_default();
-
-        let is_alias =
-            exe_name.contains("flash") || exe_name.contains("pro") || exe_name.contains("think");
-
         let first_subcmd = find_first_subcmd(&raw_args);
         let has_known_subcmd = first_subcmd
             .as_deref()
             .map(is_known_subcmd)
             .unwrap_or(false);
-
-        if is_alias {
-            if has_known_subcmd {
-                let mut rewritten = vec![OsString::from("sagy")];
-                rewritten.extend(raw_args.iter().skip(1).cloned());
-                return Self::parse_from(rewritten);
-            }
-            let rewritten = rewrite_launch_args(&raw_args);
-            return Self::parse_from(rewritten);
-        }
 
         // If no explicit subcommand is given, rewrite flags directly to launch
         if raw_args.len() > 1 && !has_known_subcmd {

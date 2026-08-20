@@ -1,4 +1,3 @@
-use std::env;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -8,10 +7,8 @@ use anyhow::{Context, Result};
 use super::paths::find_agy_bin;
 use crate::core::state::AccountRecord;
 
-// Verified model IDs accepted by agy (source: `agy models`)
-pub const FLASH_MODEL_ID: &str = "gemini-3.7-flash-low";
-pub const PRO_MODEL_ID: &str = "gemini-3.1-pro-high";
-pub const THINK_MODEL_ID: &str = "gemini-3.7-flash-high";
+// agy models 的真实标识。effort 烧在 ID 内, 不再单独传 --effort。
+pub const DEFAULT_MODEL_ID: &str = "gemini-3.7-flash-high";
 
 impl super::AntigravityAdapter {
     pub fn launch_agy(
@@ -36,31 +33,11 @@ impl super::AntigravityAdapter {
             cmd.env("GOOGLE_CLOUD_PROJECT", project_id);
         }
 
-        // 3. Inspect binary alias invocation for model shortcuts
+        // 3. 注入默认模型。用户显式指定 --model 时不覆盖。
         let mut final_args = Vec::new();
-        if let Some(exe_name) = env::args().next().and_then(|p| {
-            Path::new(&p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(ToString::to_string)
-        }) {
-            let exe_lower = exe_name.to_ascii_lowercase();
-            if (exe_lower.contains("flash") || exe_lower == "sagy-flash")
-                && !contains_flag(extra_args, "--model")
-            {
-                final_args.push(OsString::from("--model"));
-                final_args.push(OsString::from(FLASH_MODEL_ID));
-            } else if (exe_lower.contains("pro") || exe_lower == "sagy-pro")
-                && !contains_flag(extra_args, "--model")
-            {
-                final_args.push(OsString::from("--model"));
-                final_args.push(OsString::from(PRO_MODEL_ID));
-            } else if (exe_lower.contains("think") || exe_lower == "sagy-think")
-                && !contains_flag(extra_args, "--model")
-            {
-                final_args.push(OsString::from("--model"));
-                final_args.push(OsString::from(THINK_MODEL_ID));
-            }
+        if !contains_flag(extra_args, "--model") {
+            final_args.push(OsString::from("--model"));
+            final_args.push(OsString::from(DEFAULT_MODEL_ID));
         }
 
         // 4. Session continuation / resume logic: only inject --continue if no prompt or continuation flag is given
