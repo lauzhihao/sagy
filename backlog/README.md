@@ -1,10 +1,19 @@
 # sagy Backlog
 
+## 当前发布状态
+
+2026-08-24 全库代码审查结论为 **BLOCKED**：已确认 Repo Sync command injection/路径越界、checksum fail-open、凭据同步失真、429 自动轮换不可达、state 并发丢更新等 P0/P1 问题。
+
+完整问题基线、证据和 release 解锁门禁见：
+
+- [2026-08-24 全库代码审查报告](./reviews/2026-08-24-full-code-review.md)
+
 ## 目录结构
 
 ```text
 backlog/
   README.md          本文件: 协议、分工、当前记分板
+  reviews/           跨模块审查报告、发布阻断项与解锁门禁
   tasks/             第一版工单(叙述式, 面向人)
   tasks-v2/          第二版工单(指令式, 面向低成本执行者) + TEMPLATE.md
   verify/            验收脚本。每个缺陷一个 bugs-NNN.sh, 输出 PASS/FAIL
