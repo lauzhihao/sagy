@@ -9,6 +9,8 @@ TMP_ROOT="${SAGY_HOME}/tmp"
 WRAPPER_PATH="${INSTALL_BIN}/sagy"
 ORIGINAL_WRAPPER_PATH="${INSTALL_BIN}/sagy-original"
 VERSION="${SAGY_VERSION:-}"
+CURL_CONNECT_TIMEOUT="${SAGY_CURL_CONNECT_TIMEOUT:-10}"
+CURL_MAX_TIME="${SAGY_CURL_MAX_TIME:-120}"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
@@ -18,7 +20,7 @@ show_requirements() {
   local missing=0
   local cmd
   echo "Dependency check:"
-  for cmd in bash curl tar mktemp; do
+  for cmd in bash curl tar mktemp awk tr; do
     if need_cmd "${cmd}"; then
       printf '  [ok] %s -> %s\n' "${cmd}" "$(command -v "${cmd}")"
     else
@@ -26,10 +28,74 @@ show_requirements() {
       missing=1
     fi
   done
+  if need_cmd shasum || need_cmd sha256sum; then
+    printf '  [ok] %s\n' "$(need_cmd shasum && echo shasum || echo sha256sum)"
+  else
+    echo '  [missing] shasum or sha256sum' >&2
+    missing=1
+  fi
   if [[ "${missing}" -ne 0 ]]; then
     echo "Install aborted because required commands are missing." >&2
     exit 1
   fi
+}
+
+verify_checksum() {
+  local sums_path="$1" archive_path="$2" asset="$3"
+  local line hash file extra expected_hash actual_hash target_count=0 seen_files="" seen_file
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    hash=""
+    file=""
+    extra=""
+    read -r hash file extra <<< "${line}"
+    if [[ -z "${hash}" || -z "${file}" || -n "${extra}" ]]; then
+      echo "Malformed checksum entry in ${sums_path}." >&2
+      return 1
+    fi
+    if [[ ! "${hash}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+      echo "Invalid SHA-256 checksum in ${sums_path}." >&2
+      return 1
+    fi
+    if [[ "${file}" == \** ]]; then
+      file="${file#\*}"
+    fi
+    if [[ -z "${file}" ]]; then
+      echo "Empty checksum target in ${sums_path}." >&2
+      return 1
+    fi
+    while IFS= read -r seen_file; do
+      if [[ "${seen_file}" == "${file}" ]]; then
+        echo "Duplicate checksum target in ${sums_path}." >&2
+        return 1
+      fi
+    done <<< "${seen_files}"
+    seen_files+="${file}"$'\n'
+    if [[ "${file}" == "${asset}" ]]; then
+      target_count=$((target_count + 1))
+      expected_hash="${hash}"
+    fi
+  done < "${sums_path}"
+
+  if [[ "${target_count}" -ne 1 ]]; then
+    echo "Checksum entry for ${asset} is missing or duplicated." >&2
+    return 1
+  fi
+
+  if need_cmd shasum; then
+    actual_hash="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+  elif need_cmd sha256sum; then
+    actual_hash="$(sha256sum "${archive_path}" | awk '{print $1}')"
+  else
+    echo "Checksum verification requires shasum or sha256sum." >&2
+    return 1
+  fi
+  if [[ "$(printf '%s' "${actual_hash}" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "${expected_hash}" | tr '[:upper:]' '[:lower:]')" ]]; then
+    echo "Checksum mismatch for ${asset}! Expected: ${expected_hash}, got: ${actual_hash}" >&2
+    return 1
+  fi
+  echo "Checksum verified: ${expected_hash}"
 }
 
 detect_target() {
@@ -64,7 +130,7 @@ resolve_version() {
   local api_url
   api_url="https://api.github.com/repos/${REPO}/releases/latest"
   VERSION="$(
-    curl -fsSL "${api_url}" \
+    curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${api_url}" \
       | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
       | head -n 1
   )"
@@ -88,29 +154,14 @@ download_and_install() {
   archive_path="${tmp_dir}/${asset}"
 
   echo "Downloading ${url}"
-  curl -fsSL "${url}" -o "${archive_path}"
+  curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${url}" -o "${archive_path}"
 
-  local sums_url sums_path expected_hash actual_hash
+  local sums_url sums_path
   sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.txt"
   sums_path="${tmp_dir}/SHA256SUMS.txt"
-  if curl -fsSL "${sums_url}" -o "${sums_path}" 2>/dev/null; then
-    echo "Verifying SHA256 checksum..."
-    expected_hash="$(grep -F "${asset}" "${sums_path}" | awk '{print $1}' || true)"
-    if [[ -n "${expected_hash}" ]]; then
-      if need_cmd shasum; then
-        actual_hash="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
-      elif need_cmd sha256sum; then
-        actual_hash="$(sha256sum "${archive_path}" | awk '{print $1}')"
-      else
-        actual_hash=""
-      fi
-      if [[ -n "${actual_hash}" && "${actual_hash}" != "${expected_hash}" ]]; then
-        echo "Checksum mismatch for ${asset}! Expected: ${expected_hash}, got: ${actual_hash}" >&2
-        exit 1
-      fi
-      echo "Checksum verified: ${expected_hash}"
-    fi
-  fi
+  echo "Verifying SHA256 checksum..."
+  curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${sums_url}" -o "${sums_path}"
+  verify_checksum "${sums_path}" "${archive_path}" "${asset}"
 
   mkdir -p "${INSTALL_BIN}"
   tar -xzf "${archive_path}" -C "${tmp_dir}"

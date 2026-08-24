@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{Cursor, Read};
@@ -197,31 +198,70 @@ fn verify_checksum(
         "https://github.com/{}/releases/download/{}/SHA256SUMS.txt",
         asset.repo, asset.tag
     );
-    if let Ok(resp) = client.get(&sums_url).send() {
-        if resp.status().is_success() {
-            let sums_text = resp.text().unwrap_or_default();
-            for line in sums_text.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let expected_hash = parts[0];
-                    let file = parts[1].trim_start_matches('*').trim_start_matches("./");
-                    if file == asset_name {
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        hasher.update(payload);
-                        let calculated = format!("{:x}", hasher.finalize());
-                        if !calculated.eq_ignore_ascii_case(expected_hash) {
-                            bail!(
-                                "SHA-256 checksum mismatch for {asset_name}!\nExpected: {expected_hash}\nActual:   {calculated}"
-                            );
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        }
+    let response = client
+        .get(&sums_url)
+        .send()
+        .with_context(|| format!("failed to download checksums from {sums_url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "checksum download from {sums_url} returned HTTP {}",
+            response.status()
+        );
+    }
+    let sums_text = response
+        .text()
+        .with_context(|| format!("failed to read checksums from {sums_url}"))?;
+    let expected_hash = parse_checksum_entry(&sums_text, asset_name)?;
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let calculated = format!("{:x}", hasher.finalize());
+    if !calculated.eq_ignore_ascii_case(&expected_hash) {
+        bail!(
+            "SHA-256 checksum mismatch for {asset_name}!\nExpected: {expected_hash}\nActual:   {calculated}"
+        );
     }
     Ok(())
+}
+
+fn parse_checksum_entry(sums_text: &str, asset_name: &str) -> Result<String> {
+    let mut seen_files = HashSet::new();
+    let mut matching_hash = None;
+
+    for (line_number, line) in sums_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let mut fields = line.split_whitespace();
+        let hash = fields.next().ok_or_else(|| {
+            anyhow::anyhow!("malformed checksum entry on line {}", line_number + 1)
+        })?;
+        let raw_file = fields.next().ok_or_else(|| {
+            anyhow::anyhow!("malformed checksum entry on line {}", line_number + 1)
+        })?;
+        if fields.next().is_some() {
+            bail!("malformed checksum entry on line {}", line_number + 1);
+        }
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("invalid SHA-256 checksum on line {}", line_number + 1);
+        }
+
+        // `*filename` is the binary-mode spelling emitted by common checksum tools.
+        let file = raw_file.strip_prefix('*').unwrap_or(raw_file);
+        if file.is_empty() || !seen_files.insert(file) {
+            bail!(
+                "duplicate or empty checksum target on line {}",
+                line_number + 1
+            );
+        }
+        if file == asset_name {
+            matching_hash = Some(hash.to_ascii_lowercase());
+        }
+    }
+
+    matching_hash.ok_or_else(|| anyhow::anyhow!("checksum entry for {asset_name} is missing"))
 }
 
 fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result<Vec<u8>> {
@@ -314,6 +354,30 @@ fn binary_filename_for_current_platform(base_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn checksum_requires_exact_target_and_strict_hash() {
+        assert_eq!(
+            parse_checksum_entry(&format!("{VALID_HASH}  sagy.tar.gz\n"), "sagy.tar.gz")
+                .expect("valid checksum"),
+            VALID_HASH
+        );
+        assert!(parse_checksum_entry("not-a-hash  sagy.tar.gz\n", "sagy.tar.gz").is_err());
+        assert!(
+            parse_checksum_entry(&format!("{VALID_HASH}  ./sagy.tar.gz\n"), "sagy.tar.gz").is_err()
+        );
+    }
+
+    #[test]
+    fn checksum_rejects_missing_and_duplicate_targets() {
+        assert!(
+            parse_checksum_entry(&format!("{VALID_HASH}  other.tar.gz\n"), "sagy.tar.gz").is_err()
+        );
+        let duplicate = format!("{VALID_HASH}  sagy.tar.gz\n{VALID_HASH}  sagy.tar.gz\n");
+        assert!(parse_checksum_entry(&duplicate, "sagy.tar.gz").is_err());
+    }
 
     #[test]
     fn test_is_newer_version() {

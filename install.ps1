@@ -9,6 +9,10 @@ $ErrorActionPreference = "Stop"
 $SagyHome = if ($env:SAGY_HOME) { $env:SAGY_HOME } else { Join-Path $HOME ".sagy" }
 $InstallBin = Join-Path $SagyHome "bin"
 $TmpRoot = Join-Path $SagyHome "tmp"
+$DownloadTimeoutSec = if ($env:SAGY_DOWNLOAD_TIMEOUT_SEC) { [int]$env:SAGY_DOWNLOAD_TIMEOUT_SEC } else { 120 }
+if ($DownloadTimeoutSec -le 0) {
+    throw "SAGY_DOWNLOAD_TIMEOUT_SEC must be a positive number"
+}
 
 if (-not (Test-Path $InstallBin)) {
     New-Item -ItemType Directory -Force -Path $InstallBin | Out-Null
@@ -28,26 +32,43 @@ $downloadUrl = "https://github.com/$Repo/releases/download/$Version/$assetName"
 $zipPath = Join-Path $TmpRoot $assetName
 
 Write-Host "Downloading $downloadUrl..."
-Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec $DownloadTimeoutSec
 
 # Verify SHA256 Checksum
 $sumsUrl = "https://github.com/$Repo/releases/download/$Version/SHA256SUMS.txt"
 $sumsPath = Join-Path $TmpRoot "SHA256SUMS.txt"
-try {
-    Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing -TimeoutSec 15
-    if (Test-Path $sumsPath) {
-        $expectedHash = (Get-Content $sumsPath | Select-String $assetName | ForEach-Object { ($_ -split '\s+')[0] })
-        if ($expectedHash) {
-            $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
-            if ($actualHash -ne $expectedHash.ToLower()) {
-                throw "SHA-256 checksum mismatch for $assetName! Expected: $expectedHash, got: $actualHash"
-            }
-            Write-Host "Checksum verified: $expectedHash"
-        }
+$null = Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing -TimeoutSec $DownloadTimeoutSec
+$seenFiles = @{}
+$expectedHash = $null
+$sumLines = (Get-Content -Path $sumsPath -Raw) -split "`r?`n"
+foreach ($line in $sumLines) {
+    if ([string]::IsNullOrWhiteSpace($line)) {
+        continue
     }
-} catch {
-    Write-Warning "Checksum verification skipped or failed: $_"
+    if ($line -notmatch '^\s*([0-9A-Fa-f]{64})\s+(\*?[^\s]+)\s*$') {
+        throw "Malformed checksum entry in $sumsPath"
+    }
+    $hash = $Matches[1].ToLowerInvariant()
+    $file = $Matches[2]
+    if ($file.StartsWith('*')) {
+        $file = $file.Substring(1)
+    }
+    if ([string]::IsNullOrEmpty($file) -or $seenFiles.ContainsKey($file)) {
+        throw "Duplicate or empty checksum target in $sumsPath"
+    }
+    $seenFiles[$file] = $true
+    if ($file -ceq $assetName) {
+        $expectedHash = $hash
+    }
 }
+if ($null -eq $expectedHash) {
+    throw "Checksum entry for $assetName is missing"
+}
+$actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actualHash -ne $expectedHash) {
+    throw "SHA-256 checksum mismatch for $assetName! Expected: $expectedHash, got: $actualHash"
+}
+Write-Host "Checksum verified: $expectedHash"
 
 Expand-Archive -Path $zipPath -DestinationPath $TmpRoot -Force
 $extractedExe = Join-Path $TmpRoot "sagy.exe"
