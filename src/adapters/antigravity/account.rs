@@ -7,8 +7,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::adapters::antigravity::paths::{
-    account_credentials_file, account_dir, account_token_file, default_antigravity_cli_home,
-    default_gemini_home,
+    account_credentials_file, account_dir_checked, account_token_file,
+    default_antigravity_cli_home, default_gemini_home, validate_path_under_root,
 };
 use crate::core::state::{AccountRecord, AccountType, State, UsageSnapshot};
 use crate::core::storage;
@@ -208,8 +208,11 @@ impl super::AntigravityAdapter {
             .map(|a| a.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let acc_dir = account_dir(state_dir, &account_id);
+        let acc_dir = account_dir_checked(state_dir, &account_id)?;
+        storage::create_secure_dir_all(&acc_dir)?;
+        let acc_dir = account_dir_checked(state_dir, &account_id)?;
         let target_cred = account_credentials_file(&acc_dir);
+        validate_path_under_root(&acc_dir, &target_cred)?;
         storage::write_secret_file(&target_cred, content.as_bytes())
             .with_context(|| format!("failed to write {}", target_cred.display()))?;
 
@@ -304,8 +307,11 @@ impl super::AntigravityAdapter {
             .map(|a| a.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let acc_dir = account_dir(state_dir, &account_id);
+        let acc_dir = account_dir_checked(state_dir, &account_id)?;
+        storage::create_secure_dir_all(&acc_dir)?;
+        let acc_dir = account_dir_checked(state_dir, &account_id)?;
         let token_path = account_token_file(&acc_dir);
+        validate_path_under_root(&acc_dir, &token_path)?;
         storage::write_secret_file(&token_path, token.as_bytes())
             .with_context(|| format!("failed to write {}", token_path.display()))?;
 
@@ -368,9 +374,19 @@ impl super::AntigravityAdapter {
     }
 
     pub fn remove_account(&self, state_dir: &Path, state: &mut State, id: &str) -> Result<()> {
-        let acc_dir = account_dir(state_dir, id);
-        if acc_dir.exists() {
-            let _ = fs::remove_dir_all(&acc_dir);
+        let acc_dir = account_dir_checked(state_dir, id)?;
+        match fs::symlink_metadata(&acc_dir) {
+            Ok(_) => {
+                fs::remove_dir_all(&acc_dir).with_context(|| {
+                    format!("failed to remove account directory {}", acc_dir.display())
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect account directory {}", acc_dir.display())
+                });
+            }
         }
         state.accounts.retain(|a| a.id != id);
         state.usage_cache.remove(id);
