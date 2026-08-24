@@ -7,6 +7,7 @@ use sagy::adapters::antigravity::paths::{
     MAX_BUNDLE_DIR_BYTES, MAX_BUNDLE_DIR_COMPONENTS, account_dir_checked, validate_account_id,
     validate_bundle_dir,
 };
+use sagy::cli::repo_sync::resolve_repo_sync_repo;
 use sagy::core::state::{AccountRecord, State};
 use sagy::core::storage;
 
@@ -255,6 +256,79 @@ fn black_box_unsafe_path_does_not_modify_victim() {
         stderr.contains("bundle path must be relative"),
         "unexpected error: {stderr}"
     );
+}
+
+#[test]
+fn repo_location_rejects_http_credentials_query_and_fragment_before_save() {
+    let rejected = [
+        "https://alice:supersecret@example.test/pool.git",
+        "https://example.test/pool.git?access_token=supersecret",
+        "https://example.test/pool.git#supersecret",
+        "HTTP://alice:supersecret@example.test/pool.git",
+    ];
+
+    for (index, repo) in rejected.iter().enumerate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join(format!("state-{index}"));
+        fs::create_dir_all(&state_dir).expect("state dir");
+        let result = resolve_repo_sync_repo(&state_dir, Some(repo));
+        assert!(result.is_err(), "accepted unsafe repository {repo:?}");
+        let error = format!("{:#}", result.expect_err("error"));
+        assert!(
+            !error.contains("supersecret"),
+            "secret leaked in validation error: {error}"
+        );
+        assert!(
+            !state_dir.join("repo-sync.json").exists(),
+            "invalid repository was persisted"
+        );
+    }
+}
+
+#[test]
+fn scp_like_ssh_repo_is_accepted_and_save_errors_propagate() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let repo = "git@github.com:user/sagy-pool.git";
+    assert_eq!(
+        resolve_repo_sync_repo(&state_dir, Some(repo)).expect("scp-like URL"),
+        repo
+    );
+    let config = fs::read_to_string(state_dir.join("repo-sync.json")).expect("config");
+    assert!(config.contains(repo));
+
+    let state_file = temp.path().join("state-file");
+    fs::write(&state_file, b"not a directory").expect("state file");
+    let error =
+        resolve_repo_sync_repo(&state_file, Some(repo)).expect_err("save failure should propagate");
+    assert!(format!("{error:#}").contains("failed to save repository sync configuration"));
+}
+
+#[test]
+fn black_box_rejected_repo_has_no_secret_in_output_or_config() {
+    let cases = [
+        "https://alice:supersecret@example.test/pool.git",
+        "https://example.test/pool.git?access_token=supersecret",
+        "https://example.test/pool.git#supersecret",
+    ];
+    for (index, repo) in cases.iter().enumerate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join(format!("state-{index}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_sagy"))
+            .env("HOME", temp.path().join("home"))
+            .env("ANTIGRAVITY_CONFIG_DIR", temp.path().join("gemini"))
+            .env("GEMINI_HOME", temp.path().join("gemini"))
+            .args(["--state-dir", state_dir.to_str().unwrap(), "pull", repo])
+            .output()
+            .expect("sagy pull");
+
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stdout.contains("supersecret"), "secret leaked to stdout");
+        assert!(!stderr.contains("supersecret"), "secret leaked to stderr");
+        assert!(!state_dir.join("repo-sync.json").exists());
+    }
 }
 
 fn run_git(git_bin: &Path, cwd: Option<&Path>, args: &[&str]) {
