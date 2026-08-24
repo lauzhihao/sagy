@@ -39,17 +39,33 @@ function Invoke-WebRequest {
     }
 }
 
+function Invoke-RestMethod {
+    param(
+        [string]$Uri,
+        [switch]$UseBasicParsing,
+        [int]$TimeoutSec
+    )
+    if ($env:FAKE_SUMS_MODE -eq "metadata-timeout") {
+        throw "fake metadata timeout"
+    }
+    throw "unexpected metadata request"
+}
+
 try {
     Set-Variable -Name HOME -Scope Global -Value $root
-    foreach ($mode in @("archive-timeout", "checksum-timeout", "http-error", "empty", "missing", "duplicate", "malformed", "mismatch")) {
+    foreach ($mode in @("metadata-timeout", "archive-timeout", "checksum-timeout", "http-error", "empty", "missing", "duplicate", "malformed", "mismatch")) {
         $home = Join-Path $root $mode
         $env:SAGY_HOME = Join-Path $home ".sagy"
         $env:FAKE_SUMS_MODE = $mode
         $failed = $false
-        try { . $installer -Repo "test/repo" -Version "v1.0.0" } catch { $failed = $true }
+        $version = if ($mode -eq "metadata-timeout") { "" } else { "v1.0.0" }
+        try { . $installer -Repo "test/repo" -Version $version } catch { $failed = $true }
         if (-not $failed) { throw "installer unexpectedly succeeded for $mode" }
         if (Test-Path (Join-Path $home ".sagy/bin/sagy.exe")) {
             throw "installer copied binary for failed checksum mode $mode"
+        }
+        if (Get-ChildItem -Path (Join-Path $home ".sagy/tmp") -Filter "sagy*.zip" -ErrorAction SilentlyContinue) {
+            throw "installer downloaded archive for failed checksum mode $mode"
         }
         if (Get-ChildItem -Path (Join-Path $home ".sagy/tmp") -Filter "sagy.exe" -Recurse -ErrorAction SilentlyContinue) {
             throw "installer extracted binary for failed checksum mode $mode"

@@ -167,6 +167,9 @@ fn powershell_installer_has_fail_closed_checksum_guard() {
     assert!(unix_source.contains("--max-time \"${CURL_MAX_TIME}\""));
     let source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/install.ps1"))
         .expect("read PowerShell installer");
+    assert!(source.contains(
+        "Invoke-RestMethod -Uri $apiUrl -UseBasicParsing -TimeoutSec $DownloadTimeoutSec"
+    ));
     assert!(source.contains("Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec $DownloadTimeoutSec"));
     assert!(source.contains("Invoke-WebRequest -Uri $sumsUrl"));
     assert!(source.contains("-TimeoutSec $DownloadTimeoutSec"));

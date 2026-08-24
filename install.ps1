@@ -23,7 +23,7 @@ if (-not (Test-Path $TmpRoot)) {
 
 if (-not $Version) {
     $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-    $response = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing
+    $response = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing -TimeoutSec $DownloadTimeoutSec
     $Version = $response.tag_name
 }
 
