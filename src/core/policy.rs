@@ -1,108 +1,181 @@
 use chrono::Utc;
-use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
-use crate::core::state::{AccountRecord, State, UsageSnapshot};
+use crate::core::health::HealthStatus;
+use crate::core::state::{
+    AccountRecord, AccountType, CredentialRef, CredentialRefKind, State, UsageSnapshot,
+};
+
+/// The only result used by account selection. The ordering is intentional:
+/// a successfully probed credential wins over one that needs a refresh, and
+/// both win over a locally verified but unprobed credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Eligibility {
+    Primary,
+    Secondary,
+    Fallback,
+    Ineligible,
+}
+
+impl Eligibility {
+    fn rank(self) -> Option<i64> {
+        match self {
+            Self::Primary => Some(3),
+            Self::Secondary => Some(2),
+            Self::Fallback => Some(1),
+            Self::Ineligible => None,
+        }
+    }
+}
+
+/// Decide whether one account can be selected.
+///
+/// `None` is deliberately accepted for the credential reference so callers
+/// handling v1 or partially migrated state can fail closed instead of
+/// inventing a credential kind. A missing usage snapshot is treated as
+/// `Unverified`; that path is selectable only after the caller has validated
+/// the local credential.
+pub fn eligibility(
+    account: &AccountRecord,
+    credential_ref: Option<&CredentialRef>,
+    usage: Option<&UsageSnapshot>,
+    local_credential_validated: bool,
+    now: i64,
+) -> Eligibility {
+    let Some(credential_ref) = credential_ref else {
+        return Eligibility::Ineligible;
+    };
+    if !compatible_credential(account.account_type, credential_ref.kind) {
+        return Eligibility::Ineligible;
+    }
+
+    let usage = usage.cloned().unwrap_or_default();
+    if usage.remaining_quota_percent == Some(0) || usage.is_in_cooldown(now) {
+        return Eligibility::Ineligible;
+    }
+
+    match usage.health {
+        HealthStatus::Ready => Eligibility::Primary,
+        HealthStatus::RefreshRequired
+            if credential_ref.kind == CredentialRefKind::OauthAuthorizedUser =>
+        {
+            Eligibility::Secondary
+        }
+        HealthStatus::Unverified if local_credential_validated => Eligibility::Fallback,
+        HealthStatus::RefreshRequired
+        | HealthStatus::Unverified
+        | HealthStatus::RateLimited
+        | HealthStatus::AuthInvalid
+        | HealthStatus::PermissionDenied
+        | HealthStatus::InvalidCredential
+        | HealthStatus::TransientFailure => Eligibility::Ineligible,
+    }
+}
+
+fn compatible_credential(account_type: AccountType, kind: CredentialRefKind) -> bool {
+    match account_type {
+        AccountType::OAuth => matches!(
+            kind,
+            CredentialRefKind::OauthAccessToken | CredentialRefKind::OauthAuthorizedUser
+        ),
+        AccountType::ApiKey => kind == CredentialRefKind::ApiKey,
+        AccountType::Vertex => kind == CredentialRefKind::VertexServiceAccount,
+    }
+}
 
 pub fn select_best_account<'a>(
     state: &'a State,
     accounts: &'a [AccountRecord],
 ) -> Option<(&'a AccountRecord, UsageSnapshot)> {
+    select_best_account_with_validation(state, accounts, &BTreeSet::new(), Utc::now().timestamp())
+}
+
+/// Select after the caller has validated the listed fixed credential files.
+/// A durable ref alone is not proof that its file still exists and matches.
+pub fn select_best_account_with_validation<'a>(
+    state: &'a State,
+    accounts: &'a [AccountRecord],
+    locally_validated_ids: &BTreeSet<String>,
+    now: i64,
+) -> Option<(&'a AccountRecord, UsageSnapshot)> {
     if accounts.is_empty() {
         return None;
     }
 
-    let now = Utc::now().timestamp();
-
-    // 1. Stickiness check: If current account is still healthy, keep it
+    // Stickiness and ordinary candidate selection use the same predicate.
     if let Some(current_id) = &state.current_account_id {
         if let Some(current_account) = accounts.iter().find(|a| &a.id == current_id) {
-            let usage = state
-                .usage_cache
-                .get(&current_account.id)
-                .cloned()
-                .unwrap_or_default();
-
-            if usage.is_healthy(now) {
-                return Some((current_account, usage));
+            let usage = state.usage_cache.get(&current_account.id);
+            let reference = state.credential_refs.get(&current_account.id);
+            if eligibility(
+                current_account,
+                reference,
+                usage,
+                locally_validated_ids.contains(&current_account.id),
+                now,
+            )
+            .rank()
+            .is_some()
+            {
+                return Some((current_account, usage.cloned().unwrap_or_default()));
             }
         }
     }
 
-    // 2. Score all candidate accounts
-    let mut candidates: Vec<(&'a AccountRecord, UsageSnapshot, f64)> = accounts
+    let mut candidates: Vec<(&'a AccountRecord, UsageSnapshot, i64)> = accounts
         .iter()
-        .map(|account| {
-            let usage = state
-                .usage_cache
-                .get(&account.id)
-                .cloned()
-                .unwrap_or_default();
-            let score = score_account(account, &usage, now);
-            (account, usage, score)
+        .filter_map(|account| {
+            let usage = state.usage_cache.get(&account.id);
+            let reference = state.credential_refs.get(&account.id);
+            let tier = eligibility(
+                account,
+                reference,
+                usage,
+                locally_validated_ids.contains(&account.id),
+                now,
+            );
+            let rank = tier.rank()?;
+            let snapshot = usage.cloned().unwrap_or_default();
+            Some((
+                account,
+                snapshot.clone(),
+                score_account(account, &snapshot, now, rank),
+            ))
         })
         .collect();
 
-    // Sort descending by score
-    candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
-
-    // Only return healthy candidate with positive score
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
     candidates
         .into_iter()
-        .find(|(_, _, score)| *score > 0.0)
-        .map(|(acc, usage, _)| (acc, usage))
+        .next()
+        .map(|(account, usage, _)| (account, usage))
 }
 
-fn score_account(account: &AccountRecord, usage: &UsageSnapshot, now: i64) -> f64 {
-    let mut score = 1000.0;
+fn score_account(account: &AccountRecord, usage: &UsageSnapshot, now: i64, tier: i64) -> i64 {
+    let mut score = tier * 10_000;
 
-    // Hard penalty for requiring re-login
-    if usage.needs_relogin {
-        return -10000.0;
-    }
-
-    // Cooldown penalty
-    if let Some(cooldown) = usage.cooldown_until {
-        if now < cooldown {
-            let remaining_seconds = (cooldown - now) as f64;
-            // Negative score proportional to remaining cooldown
-            return -5000.0 - remaining_seconds;
-        }
-    }
-
-    // Soft penalty for stale tokens that can be refreshed by agy
-    if usage.status == "Stale" {
-        score -= 200.0;
-    }
-
-    // Quota percentage bonus
     if let Some(remaining) = usage.remaining_quota_percent {
-        score += (remaining as f64) * 5.0;
-    } else {
-        // Unknown quota gets a neutral median bonus
-        score += 250.0;
+        score += i64::from(remaining) * 5;
     }
 
-    // Account type preferences
     if account.is_oauth() {
-        score += 50.0;
+        score += 50;
     }
 
-    // Plan preferences (Pro / Paid plans have higher priority)
     if let Some(plan) = &account.plan {
         let plan_lower = plan.to_ascii_lowercase();
         if plan_lower.contains("pro")
             || plan_lower.contains("advanced")
             || plan_lower.contains("ultra")
         {
-            score += 100.0;
+            score += 100;
         }
     }
 
-    // Recency / freshness bonus (slight preference for recently used healthy accounts)
+    // A future timestamp is clock-skew evidence, never a freshness bonus.
     if let Some(last_used) = account.last_used_at {
-        let age_hours = ((now - last_used) as f64) / 3600.0;
-        if age_hours < 24.0 {
-            score += 10.0;
+        if last_used <= now && now - last_used < 24 * 60 * 60 {
+            score += 10;
         }
     }
 
@@ -112,150 +185,230 @@ fn score_account(account: &AccountRecord, usage: &UsageSnapshot, now: i64) -> f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::state::AccountType;
+    use crate::core::health::Cooldown;
 
-    #[test]
-    fn test_select_best_account_healthy_current() {
-        let mut state = State::default();
-        let acc1 = AccountRecord {
-            id: "acc-1".to_string(),
-            email: "user1@gmail.com".to_string(),
-            account_type: AccountType::OAuth,
-            plan: Some("Pro".to_string()),
-            ..Default::default()
-        };
-        let acc2 = AccountRecord {
-            id: "acc-2".to_string(),
-            email: "user2@gmail.com".to_string(),
-            account_type: AccountType::OAuth,
-            plan: Some("Free".to_string()),
-            ..Default::default()
-        };
-        state.accounts = vec![acc1.clone(), acc2.clone()];
-        state.current_account_id = Some("acc-1".to_string());
-        state.usage_cache.insert(
-            "acc-1".to_string(),
-            UsageSnapshot {
-                status: "Ready".to_string(),
-                remaining_quota_percent: Some(90),
-                ..Default::default()
-            },
-        );
+    const FP: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        let selected = select_best_account(&state, &state.accounts);
-        assert!(selected.is_some());
-        assert_eq!(selected.unwrap().0.id, "acc-1");
+    fn account(account_type: AccountType) -> AccountRecord {
+        AccountRecord {
+            id: "account-1".to_string(),
+            email: "user@example.test".to_string(),
+            account_type,
+            ..Default::default()
+        }
+    }
+
+    fn reference(kind: CredentialRefKind) -> CredentialRef {
+        CredentialRef {
+            kind,
+            fingerprint: FP.to_string(),
+        }
+    }
+
+    fn usage(health: HealthStatus) -> UsageSnapshot {
+        UsageSnapshot {
+            health,
+            remaining_quota_percent: Some(50),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn test_select_best_account_skips_cooldown() {
-        let mut state = State::default();
-        let acc1 = AccountRecord {
-            id: "acc-1".to_string(),
-            email: "user1@gmail.com".to_string(),
-            account_type: AccountType::OAuth,
-            ..Default::default()
-        };
-        let acc2 = AccountRecord {
-            id: "acc-2".to_string(),
-            email: "user2@gmail.com".to_string(),
-            account_type: AccountType::OAuth,
-            ..Default::default()
-        };
-        state.accounts = vec![acc1.clone(), acc2.clone()];
-        state.current_account_id = Some("acc-1".to_string());
+    fn eligibility_matrix_rejects_incompatible_and_terminal_states() {
+        let now = 1_000;
+        let kinds = [
+            (AccountType::OAuth, CredentialRefKind::OauthAccessToken),
+            (AccountType::OAuth, CredentialRefKind::OauthAuthorizedUser),
+            (AccountType::ApiKey, CredentialRefKind::ApiKey),
+            (AccountType::Vertex, CredentialRefKind::VertexServiceAccount),
+        ];
+        for (account_type, kind) in kinds {
+            let account = account(account_type);
+            let reference = reference(kind);
+            assert_eq!(
+                eligibility(
+                    &account,
+                    Some(&reference),
+                    Some(&usage(HealthStatus::Ready)),
+                    false,
+                    now
+                ),
+                Eligibility::Primary
+            );
+            assert_eq!(
+                eligibility(
+                    &account,
+                    Some(&reference),
+                    Some(&usage(HealthStatus::RefreshRequired)),
+                    true,
+                    now
+                ),
+                if kind == CredentialRefKind::OauthAuthorizedUser {
+                    Eligibility::Secondary
+                } else {
+                    Eligibility::Ineligible
+                }
+            );
+            for health in [
+                HealthStatus::RateLimited,
+                HealthStatus::AuthInvalid,
+                HealthStatus::PermissionDenied,
+                HealthStatus::InvalidCredential,
+                HealthStatus::TransientFailure,
+            ] {
+                assert_eq!(
+                    eligibility(&account, Some(&reference), Some(&usage(health)), true, now),
+                    Eligibility::Ineligible
+                );
+            }
+            assert_eq!(
+                eligibility(&account, Some(&reference), None, false, now),
+                Eligibility::Ineligible
+            );
+            assert_eq!(
+                eligibility(&account, Some(&reference), None, true, now),
+                Eligibility::Fallback
+            );
+        }
 
+        let oauth = account(AccountType::OAuth);
+        assert_eq!(
+            eligibility(
+                &oauth,
+                Some(&reference(CredentialRefKind::ApiKey)),
+                Some(&usage(HealthStatus::Ready)),
+                true,
+                now
+            ),
+            Eligibility::Ineligible
+        );
+        assert_eq!(
+            eligibility(&oauth, None, Some(&usage(HealthStatus::Ready)), true, now),
+            Eligibility::Ineligible
+        );
+    }
+
+    #[test]
+    fn zero_quota_and_active_cooldown_are_always_ineligible() {
+        let account = account(AccountType::OAuth);
+        let reference = reference(CredentialRefKind::OauthAuthorizedUser);
+        let zero = UsageSnapshot {
+            health: HealthStatus::Ready,
+            remaining_quota_percent: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            eligibility(&account, Some(&reference), Some(&zero), true, 100),
+            Eligibility::Ineligible
+        );
+        let limited = UsageSnapshot {
+            health: HealthStatus::RateLimited,
+            cooldown: Some(Cooldown {
+                started_at: 100,
+                until: 200,
+                last_evidence_at: 100,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            eligibility(&account, Some(&reference), Some(&limited), true, 150),
+            Eligibility::Ineligible
+        );
+    }
+
+    #[test]
+    fn stickiness_and_candidates_share_eligibility() {
+        let current = account(AccountType::OAuth);
+        let candidate = AccountRecord {
+            id: "account-2".to_string(),
+            email: "two@example.test".to_string(),
+            account_type: AccountType::OAuth,
+            ..Default::default()
+        };
+        let mut state = State {
+            accounts: vec![current.clone(), candidate.clone()],
+            current_account_id: Some(current.id.clone()),
+            ..Default::default()
+        };
+        state.credential_refs.insert(
+            current.id.clone(),
+            reference(CredentialRefKind::OauthAccessToken),
+        );
+        state.credential_refs.insert(
+            candidate.id.clone(),
+            reference(CredentialRefKind::OauthAccessToken),
+        );
+        state
+            .usage_cache
+            .insert(current.id.clone(), usage(HealthStatus::AuthInvalid));
+        state.usage_cache.insert(
+            candidate.id.clone(),
+            UsageSnapshot {
+                health: HealthStatus::Ready,
+                remaining_quota_percent: Some(10),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            select_best_account(&state, &state.accounts).unwrap().0.id,
+            candidate.id
+        );
+    }
+
+    #[test]
+    fn future_last_used_does_not_receive_freshness_bonus() {
         let now = Utc::now().timestamp();
-        state.usage_cache.insert(
-            "acc-1".to_string(),
-            UsageSnapshot {
-                status: "RateLimited".to_string(),
-                cooldown_until: Some(now + 300),
-                ..Default::default()
-            },
-        );
-        state.usage_cache.insert(
-            "acc-2".to_string(),
-            UsageSnapshot {
-                status: "Ready".to_string(),
-                remaining_quota_percent: Some(100),
-                ..Default::default()
-            },
-        );
-
-        let selected = select_best_account(&state, &state.accounts);
-        assert!(selected.is_some());
-        assert_eq!(selected.unwrap().0.id, "acc-2");
+        let mut first = account(AccountType::ApiKey);
+        first.id = "first".to_string();
+        first.last_used_at = Some(now + 86_400);
+        let mut second = account(AccountType::ApiKey);
+        second.id = "second".to_string();
+        let mut state = State {
+            accounts: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        for item in [&first, &second] {
+            state
+                .credential_refs
+                .insert(item.id.clone(), reference(CredentialRefKind::ApiKey));
+            state
+                .usage_cache
+                .insert(item.id.clone(), usage(HealthStatus::Ready));
+        }
+        let selected = select_best_account(&state, &state.accounts).unwrap();
+        assert_eq!(selected.0.id, "first");
     }
 
     #[test]
-    fn test_select_best_account_returns_none_when_all_in_cooldown() {
-        let mut state = State::default();
-        let acc1 = AccountRecord {
-            id: "acc-1".to_string(),
-            email: "user1@gmail.com".to_string(),
-            ..Default::default()
-        };
-        state.accounts = vec![acc1];
-        let now = Utc::now().timestamp();
-        state.usage_cache.insert(
-            "acc-1".to_string(),
-            UsageSnapshot {
-                status: "RateLimited".to_string(),
-                cooldown_until: Some(now + 300),
-                ..Default::default()
-            },
-        );
-
-        let selected = select_best_account(&state, &state.accounts);
-        assert!(selected.is_none());
+    fn tier_is_primary_then_secondary_then_fallback() {
+        assert!(Eligibility::Primary.rank() > Eligibility::Secondary.rank());
+        assert!(Eligibility::Secondary.rank() > Eligibility::Fallback.rank());
+        assert_eq!(Eligibility::Ineligible.rank(), None);
     }
 
     #[test]
-    fn test_select_best_account_returns_none_when_needs_relogin() {
-        let mut state = State::default();
-        let acc1 = AccountRecord {
-            id: "acc-1".to_string(),
-            email: "user1@gmail.com".to_string(),
+    fn unverified_selection_requires_live_local_validation_not_only_a_state_ref() {
+        let candidate = account(AccountType::Vertex);
+        let mut state = State {
+            accounts: vec![candidate.clone()],
             ..Default::default()
         };
-        state.accounts = vec![acc1];
-        state.usage_cache.insert(
-            "acc-1".to_string(),
-            UsageSnapshot {
-                status: "AuthError".to_string(),
-                needs_relogin: true,
-                ..Default::default()
-            },
+        state.credential_refs.insert(
+            candidate.id.clone(),
+            reference(CredentialRefKind::VertexServiceAccount),
         );
+        state
+            .usage_cache
+            .insert(candidate.id.clone(), usage(HealthStatus::Unverified));
 
-        let selected = select_best_account(&state, &state.accounts);
-        assert!(selected.is_none());
-    }
-
-    #[test]
-    fn test_select_best_account_selects_stale_refreshable_account() {
-        let mut state = State::default();
-        let acc1 = AccountRecord {
-            id: "acc-1".to_string(),
-            email: "user1@gmail.com".to_string(),
-            account_type: AccountType::OAuth,
-            refresh_token: Some("1//sample_refresh".to_string()),
-            ..Default::default()
-        };
-        state.accounts = vec![acc1];
-        state.usage_cache.insert(
-            "acc-1".to_string(),
-            UsageSnapshot {
-                status: "Stale".to_string(),
-                remaining_quota_percent: Some(50),
-                needs_relogin: false,
-                ..Default::default()
-            },
+        assert!(select_best_account(&state, &state.accounts).is_none());
+        let validated = BTreeSet::from([candidate.id.clone()]);
+        assert_eq!(
+            select_best_account_with_validation(&state, &state.accounts, &validated, 1_000)
+                .unwrap()
+                .0
+                .id,
+            candidate.id
         );
-
-        let selected = select_best_account(&state, &state.accounts);
-        assert!(selected.is_some());
-        assert_eq!(selected.unwrap().0.id, "acc-1");
     }
 }

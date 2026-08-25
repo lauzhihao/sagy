@@ -16,6 +16,37 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+validate_release_component() {
+  local value="$1" label="$2"
+  if [[ -z "${value}" || ! "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "${value}" == "." || "${value}" == ".." ]]; then
+    echo "Unsafe ${label}: ${value}" >&2
+    return 1
+  fi
+}
+
+validate_configuration() {
+  if [[ ! "${REPO}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+    echo "Unsafe GitHub repository name: ${REPO}" >&2
+    return 1
+  fi
+  local repo_owner="${REPO%%/*}" repo_name="${REPO#*/}"
+  if [[ "${repo_owner}" == "." || "${repo_owner}" == ".." || "${repo_name}" == "." || "${repo_name}" == ".." ]]; then
+    echo "Unsafe GitHub repository name: ${REPO}" >&2
+    return 1
+  fi
+  if [[ -n "${VERSION}" ]]; then
+    validate_release_component "${VERSION}" "release version"
+  fi
+  if [[ ! "${CURL_CONNECT_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SAGY_CURL_CONNECT_TIMEOUT must be a positive integer." >&2
+    return 1
+  fi
+  if [[ ! "${CURL_MAX_TIME}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SAGY_CURL_MAX_TIME must be a positive integer." >&2
+    return 1
+  fi
+}
+
 show_requirements() {
   local missing=0
   local cmd
@@ -40,9 +71,31 @@ show_requirements() {
   fi
 }
 
+download_file() {
+  local url="$1" output="$2" status
+  status="$(curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" \
+    -w '%{http_code}' "${url}" -o "${output}")" || {
+    echo "Download failed: ${url}" >&2
+    return 1
+  }
+  if [[ ! "${status}" =~ ^2[0-9]{2}$ ]]; then
+    echo "Download returned HTTP ${status:-unknown}: ${url}" >&2
+    return 1
+  fi
+}
+
 verify_checksum() {
   local sums_path="$1" archive_path="$2" asset="$3"
   local line hash file extra expected_hash actual_hash target_count=0 seen_files="" seen_file
+
+  if [[ -L "${sums_path}" || ! -f "${sums_path}" || ! -s "${sums_path}" ]]; then
+    echo "Checksum manifest is missing or empty: ${sums_path}" >&2
+    return 1
+  fi
+  if [[ -L "${archive_path}" || ! -f "${archive_path}" || ! -s "${archive_path}" ]]; then
+    echo "Downloaded archive is missing or empty: ${archive_path}" >&2
+    return 1
+  fi
 
   while IFS= read -r line || [[ -n "${line}" ]]; do
     [[ -z "${line//[[:space:]]/}" ]] && continue
@@ -63,6 +116,10 @@ verify_checksum() {
     fi
     if [[ -z "${file}" ]]; then
       echo "Empty checksum target in ${sums_path}." >&2
+      return 1
+    fi
+    if [[ ! "${file}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "Unsafe checksum target in ${sums_path}." >&2
       return 1
     fi
     while IFS= read -r seen_file; do
@@ -89,6 +146,10 @@ verify_checksum() {
     actual_hash="$(sha256sum "${archive_path}" | awk '{print $1}')"
   else
     echo "Checksum verification requires shasum or sha256sum." >&2
+    return 1
+  fi
+  if [[ ! "${actual_hash}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "Hash tool returned an invalid SHA-256 digest." >&2
     return 1
   fi
   if [[ "$(printf '%s' "${actual_hash}" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "${expected_hash}" | tr '[:upper:]' '[:lower:]')" ]]; then
@@ -138,6 +199,7 @@ resolve_version() {
     echo "Failed to resolve latest release tag from ${api_url}" >&2
     exit 1
   fi
+  validate_release_component "${VERSION}" "release version"
   echo "${VERSION}"
 }
 
@@ -146,6 +208,8 @@ download_and_install() {
   version="$1"
   target="$2"
   asset="sagy-${version}-${target}.tar.gz"
+  validate_release_component "${version}" "release version"
+  validate_release_component "${asset}" "release asset name"
   url="https://github.com/${REPO}/releases/download/${version}/${asset}"
   mkdir -p "${TMP_ROOT}"
   tmp_dir="$(mktemp -d "${TMP_ROOT}/install.XXXXXX")"
@@ -154,19 +218,19 @@ download_and_install() {
   archive_path="${tmp_dir}/${asset}"
 
   echo "Downloading ${url}"
-  curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${url}" -o "${archive_path}"
+  download_file "${url}" "${archive_path}"
 
   local sums_url sums_path
   sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.txt"
   sums_path="${tmp_dir}/SHA256SUMS.txt"
   echo "Verifying SHA256 checksum..."
-  curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${sums_url}" -o "${sums_path}"
+  download_file "${sums_url}" "${sums_path}"
   verify_checksum "${sums_path}" "${archive_path}" "${asset}"
 
   mkdir -p "${INSTALL_BIN}"
   tar -xzf "${archive_path}" -C "${tmp_dir}"
   extracted_path="${tmp_dir}/sagy"
-  if [[ ! -f "${extracted_path}" ]]; then
+  if [[ -L "${extracted_path}" || ! -f "${extracted_path}" ]]; then
     echo "Release archive did not contain a top-level sagy binary." >&2
     exit 1
   fi
@@ -223,6 +287,7 @@ print_next_steps() {
   fi
 }
 
+validate_configuration
 show_requirements
 TARGET="$(detect_target)"
 VERSION="$(resolve_version)"

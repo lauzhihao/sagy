@@ -24,9 +24,10 @@ function Invoke-WebRequest {
     }
     if ($Uri -like "*SHA256SUMS.txt") {
         switch ($env:FAKE_SUMS_MODE) {
-            "checksum-timeout" { throw "fake checksum timeout" }
-            "http-error" { throw "fake HTTP 404" }
-            "empty" { Set-Content -Path $OutFile -Value "" -NoNewline }
+        "checksum-timeout" { throw "fake checksum timeout" }
+        "http-error" { throw "fake HTTP 404" }
+        "unsafe-target" { Set-Content -Path $OutFile -Value ("{0}  ../{1}" -f $hash, $asset) }
+        "empty" { Set-Content -Path $OutFile -Value "" -NoNewline }
             "missing" { Set-Content -Path $OutFile -Value ("{0}  other.zip" -f $hash) }
             "duplicate" { Set-Content -Path $OutFile -Value (("{0}  {1}`n{0}  {1}" -f $hash, $asset)) }
             "malformed" { Set-Content -Path $OutFile -Value ("not-a-hash  {0}" -f $asset) }
@@ -35,7 +36,11 @@ function Invoke-WebRequest {
             default { throw "unknown fake checksum mode" }
         }
     } else {
-        Copy-Item -Path $zip -Destination $OutFile -Force
+        if ($env:FAKE_SUMS_MODE -eq "empty-archive") {
+            Set-Content -Path $OutFile -Value "" -NoNewline
+        } else {
+            Copy-Item -Path $zip -Destination $OutFile -Force
+        }
     }
 }
 
@@ -53,7 +58,7 @@ function Invoke-RestMethod {
 
 try {
     Set-Variable -Name HOME -Scope Global -Value $root
-    foreach ($mode in @("metadata-timeout", "archive-timeout", "checksum-timeout", "http-error", "empty", "missing", "duplicate", "malformed", "mismatch")) {
+    foreach ($mode in @("metadata-timeout", "archive-timeout", "empty-archive", "checksum-timeout", "http-error", "empty", "missing", "duplicate", "malformed", "mismatch", "unsafe-target")) {
         $home = Join-Path $root $mode
         $env:SAGY_HOME = Join-Path $home ".sagy"
         $env:FAKE_SUMS_MODE = $mode

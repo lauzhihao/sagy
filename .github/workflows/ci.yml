@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      HOME: ${{ runner.temp }}/sagy-home
+      SAGY_HOME: ${{ runner.temp }}/sagy-state
+      GEMINI_HOME: ${{ runner.temp }}/gemini-home
+      ANTIGRAVITY_CONFIG_DIR: ${{ runner.temp }}/antigravity-config
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo fmt check
+        run: cargo fmt --all -- --check
+      - name: Cargo check
+        run: cargo check --all-targets --locked
+      - name: Cargo clippy check
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Cargo test
+        run: cargo test --all-targets --locked
+      - name: Cargo build
+        run: cargo build --release --locked
+
+  windows-runtime:
+    runs-on: windows-latest
+    env:
+      HOME: ${{ runner.temp }}\sagy-home
+      SAGY_HOME: ${{ runner.temp }}\sagy-state
+      GEMINI_HOME: ${{ runner.temp }}\gemini-home
+      ANTIGRAVITY_CONFIG_DIR: ${{ runner.temp }}\antigravity-config
+      CARGO_HOME: ${{ runner.temp }}\cargo-home
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo test on native Windows
+        run: cargo test --all-targets --locked
+      - name: Windows state save and replacement smoke test
+        run: cargo test --test windows_runtime --locked

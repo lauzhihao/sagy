@@ -6,6 +6,27 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Assert-SafeReleaseComponent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*\z' -or $Value -eq "." -or $Value -eq "..") {
+        throw "Unsafe ${Label}: ${Value}"
+    }
+}
+
+if ($Repo -notmatch '\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z') {
+    throw "Unsafe GitHub repository name: $Repo"
+}
+$repoParts = $Repo.Split('/')
+if ($repoParts[0] -in @('.', '..') -or $repoParts[1] -in @('.', '..')) {
+    throw "Unsafe GitHub repository name: $Repo"
+}
+if ($Version) {
+    Assert-SafeReleaseComponent -Value $Version -Label "release version"
+}
+
 $SagyHome = if ($env:SAGY_HOME) { $env:SAGY_HOME } else { Join-Path $HOME ".sagy" }
 $InstallBin = Join-Path $SagyHome "bin"
 $TmpRoot = Join-Path $SagyHome "tmp"
@@ -26,18 +47,38 @@ if (-not $Version) {
     $response = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing -TimeoutSec $DownloadTimeoutSec
     $Version = $response.tag_name
 }
+Assert-SafeReleaseComponent -Value $Version -Label "release version"
 
 $assetName = "sagy-$Version-x86_64-pc-windows-msvc.zip"
+Assert-SafeReleaseComponent -Value $assetName -Label "release asset name"
 $downloadUrl = "https://github.com/$Repo/releases/download/$Version/$assetName"
 $zipPath = Join-Path $TmpRoot $assetName
-
-Write-Host "Downloading $downloadUrl..."
-Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec $DownloadTimeoutSec
-
-# Verify SHA256 Checksum
 $sumsUrl = "https://github.com/$Repo/releases/download/$Version/SHA256SUMS.txt"
 $sumsPath = Join-Path $TmpRoot "SHA256SUMS.txt"
+
+Write-Host "Downloading $downloadUrl..."
+try {
+Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec $DownloadTimeoutSec
+if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+    throw "Downloaded archive is missing: $zipPath"
+}
+$archiveInfo = Get-Item -LiteralPath $zipPath -ErrorAction Stop
+if ($archiveInfo.Length -le 0) {
+    throw "Downloaded archive is empty: $zipPath"
+}
+
+# Verify SHA256 Checksum
 $null = Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing -TimeoutSec $DownloadTimeoutSec
+if (-not (Test-Path -LiteralPath $sumsPath -PathType Leaf)) {
+    throw "Checksum manifest is missing: $sumsPath"
+}
+$sumsInfo = Get-Item -LiteralPath $sumsPath -ErrorAction Stop
+if ($sumsInfo.Length -le 0) {
+    throw "Checksum manifest is empty: $sumsPath"
+}
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    throw "Checksum verification requires Get-FileHash."
+}
 $seenFiles = @{}
 $expectedHash = $null
 $sumLines = (Get-Content -Path $sumsPath -Raw) -split "`r?`n"
@@ -56,6 +97,9 @@ foreach ($line in $sumLines) {
     if ([string]::IsNullOrEmpty($file) -or $seenFiles.ContainsKey($file)) {
         throw "Duplicate or empty checksum target in $sumsPath"
     }
+    if ($file -notmatch '\A[A-Za-z0-9._-]+\z') {
+        throw "Unsafe checksum target in $sumsPath"
+    }
     $seenFiles[$file] = $true
     if ($file -ceq $assetName) {
         $expectedHash = $hash
@@ -64,7 +108,11 @@ foreach ($line in $sumLines) {
 if ($null -eq $expectedHash) {
     throw "Checksum entry for $assetName is missing"
 }
-$actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$hashResult = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256 -ErrorAction Stop
+if ($null -eq $hashResult -or $hashResult.Hash -notmatch '\A[0-9A-Fa-f]{64}\z') {
+    throw "Hash tool returned an invalid SHA-256 digest."
+}
+$actualHash = $hashResult.Hash.ToLowerInvariant()
 if ($actualHash -ne $expectedHash) {
     throw "SHA-256 checksum mismatch for $assetName! Expected: $expectedHash, got: $actualHash"
 }
@@ -74,7 +122,20 @@ Expand-Archive -Path $zipPath -DestinationPath $TmpRoot -Force
 $extractedExe = Join-Path $TmpRoot "sagy.exe"
 $targetExe = Join-Path $InstallBin "sagy.exe"
 
+if (-not (Test-Path -LiteralPath $extractedExe -PathType Leaf)) {
+    throw "Release archive did not contain a top-level sagy.exe binary."
+}
+$extractedInfo = Get-Item -LiteralPath $extractedExe -ErrorAction Stop
+if ($extractedInfo.PSIsContainer -or $extractedInfo.Length -le 0) {
+    throw "Release archive contained an empty or invalid sagy.exe binary."
+}
 Copy-Item $extractedExe $targetExe -Force
+}
+catch {
+    Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $sumsPath -Force -ErrorAction SilentlyContinue
+    throw
+}
 
 # 清理旧版本安装的模型别名二进制
 foreach ($legacy in @("flash", "pro", "think")) {

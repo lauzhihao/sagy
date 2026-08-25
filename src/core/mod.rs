@@ -1,5 +1,10 @@
+pub(crate) mod atomic_io;
+pub(crate) mod atomic_store;
+pub mod credential;
+pub mod health;
 pub mod policy;
 pub mod state;
+pub(crate) mod state_store;
 pub mod storage;
 pub mod ui;
 pub mod update;

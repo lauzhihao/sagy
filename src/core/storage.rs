@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,32 +71,65 @@ pub fn create_secure_dir_all(path: &Path) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = fs::metadata(&current) {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o700);
-                let _ = fs::set_permissions(&current, perms);
-            }
+            let metadata = fs::metadata(&current).with_context(|| {
+                format!("failed to inspect created directory {}", current.display())
+            })?;
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o700);
+            fs::set_permissions(&current, perms).with_context(|| {
+                format!(
+                    "failed to restrict directory permissions for {}",
+                    current.display()
+                )
+            })?;
         }
     }
     Ok(())
 }
 
 pub fn load_state(state_dir: &Path) -> Result<State> {
+    let state_dir_metadata = match fs::symlink_metadata(state_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect state directory {}", state_dir.display())
+            });
+        }
+    };
+    if state_dir_metadata.file_type().is_symlink() {
+        bail!("state directory cannot be a symlink");
+    }
+    if !state_dir_metadata.is_dir() {
+        bail!("state path is not a directory");
+    }
+
     let state_file = state_dir.join("state.json");
-    if !state_file.exists() {
-        return Ok(State::default());
+    let state_file_metadata = match fs::symlink_metadata(&state_file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(State::default());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect state file {}", state_file.display()));
+        }
+    };
+    if state_file_metadata.file_type().is_symlink() {
+        bail!("state file cannot be a symlink");
+    }
+    if !state_file_metadata.is_file() {
+        bail!("state path is not a regular file");
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(&state_file) {
-            let mode = metadata.permissions().mode();
-            if mode & 0o077 != 0 {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o600);
-                let _ = fs::set_permissions(&state_file, perms);
-            }
+        let mode = state_file_metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            let mut perms = state_file_metadata.permissions();
+            perms.set_mode(0o600);
+            let _ = fs::set_permissions(&state_file, perms);
         }
     }
 
@@ -104,6 +138,7 @@ pub fn load_state(state_dir: &Path) -> Result<State> {
     let mut state: State = serde_json::from_str(&contents)
         .with_context(|| format!("invalid state file: {}", state_file.display()))?;
     cleanup_invalid_legacy_accounts(&mut state);
+    validate_state_before_normalization(state_dir, &state)?;
     normalize_state_account_paths(state_dir, &mut state);
     Ok(state)
 }
@@ -151,11 +186,16 @@ pub fn write_secret_file(target: &Path, content: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(target) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = fs::set_permissions(target, perms);
-        }
+        let metadata = fs::metadata(target)
+            .with_context(|| format!("failed to inspect secret file {}", target.display()))?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(target, perms).with_context(|| {
+            format!(
+                "failed to restrict secret file permissions for {}",
+                target.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -168,8 +208,37 @@ pub fn save_state(state_dir: &Path, state: &State) -> Result<()> {
 
 pub fn load_repo_sync_config(state_dir: &Path) -> Result<RepoSyncConfig> {
     let config_path = state_dir.join(REPO_SYNC_CONFIG_FILENAME);
-    if !config_path.exists() {
-        return Ok(RepoSyncConfig::default());
+    let metadata = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepoSyncConfig::default());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", config_path.display()));
+        }
+    };
+    restrict_repo_sync_directory(state_dir)?;
+    if metadata.file_type().is_symlink() {
+        bail!("repository sync configuration cannot be a symlink");
+    }
+    if !metadata.is_file() {
+        bail!("repository sync configuration is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&config_path, perms).with_context(|| {
+                format!(
+                    "failed to restrict repository sync configuration {}",
+                    config_path.display()
+                )
+            })?;
+        }
     }
     let contents = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
@@ -179,10 +248,40 @@ pub fn load_repo_sync_config(state_dir: &Path) -> Result<RepoSyncConfig> {
 }
 
 pub fn save_repo_sync_config(state_dir: &Path, config: &RepoSyncConfig) -> Result<()> {
+    create_secure_dir_all(state_dir)?;
+    restrict_repo_sync_directory(state_dir)?;
     let target = state_dir.join(REPO_SYNC_CONFIG_FILENAME);
     let contents =
         serde_json::to_string_pretty(config).context("failed to serialize repo sync config")?;
-    write_file_atomically(&target, contents.as_bytes())
+    write_secret_file(&target, contents.as_bytes())
+}
+
+fn restrict_repo_sync_directory(state_dir: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(state_dir).with_context(|| {
+        format!(
+            "failed to inspect repository sync configuration directory {}",
+            state_dir.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        bail!("repository sync configuration directory cannot be a symlink");
+    }
+    if !metadata.is_dir() {
+        bail!("repository sync configuration path is not a directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(state_dir, perms).with_context(|| {
+            format!(
+                "failed to restrict repository sync configuration directory {}",
+                state_dir.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub fn ensure_exists(path: &Path, label: &str) -> Result<()> {
@@ -264,6 +363,40 @@ fn normalize_state_account_paths(state_dir: &Path, state: &mut State) {
             account.config_path = Some(expected_config_path.to_string_lossy().into_owned());
         }
     }
+}
+
+fn validate_state_before_normalization(state_dir: &Path, state: &State) -> Result<()> {
+    let mut account_ids = HashSet::with_capacity(state.accounts.len());
+    for account in &state.accounts {
+        crate::adapters::antigravity::paths::validate_account_id(&account.id)
+            .context("state contains an invalid account id")?;
+        if !account_ids.insert(account.id.as_str()) {
+            bail!("state contains duplicate account ids");
+        }
+    }
+
+    if let Some(current_account_id) = state.current_account_id.as_deref() {
+        crate::adapters::antigravity::paths::validate_account_id(current_account_id)
+            .context("state contains an invalid current account id")?;
+        if !account_ids.contains(current_account_id) {
+            bail!("state current account does not exist");
+        }
+    }
+
+    for account_id in state.usage_cache.keys() {
+        crate::adapters::antigravity::paths::validate_account_id(account_id)
+            .context("state contains an invalid usage cache account id")?;
+        if !account_ids.contains(account_id.as_str()) {
+            bail!("state usage cache refers to a missing account");
+        }
+    }
+
+    for account_id in &account_ids {
+        crate::adapters::antigravity::paths::account_dir_checked(state_dir, account_id)
+            .context("state account path is outside the state directory")?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

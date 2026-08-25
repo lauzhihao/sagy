@@ -1,42 +1,4 @@
 use crate::core::ui;
-use std::ffi::OsString;
-
-pub fn requested_help_topic(args: &[OsString]) -> Option<Option<String>> {
-    if args.len() <= 1 {
-        return None;
-    }
-
-    let first = args[1].to_string_lossy();
-    if first == "-h" || first == "--help" {
-        if args.len() > 2 {
-            return Some(Some(args[2].to_string_lossy().to_string()));
-        }
-        return Some(None);
-    }
-
-    if first == "help" {
-        if args.len() > 2 {
-            return Some(Some(args[2].to_string_lossy().to_string()));
-        }
-        return Some(None);
-    }
-
-    // Check if any subcommand followed by --help or -h
-    if args.iter().any(|a| {
-        let s = a.to_string_lossy();
-        s == "-h" || s == "--help"
-    }) {
-        for arg in args.iter().skip(1) {
-            let s = arg.to_string_lossy();
-            if is_known_subcmd(&s) {
-                return Some(Some(s.to_string()));
-            }
-        }
-        return Some(None);
-    }
-
-    None
-}
 
 pub fn is_known_subcmd(s: &str) -> bool {
     matches!(
@@ -55,6 +17,7 @@ pub fn is_known_subcmd(s: &str) -> bool {
             | "upgrade"
             | "import-auth"
             | "import-known"
+            | "help"
     )
 }
 
@@ -171,33 +134,6 @@ fn render_topic_help(topic: &str, is_zh: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-
-    #[test]
-    fn test_requested_help_topic() {
-        let args1 = vec![OsString::from("sagy"), OsString::from("-h")];
-        assert_eq!(requested_help_topic(&args1), Some(None));
-
-        let args2 = vec![
-            OsString::from("sagy"),
-            OsString::from("help"),
-            OsString::from("launch"),
-        ];
-        assert_eq!(
-            requested_help_topic(&args2),
-            Some(Some("launch".to_string()))
-        );
-
-        let args3 = vec![
-            OsString::from("sagy"),
-            OsString::from("push"),
-            OsString::from("--help"),
-        ];
-        assert_eq!(requested_help_topic(&args3), Some(Some("push".to_string())));
-
-        let args4 = vec![OsString::from("sagy"), OsString::from("list")];
-        assert_eq!(requested_help_topic(&args4), None);
-    }
 
     #[test]
     fn test_render_help_topics() {

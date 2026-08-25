@@ -6,13 +6,77 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  version-guard:
+    runs-on: ubuntu-latest
+    env:
+      HOME: ${{ runner.temp }}/sagy-home
+      SAGY_HOME: ${{ runner.temp }}/sagy-state
+      GEMINI_HOME: ${{ runner.temp }}/gemini-home
+      ANTIGRAVITY_CONFIG_DIR: ${{ runner.temp }}/antigravity-config
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify release tag matches Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          expected_tag="v${package_version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "Release tag ${GITHUB_REF_NAME} does not match Cargo package version ${package_version}." >&2
+            exit 1
+          fi
+
+  quality:
+    needs: version-guard
+    runs-on: ubuntu-latest
+    env:
+      HOME: ${{ runner.temp }}/sagy-home
+      SAGY_HOME: ${{ runner.temp }}/sagy-state
+      GEMINI_HOME: ${{ runner.temp }}/gemini-home
+      ANTIGRAVITY_CONFIG_DIR: ${{ runner.temp }}/antigravity-config
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo fmt check
+        run: cargo fmt --all -- --check
+      - name: Cargo check
+        run: cargo check --all-targets --locked
+      - name: Cargo clippy check
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Cargo test
+        run: cargo test --all-targets --locked
+      - name: Cargo build
+        run: cargo build --release --locked
+
+  windows-runtime:
+    needs: version-guard
+    runs-on: windows-latest
+    env:
+      HOME: ${{ runner.temp }}\sagy-home
+      SAGY_HOME: ${{ runner.temp }}\sagy-state
+      GEMINI_HOME: ${{ runner.temp }}\gemini-home
+      ANTIGRAVITY_CONFIG_DIR: ${{ runner.temp }}\antigravity-config
+      CARGO_HOME: ${{ runner.temp }}\cargo-home
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo test on native Windows
+        run: cargo test --all-targets --locked
+      - name: Windows state save and replacement smoke test
+        run: cargo test --test windows_runtime --locked
+
   build:
+    needs: [version-guard, quality, windows-runtime]
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +98,12 @@ jobs:
             archive_ext: zip
             bin_name: sagy.exe
     runs-on: ${{ matrix.os }}
+    env:
+      HOME: ${{ runner.temp }}/sagy-home
+      SAGY_HOME: ${{ runner.temp }}/sagy-state
+      GEMINI_HOME: ${{ runner.temp }}/gemini-home
+      ANTIGRAVITY_CONFIG_DIR: ${{ runner.temp }}/antigravity-config
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -42,14 +112,8 @@ jobs:
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Cargo fmt check
-        run: cargo fmt --check
-      - name: Cargo clippy check
-        run: cargo clippy -- -D warnings
-      - name: Cargo test
-        run: cargo test
       - name: Cargo build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package archive (unix)
         if: runner.os != 'Windows'
         run: |
@@ -73,12 +137,20 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     if: success()
+    permissions:
+      contents: write
+    env:
+      HOME: ${{ runner.temp }}/sagy-home
+      SAGY_HOME: ${{ runner.temp }}/sagy-state
+      GEMINI_HOME: ${{ runner.temp }}/gemini-home
+      ANTIGRAVITY_CONFIG_DIR: ${{ runner.temp }}/antigravity-config
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
       - name: Generate SHA256 checksums
         run: |
+          set -euo pipefail
           mkdir -p release_assets
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release_assets/ \;
           cd release_assets

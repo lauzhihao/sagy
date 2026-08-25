@@ -1,15 +1,13 @@
-use std::fs;
-use std::io::{self, Write};
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use serde_json::Value;
 
-use crate::adapters::antigravity::account::is_valid_oauth_credential;
-use crate::adapters::antigravity::paths::{default_antigravity_cli_home, default_gemini_home};
-use crate::core::state::{AccountRecord, AccountType, State};
+use crate::adapters::antigravity::account::MutationResult;
+use crate::core::state::AccountRecord;
+use crate::core::state_store::StateSession;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum LoginMode<'a> {
     OAuth {
         email_hint: Option<&'a str>,
@@ -25,96 +23,76 @@ pub enum LoginMode<'a> {
     },
 }
 
-impl super::AntigravityAdapter {
-    pub fn switch_account(&self, account: &AccountRecord) -> Result<()> {
-        let auth_path = Path::new(&account.auth_path);
-        if !auth_path.exists() {
-            bail!("Account credentials not found at {}", auth_path.display());
-        }
-
-        match account.account_type {
-            AccountType::OAuth => {
-                // 1. If it has a raw oauth token, copy to ~/.gemini/antigravity-cli/antigravity-oauth-token
-                if let Some(cli_home) = default_antigravity_cli_home() {
-                    let target_token = cli_home.join("antigravity-oauth-token");
-                    if let Some(token) = &account.oauth_token {
-                        crate::core::storage::write_secret_file(&target_token, token.as_bytes())?;
-                    } else if auth_path.file_name().and_then(|s| s.to_str())
-                        == Some("antigravity-oauth-token")
-                    {
-                        let token = fs::read_to_string(auth_path)?;
-                        crate::core::storage::write_secret_file(&target_token, token.as_bytes())?;
-                    }
-                }
-
-                // 2. If it's a full Google OAuth JSON credential, validate and copy to ~/.gemini/oauth_creds.json
-                if let Some(gemini_home) = default_gemini_home() {
-                    if auth_path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        let content = fs::read_to_string(auth_path)?;
-                        if let Ok(json_val) = serde_json::from_str::<Value>(&content) {
-                            if is_valid_oauth_credential(&json_val) {
-                                let target_creds = gemini_home.join("oauth_creds.json");
-                                // Backup original file if exists and not yet backed up
-                                if target_creds.exists() {
-                                    let backup_path = gemini_home.join("oauth_creds.json.bak");
-                                    if !backup_path.exists() {
-                                        let _ = fs::copy(&target_creds, &backup_path);
-                                    }
-                                }
-                                crate::core::storage::write_secret_file(
-                                    &target_creds,
-                                    content.as_bytes(),
-                                )?;
-                            }
-                        }
-                    }
-                }
+// Authentication material must never be exposed by a diagnostic formatter.
+impl fmt::Debug for LoginMode<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("LoginMode");
+        match self {
+            Self::OAuth { email_hint } => {
+                debug
+                    .field("mode", &"oauth")
+                    .field("email_hint", email_hint);
             }
-            AccountType::ApiKey => {
-                // API key accounts are injected via environment variable (GEMINI_API_KEY) at launch time.
-                // Do NOT touch or overwrite ~/.gemini/oauth_creds.json or antigravity-oauth-token!
+            Self::Token { email, .. } => {
+                debug.field("mode", &"token").field("token", &"<redacted>");
+                debug.field("email", email);
             }
-            AccountType::Vertex => {
-                // Vertex service accounts are injected via GOOGLE_APPLICATION_CREDENTIALS / project_id.
+            Self::ApiKey {
+                email, project_id, ..
+            } => {
+                debug
+                    .field("mode", &"api_key")
+                    .field("api_key", &"<redacted>")
+                    .field("email", email)
+                    .field("project_id", project_id);
             }
         }
-
-        Ok(())
+        debug.finish()
     }
+}
 
-    pub fn run_login_mode(
+fn validate_secret_input(input: &str) -> Result<&str> {
+    let token = input.trim();
+    if token.is_empty() {
+        bail!("Token cannot be empty");
+    }
+    Ok(token)
+}
+
+impl super::AntigravityAdapter {
+    /// Execute one login/import against the CLI's exact v2 session.
+    ///
+    /// The compatibility API below remains temporarily available to older
+    /// callers, but new command paths must keep the same `StateSession` so a
+    /// post-commit recovery warning cannot make them continue from stale
+    /// state.
+    pub(crate) fn run_login_mode_session(
         &self,
         state_dir: &Path,
-        state: &mut State,
+        session: &mut StateSession,
         mode: LoginMode<'_>,
-    ) -> Result<AccountRecord> {
+    ) -> Result<MutationResult<AccountRecord>> {
         match mode {
             LoginMode::OAuth { email_hint } => {
                 let email = email_hint.unwrap_or("antigravity-user@google.com");
                 println!("Paste your Antigravity OAuth Token (or Google Token):");
-                print!("> ");
-                io::stdout().flush()?;
-                let mut token_input = String::new();
-                io::stdin().read_line(&mut token_input)?;
-                let token = token_input.trim();
-                if token.is_empty() {
-                    bail!("Token cannot be empty");
-                }
-                self.import_or_update_token(
+                let token_input = rpassword::prompt_password("> ")?;
+                let token = validate_secret_input(&token_input)?;
+                self.import_or_update_token_session(
                     state_dir,
-                    state,
+                    session,
                     email,
                     token,
                     Some("Antigravity OAuth"),
                 )
             }
             LoginMode::Token { token, email } => {
-                let email_str = email.unwrap_or("token-user@gemini");
-                self.import_or_update_token(
+                let email = email.unwrap_or("token-user@gemini");
+                self.import_or_update_token_session(
                     state_dir,
-                    state,
-                    email_str,
-                    token,
+                    session,
+                    email,
+                    validate_secret_input(token)?,
                     Some("Antigravity Token"),
                 )
             }
@@ -122,59 +100,52 @@ impl super::AntigravityAdapter {
                 api_key,
                 email,
                 project_id,
-            } => {
-                let email_str = email.unwrap_or("api-key-user@gemini");
-                let acc_id = uuid::Uuid::new_v4().to_string();
-                let acc_dir = super::paths::account_dir(state_dir, &acc_id);
-                crate::core::storage::create_secure_dir_all(&acc_dir)?;
-                let cred_file = super::paths::account_credentials_file(&acc_dir);
-
-                let creds_json = serde_json::json!({
-                    "api_key": api_key,
-                    "email": email_str,
-                    "project_id": project_id,
-                });
-                crate::core::storage::write_secret_file(
-                    &cred_file,
-                    serde_json::to_string_pretty(&creds_json)?.as_bytes(),
-                )?;
-
-                let now = chrono::Utc::now().timestamp();
-                let record = AccountRecord {
-                    id: acc_id.clone(),
-                    email: email_str.to_string(),
-                    account_type: AccountType::ApiKey,
-                    provider_id: Some("google-ai-studio".to_string()),
-                    project_id: project_id.map(ToString::to_string),
-                    account_id: None,
-                    identity_fingerprint: None,
-                    plan: Some("Gemini API Key".to_string()),
-                    auth_path: cred_file.to_string_lossy().into_owned(),
-                    config_path: None,
-                    oauth_token: None,
-                    refresh_token: None,
-                    api_key: Some(api_key.to_string()),
-                    added_at: now,
-                    updated_at: now,
-                    last_used_at: None,
-                };
-
-                state.accounts.push(record.clone());
-                state.usage_cache.insert(
-                    acc_id,
-                    crate::core::state::UsageSnapshot {
-                        plan: record.plan.clone(),
-                        status: "Ready".to_string(),
-                        cooldown_until: None,
-                        remaining_quota_percent: Some(100),
-                        last_synced_at: Some(now),
-                        last_sync_error: None,
-                        needs_relogin: false,
-                    },
-                );
-
-                Ok(record)
-            }
+            } => self.import_or_update_api_key_session(
+                state_dir,
+                session,
+                validate_secret_input(api_key)?,
+                email.unwrap_or("api-key-user@gemini"),
+                project_id,
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LoginMode, validate_secret_input};
+
+    #[test]
+    fn secret_input_rejects_empty_and_whitespace() {
+        assert!(validate_secret_input("").is_err());
+        assert!(validate_secret_input(" \t\n").is_err());
+        assert_eq!(
+            validate_secret_input("  token-value  ").unwrap(),
+            "token-value"
+        );
+    }
+
+    #[test]
+    fn login_mode_debug_redacts_authentication_material() {
+        let token_debug = format!(
+            "{:?}",
+            LoginMode::Token {
+                token: "do-not-print",
+                email: Some("user@example.com"),
+            }
+        );
+        assert!(!token_debug.contains("do-not-print"));
+        assert!(token_debug.contains("<redacted>"));
+
+        let api_key_debug = format!(
+            "{:?}",
+            LoginMode::ApiKey {
+                api_key: "also-do-not-print",
+                email: None,
+                project_id: None,
+            }
+        );
+        assert!(!api_key_debug.contains("also-do-not-print"));
+        assert!(api_key_debug.contains("<redacted>"));
     }
 }

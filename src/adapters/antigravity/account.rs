@@ -1,124 +1,432 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::adapters::antigravity::paths::{
-    account_credentials_file, account_dir_checked, account_token_file,
-    default_antigravity_cli_home, default_gemini_home, validate_path_under_root,
+pub mod credential_store;
+use credential_store::CredentialStore;
+
+use crate::adapters::antigravity::active_home::{
+    ActiveHomeError, ActiveHomeStore, PreparedActiveHomeTxn, PublishedActiveHomeTxn,
+    restore_reconcile,
 };
-use crate::core::state::{AccountRecord, AccountType, State, UsageSnapshot};
-use crate::core::storage;
+use crate::adapters::antigravity::paths::{
+    account_token_file, active_home_roots, active_home_scope_id, default_antigravity_cli_home,
+    default_gemini_home,
+};
+use crate::core::atomic_io::read_external_regular_file_bounded;
+use crate::core::credential::{CredentialKind, PortableCredential};
+use crate::core::health::HealthStatus;
+use crate::core::state::{
+    AccountRecord, AccountType, ActiveProfile, CredentialRef, CredentialRefKind, ManagedLayout,
+    SlotState, State, UsageSnapshot,
+};
+use crate::core::state_store::{
+    MigrationStatus, StateRead, StateSession, StateStore, StateStoreError,
+};
+
+/// 账户 mutation 的结果。State commit 即使在后续 evidence cleanup/finalize
+/// 失败时也已经持久化；此时必须携带 committed snapshot，避免调用方继续使用旧状态。
+#[derive(Debug)]
+pub(crate) enum MutationResult<T> {
+    Committed {
+        value: T,
+        state: StateRead,
+    },
+    CommittedRecoveryPending {
+        value: T,
+        state: StateRead,
+        message: String,
+    },
+}
+
+impl<T> MutationResult<T> {
+    pub(crate) fn into_value(self) -> T {
+        match self {
+            Self::Committed { value, .. } | Self::CommittedRecoveryPending { value, .. } => value,
+        }
+    }
+
+    pub(crate) fn state(&self) -> &StateRead {
+        match self {
+            Self::Committed { state, .. } | Self::CommittedRecoveryPending { state, .. } => state,
+        }
+    }
+
+    pub(crate) fn recovery_pending(&self) -> bool {
+        matches!(self, Self::CommittedRecoveryPending { .. })
+    }
+
+    pub(crate) fn recovery_message(&self) -> Option<&str> {
+        match self {
+            Self::Committed { .. } => None,
+            Self::CommittedRecoveryPending { message, .. } => Some(message),
+        }
+    }
+}
+
+/// active-home adoption 必须显式选择。首次 profile 遇到 unmanaged fixed slot
+/// 时，普通账户切换保持 fail-closed。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActiveHomeAdoption {
+    Strict,
+    #[allow(dead_code)]
+    Adopt,
+    #[allow(dead_code)]
+    Takeover,
+}
 
 pub fn is_valid_oauth_credential(json: &Value) -> bool {
-    if !json.is_object() {
-        return false;
-    }
-    json.get("access_token").is_some()
-        || json.get("refresh_token").is_some()
-        || json.get("token").is_some()
-        || json.get("client_secret").is_some()
-        || json.get("type").and_then(Value::as_str) == Some("authorized_user")
-        || json.get("type").and_then(Value::as_str) == Some("service_account")
+    PortableCredential::from_native_json_str(&json.to_string())
+        .map(|credential| matches!(credential.kind(), CredentialKind::OAuthAuthorizedUser))
+        .unwrap_or(false)
 }
 
 pub fn is_valid_api_key_credential(json: &Value) -> bool {
-    if !json.is_object() {
-        return false;
-    }
-    json.get("api_key")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .is_some()
+    PortableCredential::from_native_json_str(&json.to_string())
+        .map(|credential| credential.kind() == CredentialKind::ApiKey)
+        .unwrap_or(false)
 }
 
 impl super::AntigravityAdapter {
-    pub fn import_known_sources(&self, state_dir: &Path, state: &mut State) -> Vec<AccountRecord> {
-        let mut imported = Vec::new();
+    /// 使用精确 State snapshot 导入一个显式 credential source。调用方不提供
+    /// mutable state，避免 stale runtime copy 充当 migration 或 credential authority。
+    pub(crate) fn import_auth_path_transaction(
+        &self,
+        state_dir: &Path,
+        raw_path: &Path,
+    ) -> Result<MutationResult<AccountRecord>> {
+        self.import_auth_path_transaction_with_email(state_dir, raw_path, None)
+    }
 
-        // 1. Resolve local active email if available
-        let mut active_email: Option<String> = None;
-        if let Some(gemini_home) = default_gemini_home() {
-            let ga_path = gemini_home.join("google_accounts.json");
-            if ga_path.is_file() {
-                if let Ok(content) = fs::read_to_string(&ga_path) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                        if let Some(act) = json.get("active").and_then(Value::as_str) {
-                            let trimmed = act.trim();
-                            if !trimmed.is_empty() {
-                                active_email = Some(trimmed.to_string());
-                            }
+    fn import_auth_path_transaction_with_email(
+        &self,
+        state_dir: &Path,
+        raw_path: &Path,
+        email_override: Option<&str>,
+    ) -> Result<MutationResult<AccountRecord>> {
+        let source = read_import_source(raw_path)?;
+        let (credential, source_material) = parse_import_source(&source)?;
+        let email = credential_email(&credential)
+            .or_else(|| {
+                email_override
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| {
+                raw_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| {
+                        if stem == "oauth_creds" {
+                            "google-oauth-user@gemini".to_string()
+                        } else {
+                            format!("{stem}@gemini")
                         }
-                    }
-                }
-            }
+                    })
+                    .unwrap_or_else(|| "imported-account@gemini".to_string())
+            });
+        if email.trim().is_empty() {
+            bail!("credential email cannot be empty")
         }
+        run_credential_import(
+            state_dir,
+            credential,
+            source_material,
+            &email,
+            None,
+            ImportMatch::IdentityOrEmail,
+            true,
+        )
+    }
 
-        // 2. Read ~/.gemini/antigravity-cli/antigravity-oauth-token
-        let mut local_token: Option<String> = None;
-        if let Some(cli_home) = default_antigravity_cli_home() {
-            let token_path = cli_home.join("antigravity-oauth-token");
-            if token_path.is_file() {
-                if let Ok(token_str) = fs::read_to_string(&token_path) {
-                    let trimmed = token_str.trim().to_string();
-                    if !trimmed.is_empty() {
-                        local_token = Some(trimmed);
-                    }
-                }
-            }
+    pub(crate) fn import_or_update_token_transaction(
+        &self,
+        state_dir: &Path,
+        email: &str,
+        token: &str,
+        plan_label: Option<&str>,
+    ) -> Result<MutationResult<AccountRecord>> {
+        let token = token.trim();
+        let credential =
+            PortableCredential::oauth_access_token(token).map_err(anyhow::Error::new)?;
+        run_credential_import(
+            state_dir,
+            credential,
+            token.as_bytes().to_vec(),
+            email,
+            plan_label,
+            ImportMatch::IdentityOrEmail,
+            true,
+        )
+    }
+
+    pub(crate) fn import_or_update_api_key_transaction(
+        &self,
+        state_dir: &Path,
+        api_key: &str,
+        email: &str,
+        project_id: Option<&str>,
+    ) -> Result<MutationResult<AccountRecord>> {
+        let api_key = api_key.trim();
+        let email = email.trim();
+        if api_key.is_empty() {
+            bail!("API key cannot be empty")
         }
-
-        // 3. Read ~/.gemini/oauth_creds.json
-        let mut oauth_cred_record: Option<AccountRecord> = None;
-        if let Some(gemini_home) = default_gemini_home() {
-            let oauth_path = gemini_home.join("oauth_creds.json");
-            if oauth_path.is_file() {
-                if let Ok(record) = self.import_auth_path(state_dir, state, &oauth_path) {
-                    oauth_cred_record = Some(record);
-                }
-            }
+        if email.is_empty() {
+            bail!("credential email cannot be empty")
         }
-
-        // 4. Merge into a single coherent account record
-        let resolved_email = active_email
-            .or_else(|| oauth_cred_record.as_ref().map(|r| r.email.clone()))
-            .unwrap_or_else(|| "antigravity-user@gemini".to_string());
-
-        if let Some(token) = local_token {
-            let record = self.import_or_update_token(
-                state_dir,
-                state,
-                &resolved_email,
-                &token,
-                Some("Antigravity OAuth"),
+        let mut document = serde_json::Map::new();
+        document.insert("api_key".to_string(), Value::String(api_key.to_string()));
+        document.insert("email".to_string(), Value::String(email.to_string()));
+        if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            document.insert(
+                "project_id".to_string(),
+                Value::String(project_id.to_string()),
             );
-            if let Ok(mut rec) = record {
-                // If oauth_creds.json had refresh_token, attach it
-                if let Some(oauth_rec) = &oauth_cred_record {
-                    if rec.refresh_token.is_none() && oauth_rec.refresh_token.is_some() {
-                        rec.refresh_token = oauth_rec.refresh_token.clone();
-                        if let Some(pos) = state.accounts.iter().position(|a| a.id == rec.id) {
-                            state.accounts[pos].refresh_token = rec.refresh_token.clone();
-                        }
+        }
+        let credential = PortableCredential::api_key_document(Value::Object(document))
+            .map_err(anyhow::Error::new)?;
+        let material = credential_material(&credential)?;
+        run_credential_import(
+            state_dir,
+            credential,
+            material,
+            email,
+            None,
+            ImportMatch::IdentityOnly,
+            false,
+        )
+    }
+
+    /// CLI 使用的 session 变体。整个操作只由同一 session 持有 revision，
+    /// 并由 StateSession 的 lock callback 推进 snapshot。
+    pub(crate) fn import_auth_path_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+        raw_path: &Path,
+    ) -> Result<MutationResult<AccountRecord>> {
+        let source = read_import_source(raw_path)?;
+        let (credential, source_material) = parse_import_source(&source)?;
+        let email = credential_email(&credential).unwrap_or_else(|| {
+            raw_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| {
+                    if stem == "oauth_creds" {
+                        "google-oauth-user@gemini".to_string()
+                    } else {
+                        format!("{stem}@gemini")
                     }
-                }
-                imported.push(rec);
+                })
+                .unwrap_or_else(|| "imported-account@gemini".to_string())
+        });
+        run_credential_import_session(
+            state_dir,
+            session,
+            credential,
+            source_material,
+            &email,
+            None,
+            ImportMatch::IdentityOrEmail,
+            true,
+        )
+    }
+
+    pub(crate) fn import_or_update_token_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+        email: &str,
+        token: &str,
+        plan_label: Option<&str>,
+    ) -> Result<MutationResult<AccountRecord>> {
+        let token = token.trim();
+        let credential =
+            PortableCredential::oauth_access_token(token).map_err(anyhow::Error::new)?;
+        run_credential_import_session(
+            state_dir,
+            session,
+            credential,
+            token.as_bytes().to_vec(),
+            email,
+            plan_label,
+            ImportMatch::IdentityOrEmail,
+            true,
+        )
+    }
+
+    pub(crate) fn import_or_update_api_key_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+        api_key: &str,
+        email: &str,
+        project_id: Option<&str>,
+    ) -> Result<MutationResult<AccountRecord>> {
+        let api_key = api_key.trim();
+        let email = email.trim();
+        if api_key.is_empty() {
+            bail!("API key cannot be empty")
+        }
+        if email.is_empty() {
+            bail!("credential email cannot be empty")
+        }
+        let mut document = serde_json::Map::new();
+        document.insert("api_key".to_string(), Value::String(api_key.to_string()));
+        document.insert("email".to_string(), Value::String(email.to_string()));
+        if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            document.insert(
+                "project_id".to_string(),
+                Value::String(project_id.to_string()),
+            );
+        }
+        let credential = PortableCredential::api_key_document(Value::Object(document))
+            .map_err(anyhow::Error::new)?;
+        let material = credential_material(&credential)?;
+        run_credential_import_session(
+            state_dir,
+            session,
+            credential,
+            material,
+            email,
+            None,
+            ImportMatch::IdentityOnly,
+            false,
+        )
+    }
+
+    /// Migrate a legacy v1 state using only the fixed account credential
+    /// slots.  No caller `State`, arbitrary `auth_path`, or ambient home scan
+    /// participates in this transaction.
+    /// Run the sealed v1 -> v2 migration on the caller-owned session. The
+    /// planner reads only fixed account slots and never manufactures a new
+    /// credential from ambient user-home files.
+    pub(crate) fn migrate_legacy_state_transaction(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+    ) -> Result<MutationResult<()>> {
+        run_legacy_migration_session(state_dir, session)
+    }
+
+    pub(crate) fn migrate_legacy_state_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+    ) -> Result<MutationResult<()>> {
+        self.migrate_legacy_state_transaction(state_dir, session)
+    }
+
+    /// Recover credential and active-home journals using the caller's one
+    /// StateSession. This is the startup entry point for current v2 state;
+    /// neither helper opens a second snapshot owner.
+    pub(crate) fn recover_account_transactions_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+    ) -> Result<()> {
+        if !matches!(session.migration(), MigrationStatus::None) {
+            bail!("account transaction recovery requires current v2 state")
+        }
+        recover_active_home_journals(state_dir, session, None)?;
+        recover_credential_journals_session(state_dir, session)
+    }
+
+    /// Explicit missing-store bootstrap used by CLI startup.  It is separate
+    /// from import-known so a normal launch/list/use/rm path cannot scan user
+    /// home files as a side effect of opening state.
+    pub(crate) fn bootstrap_empty_v2_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+    ) -> Result<MutationResult<()>> {
+        if !matches!(session.migration(), MigrationStatus::Missing) {
+            bail!("empty v2 bootstrap requires a missing state")
+        }
+        recover_active_home_journals(state_dir, session, None)?;
+        recover_credential_journals_session(state_dir, session)?;
+        let committed = session.bootstrap_empty_v2().map_err(anyhow::Error::new)?;
+        Ok(MutationResult::Committed {
+            value: (),
+            state: committed.after().clone(),
+        })
+    }
+
+    /// Explicit, single-CAS discovery of the two fixed OAuth sources.  The
+    /// local token and authorized-user document are merged before staging so
+    /// import-known cannot leave a half-imported pair behind.
+    pub(crate) fn import_known_sources_transaction(
+        &self,
+        state_dir: &Path,
+    ) -> Result<MutationResult<Vec<AccountRecord>>> {
+        let store = StateStore::open(state_dir).map_err(anyhow::Error::new)?;
+        let mut session = StateSession::bootstrap_exact(&store).map_err(anyhow::Error::new)?;
+        self.import_known_sources_session(state_dir, &mut session)
+    }
+
+    pub(crate) fn import_known_sources_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+    ) -> Result<MutationResult<Vec<AccountRecord>>> {
+        let Some((credential, material, email)) = scan_known_oauth_source()? else {
+            if matches!(session.migration(), MigrationStatus::Missing) {
+                recover_active_home_journals(state_dir, session, None)?;
+                recover_credential_journals_session(state_dir, session)?;
+                let committed = session.bootstrap_empty_v2().map_err(anyhow::Error::new)?;
+                return Ok(MutationResult::Committed {
+                    value: Vec::new(),
+                    state: committed.after().clone(),
+                });
             }
-        } else if let Some(oauth_rec) = oauth_cred_record {
-            imported.push(oauth_rec);
+            return Ok(MutationResult::Committed {
+                value: Vec::new(),
+                state: session.read().clone(),
+            });
+        };
+        let imported = run_credential_import_session(
+            state_dir,
+            session,
+            credential,
+            material,
+            &email,
+            Some("Antigravity OAuth"),
+            ImportMatch::IdentityOrEmail,
+            true,
+        )?;
+        let pending = imported.recovery_pending();
+        let state = imported.state().clone();
+        let value = vec![imported.into_value()];
+        if pending {
+            // The original mutation already carries the exact recovery error;
+            // retain it through a bounded user-facing message.
+            Ok(MutationResult::CommittedRecoveryPending {
+                value,
+                state,
+                message: "import-known credential evidence cleanup is pending".to_string(),
+            })
+        } else {
+            Ok(MutationResult::Committed { value, state })
         }
+    }
 
-        // 5. Clean up old duplicate placeholder accounts if unified email exists
-        if resolved_email != "default-antigravity-user@gemini" {
-            state
-                .accounts
-                .retain(|a| a.email != "default-antigravity-user@gemini");
+    pub fn import_known_sources(&self, state_dir: &Path, state: &mut State) -> Vec<AccountRecord> {
+        match self.import_known_sources_transaction(state_dir) {
+            Ok(outcome) => {
+                apply_compat_state(state, &outcome);
+                outcome.into_value()
+            }
+            Err(error) => {
+                eprintln!("warning: known credential import failed: {error}");
+                Vec::new()
+            }
         }
-
-        imported
     }
 
     pub fn import_auth_path(
@@ -127,165 +435,12 @@ impl super::AntigravityAdapter {
         state: &mut State,
         raw_path: &Path,
     ) -> Result<AccountRecord> {
-        storage::ensure_exists(raw_path, "Auth credential file")?;
-        let content = fs::read_to_string(raw_path)
-            .with_context(|| format!("failed to read auth file {}", raw_path.display()))?;
-
-        let json_val: Value = serde_json::from_str(&content)
-            .with_context(|| format!("invalid JSON in {}", raw_path.display()))?;
-
-        // Validate that this JSON actually contains recognizable credentials
-        let is_api = is_valid_api_key_credential(&json_val);
-        let is_service_account =
-            json_val.get("type").and_then(Value::as_str) == Some("service_account");
-        let is_oauth = is_valid_oauth_credential(&json_val);
-
-        if !is_api && !is_service_account && !is_oauth {
-            bail!(
-                "File {} does not contain valid Antigravity or Gemini credentials (must contain token, oauth keys, or api_key)",
-                raw_path.display()
-            );
+        let outcome = self.import_auth_path_transaction(state_dir, raw_path)?;
+        apply_compat_state(state, &outcome);
+        if let Some(message) = outcome.recovery_message() {
+            bail!("account import committed; recovery pending: {message}")
         }
-
-        // Try reading active email from google_accounts.json if not present in the cred file
-        let mut email_opt = json_val
-            .get("email")
-            .or_else(|| json_val.get("client_email"))
-            .or_else(|| json_val.get("account"))
-            .or_else(|| json_val.get("user"))
-            .and_then(Value::as_str)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if email_opt.is_none() {
-            if let Some(gemini_home) = default_gemini_home() {
-                let google_accounts_path = gemini_home.join("google_accounts.json");
-                if google_accounts_path.is_file() {
-                    if let Ok(ga_content) = fs::read_to_string(&google_accounts_path) {
-                        if let Ok(ga_json) = serde_json::from_str::<Value>(&ga_content) {
-                            if let Some(active_email) =
-                                ga_json.get("active").and_then(Value::as_str)
-                            {
-                                let trimmed = active_email.trim();
-                                if !trimmed.is_empty() {
-                                    email_opt = Some(trimmed.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let email = email_opt.unwrap_or_else(|| {
-            if let Some(stem) = raw_path.file_stem().and_then(|s| s.to_str()) {
-                if stem == "oauth_creds" {
-                    "google-oauth-user@gemini".to_string()
-                } else {
-                    format!("{stem}@gemini")
-                }
-            } else {
-                "imported-account@gemini".to_string()
-            }
-        });
-
-        let secret_payload = json_val
-            .get("token")
-            .or_else(|| json_val.get("access_token"))
-            .or_else(|| json_val.get("api_key"))
-            .or_else(|| json_val.get("refresh_token"))
-            .and_then(Value::as_str)
-            .unwrap_or(&content);
-        let fingerprint = compute_credential_fingerprint(secret_payload);
-
-        let account_id = state
-            .accounts
-            .iter()
-            .find(|a| {
-                a.identity_fingerprint.as_deref() == Some(&fingerprint)
-                    || a.email.eq_ignore_ascii_case(&email)
-            })
-            .map(|a| a.id.clone())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        let acc_dir = account_dir_checked(state_dir, &account_id)?;
-        storage::create_secure_dir_all(&acc_dir)?;
-        let acc_dir = account_dir_checked(state_dir, &account_id)?;
-        let target_cred = account_credentials_file(&acc_dir);
-        validate_path_under_root(&acc_dir, &target_cred)?;
-        storage::write_secret_file(&target_cred, content.as_bytes())
-            .with_context(|| format!("failed to write {}", target_cred.display()))?;
-
-        let now = Utc::now().timestamp();
-        let record = AccountRecord {
-            id: account_id.clone(),
-            email: email.clone(),
-            account_type: if is_api {
-                AccountType::ApiKey
-            } else if is_service_account {
-                AccountType::Vertex
-            } else {
-                AccountType::OAuth
-            },
-            provider_id: Some("google".to_string()),
-            project_id: json_val
-                .get("project_id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            account_id: json_val
-                .get("account_id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            identity_fingerprint: Some(fingerprint),
-            plan: if is_api {
-                Some("Gemini API Key".to_string())
-            } else if is_service_account {
-                Some("Vertex AI".to_string())
-            } else {
-                Some("Antigravity OAuth".to_string())
-            },
-            auth_path: target_cred.to_string_lossy().into_owned(),
-            config_path: None,
-            oauth_token: json_val
-                .get("token")
-                .or_else(|| json_val.get("access_token"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            refresh_token: json_val
-                .get("refresh_token")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            api_key: json_val
-                .get("api_key")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            added_at: now,
-            updated_at: now,
-            last_used_at: None,
-        };
-
-        if let Some(existing_idx) = state.accounts.iter().position(|a| a.id == record.id) {
-            state.accounts[existing_idx] = record.clone();
-        } else {
-            state.accounts.push(record.clone());
-        }
-
-        if !state.usage_cache.contains_key(&record.id) {
-            state.usage_cache.insert(
-                record.id.clone(),
-                UsageSnapshot {
-                    plan: record.plan.clone(),
-                    status: "Ready".to_string(),
-                    cooldown_until: None,
-                    remaining_quota_percent: Some(100),
-                    last_synced_at: Some(now),
-                    last_sync_error: None,
-                    needs_relogin: false,
-                },
-            );
-        }
-
-        Ok(record)
+        Ok(outcome.into_value())
     }
 
     pub fn import_or_update_token(
@@ -296,69 +451,34 @@ impl super::AntigravityAdapter {
         token: &str,
         plan_label: Option<&str>,
     ) -> Result<AccountRecord> {
-        let fingerprint = compute_credential_fingerprint(token);
-        let account_id = state
-            .accounts
-            .iter()
-            .find(|a| {
-                a.identity_fingerprint.as_deref() == Some(&fingerprint)
-                    || a.email.eq_ignore_ascii_case(email)
-            })
-            .map(|a| a.id.clone())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        let acc_dir = account_dir_checked(state_dir, &account_id)?;
-        storage::create_secure_dir_all(&acc_dir)?;
-        let acc_dir = account_dir_checked(state_dir, &account_id)?;
-        let token_path = account_token_file(&acc_dir);
-        validate_path_under_root(&acc_dir, &token_path)?;
-        storage::write_secret_file(&token_path, token.as_bytes())
-            .with_context(|| format!("failed to write {}", token_path.display()))?;
-
-        let now = Utc::now().timestamp();
-        let record = AccountRecord {
-            id: account_id.clone(),
-            email: email.to_string(),
-            account_type: AccountType::OAuth,
-            provider_id: Some("antigravity-oauth".to_string()),
-            project_id: None,
-            account_id: None,
-            identity_fingerprint: Some(fingerprint),
-            plan: plan_label
-                .map(ToString::to_string)
-                .or_else(|| Some("Antigravity OAuth".to_string())),
-            auth_path: token_path.to_string_lossy().into_owned(),
-            config_path: None,
-            oauth_token: Some(token.to_string()),
-            refresh_token: None,
-            api_key: None,
-            added_at: now,
-            updated_at: now,
-            last_used_at: None,
-        };
-
-        if let Some(existing_idx) = state.accounts.iter().position(|a| a.id == record.id) {
-            state.accounts[existing_idx] = record.clone();
-        } else {
-            state.accounts.push(record.clone());
+        let outcome =
+            self.import_or_update_token_transaction(state_dir, email, token, plan_label)?;
+        apply_compat_state(state, &outcome);
+        if let Some(message) = outcome.recovery_message() {
+            bail!("account import committed; recovery pending: {message}")
         }
+        Ok(outcome.into_value())
+    }
 
-        if !state.usage_cache.contains_key(&record.id) {
-            state.usage_cache.insert(
-                record.id.clone(),
-                UsageSnapshot {
-                    plan: record.plan.clone(),
-                    status: "Ready".to_string(),
-                    cooldown_until: None,
-                    remaining_quota_percent: Some(100),
-                    last_synced_at: Some(now),
-                    last_sync_error: None,
-                    needs_relogin: false,
-                },
-            );
+    /// Import or update an API-key credential through the same strict
+    /// PortableCredential/credential-store path used by file imports.  The
+    /// lower layer rejects blank keys and reuses an id for an exact material
+    /// duplicate, even when the caller supplies a different email hint.
+    pub fn import_or_update_api_key(
+        &self,
+        state_dir: &Path,
+        state: &mut State,
+        api_key: &str,
+        email: &str,
+        project_id: Option<&str>,
+    ) -> Result<AccountRecord> {
+        let outcome =
+            self.import_or_update_api_key_transaction(state_dir, api_key, email, project_id)?;
+        apply_compat_state(state, &outcome);
+        if let Some(message) = outcome.recovery_message() {
+            bail!("API-key import committed; recovery pending: {message}")
         }
-
-        Ok(record)
+        Ok(outcome.into_value())
     }
 
     pub fn find_account_by_email<'a>(
@@ -373,47 +493,1357 @@ impl super::AntigravityAdapter {
             .find(|a| a.email.eq_ignore_ascii_case(needle) || a.id == needle)
     }
 
-    pub fn remove_account(&self, state_dir: &Path, state: &mut State, id: &str) -> Result<()> {
-        let acc_dir = account_dir_checked(state_dir, id)?;
-        match fs::symlink_metadata(&acc_dir) {
-            Ok(_) => {
-                fs::remove_dir_all(&acc_dir).with_context(|| {
-                    format!("failed to remove account directory {}", acc_dir.display())
-                })?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to inspect account directory {}", acc_dir.display())
-                });
-            }
+    pub(crate) fn switch_account_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+        account_id: &str,
+        adoption: ActiveHomeAdoption,
+    ) -> Result<MutationResult<AccountRecord>> {
+        self.switch_account_session_inner(state_dir, session, account_id, adoption, None)
+    }
+
+    #[cfg(test)]
+    fn switch_account_transaction_with_roots(
+        &self,
+        state_dir: &Path,
+        account_id: &str,
+        adoption: ActiveHomeAdoption,
+        roots: (
+            crate::core::atomic_io::NormalizedStoreRoot,
+            crate::core::atomic_io::NormalizedStoreRoot,
+        ),
+    ) -> Result<MutationResult<AccountRecord>> {
+        let store = StateStore::open(state_dir).map_err(anyhow::Error::new)?;
+        let mut session = StateSession::bootstrap_exact(&store).map_err(anyhow::Error::new)?;
+        self.switch_account_session_inner(
+            state_dir,
+            &mut session,
+            account_id,
+            adoption,
+            Some(roots),
+        )
+    }
+
+    fn switch_account_session_inner(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+        account_id: &str,
+        adoption: ActiveHomeAdoption,
+        roots: Option<(
+            crate::core::atomic_io::NormalizedStoreRoot,
+            crate::core::atomic_io::NormalizedStoreRoot,
+        )>,
+    ) -> Result<MutationResult<AccountRecord>> {
+        recover_active_home_journals(state_dir, session, roots.clone())?;
+        recover_credential_journals_session(state_dir, session)?;
+        let disk = session.read().clone();
+        if disk.recovery_pending {
+            bail!("state recovery is pending; recover before account switch")
         }
-        state.accounts.retain(|a| a.id != id);
-        state.usage_cache.remove(id);
-        if state.current_account_id.as_deref() == Some(id) {
-            state.current_account_id = None;
+        if !matches!(disk.migration, MigrationStatus::None) {
+            bail!("account switch requires a current v2 state")
+        }
+        session
+            .with_locked_exact(|transaction| {
+                let snapshot = transaction.snapshot().map_err(anyhow::Error::new)?;
+                let account = snapshot
+                    .state
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+                    .cloned()
+                    .ok_or_else(|| StateStoreError::Invalid(anyhow!("account not found")))?;
+                let reference = snapshot
+                    .state
+                    .credential_refs
+                    .get(account_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        StateStoreError::Invalid(anyhow!("account has no v2 credential reference"))
+                    })?;
+
+                // Keep the account credential lock from this exact read until
+                // active-home publication, State CAS, and receipt-gated
+                // finalize/restore all finish. This is the State -> account
+                // credential -> active-home lock order and closes the
+                // validate-then-publish TOCTOU window.
+                let credential_permit = transaction
+                    .credential_mutation_permit(account_id)
+                    .map_err(anyhow::Error::new)?;
+                let credential_store =
+                    CredentialStore::from_permit(credential_permit).map_err(anyhow::Error::new)?;
+                let credential_lease = credential_store
+                    .read_leased(&reference)
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+                let stored = credential_lease.stored();
+                let (antigravity_root, gemini_root) = roots
+                    .clone()
+                    .map_or_else(active_home_roots, Ok)
+                    .map_err(StateStoreError::Invalid)?;
+                let profile = active_profile_for_reference(
+                    account_id,
+                    &reference,
+                    &stored.material_digest,
+                    &antigravity_root,
+                    &gemini_root,
+                );
+                let home_permit = transaction
+                    .active_home_mutation_permit_with_ref(
+                        Some(profile.clone()),
+                        Some(reference.clone()),
+                    )
+                    .map_err(anyhow::Error::new)?;
+                let home_store = ActiveHomeStore::from_permit_with_roots(
+                    home_permit,
+                    antigravity_root,
+                    gemini_root,
+                )
+                .map_err(StateStoreError::Invalid)?;
+                let txid = Uuid::new_v4();
+                let prepared = prepare_active_home(home_store, txid, adoption)
+                    .map_err(StateStoreError::Invalid)?;
+                let published = publish_active_home(prepared).map_err(StateStoreError::Invalid)?;
+                let active_proof = match published.journal_proof() {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        return Err(match published.restore() {
+                            Ok(()) => StateStoreError::Invalid(error),
+                            Err(restore_error) => StateStoreError::Invalid(anyhow!(
+                                "{error}; active-home rollback failed: {restore_error}"
+                            )),
+                        });
+                    }
+                };
+
+                let mut candidate = snapshot.state;
+                candidate.current_account_id = Some(account_id.to_string());
+                candidate.active_profile = Some(profile);
+                if let Some(current) = candidate
+                    .accounts
+                    .iter_mut()
+                    .find(|current| current.id == account_id)
+                {
+                    current.last_used_at = Some(Utc::now().timestamp());
+                    current.updated_at = current.updated_at.max(Utc::now().timestamp());
+                }
+                let receipt = match transaction.commit_coordinated_with_active(
+                    &candidate,
+                    Vec::new(),
+                    Some(active_proof),
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        return Err(match published.restore() {
+                            Ok(()) => error,
+                            Err(restore_error) => StateStoreError::Invalid(anyhow!(
+                                "{error}; active-home rollback failed: {restore_error}"
+                            )),
+                        });
+                    }
+                };
+                let mut after = transaction.snapshot()?;
+                match published.finalize(&receipt) {
+                    Ok(()) => Ok(MutationResult::Committed {
+                        value: account,
+                        state: after,
+                    }),
+                    Err(error) => {
+                        after.recovery_pending = true;
+                        Ok(MutationResult::CommittedRecoveryPending {
+                            value: account,
+                            state: after,
+                            message: error.to_string(),
+                        })
+                    }
+                }
+            })
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Delete one account and its fixed credential layout.  Deleting the
+    /// current account additionally publishes an active-home tombstone and
+    /// removes `current_account_id`/`active_profile` in the same State CAS.
+    pub(crate) fn remove_account_transaction(
+        &self,
+        state_dir: &Path,
+        account_id: &str,
+    ) -> Result<MutationResult<()>> {
+        let store = StateStore::open(state_dir).map_err(anyhow::Error::new)?;
+        let mut session = StateSession::bootstrap_exact(&store).map_err(anyhow::Error::new)?;
+        self.remove_account_session_inner(state_dir, &mut session, account_id, None)
+    }
+
+    pub(crate) fn remove_account_session(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+        account_id: &str,
+    ) -> Result<MutationResult<()>> {
+        self.remove_account_session_inner(state_dir, session, account_id, None)
+    }
+
+    #[cfg(test)]
+    fn remove_account_transaction_with_roots(
+        &self,
+        state_dir: &Path,
+        account_id: &str,
+        roots: (
+            crate::core::atomic_io::NormalizedStoreRoot,
+            crate::core::atomic_io::NormalizedStoreRoot,
+        ),
+    ) -> Result<MutationResult<()>> {
+        let store = StateStore::open(state_dir).map_err(anyhow::Error::new)?;
+        let mut session = StateSession::bootstrap_exact(&store).map_err(anyhow::Error::new)?;
+        self.remove_account_session_inner(state_dir, &mut session, account_id, Some(roots))
+    }
+
+    fn remove_account_session_inner(
+        &self,
+        state_dir: &Path,
+        session: &mut StateSession,
+        account_id: &str,
+        roots: Option<(
+            crate::core::atomic_io::NormalizedStoreRoot,
+            crate::core::atomic_io::NormalizedStoreRoot,
+        )>,
+    ) -> Result<MutationResult<()>> {
+        recover_active_home_journals(state_dir, session, roots.clone())?;
+        recover_credential_journals_session(state_dir, session)?;
+        let disk = session.read().clone();
+        if disk.recovery_pending {
+            bail!("state recovery is pending; recover before account deletion")
+        }
+        if !matches!(disk.migration, MigrationStatus::None) {
+            bail!("account deletion requires a current v2 state")
+        }
+        session
+            .with_locked_exact(|transaction| {
+                let snapshot = transaction.snapshot().map_err(anyhow::Error::new)?;
+                if !snapshot
+                    .state
+                    .accounts
+                    .iter()
+                    .any(|account| account.id == account_id)
+                {
+                    return Err(StateStoreError::Invalid(anyhow!("account not found")));
+                }
+                let credential_permit = transaction
+                    .credential_mutation_permit(account_id)
+                    .map_err(anyhow::Error::new)?;
+                let credential_store =
+                    CredentialStore::from_permit(credential_permit).map_err(anyhow::Error::new)?;
+                let layout = credential_store
+                    .read_layout()
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+                let txid = Uuid::new_v4();
+                let credential_prepared = credential_store
+                    .stage_delete(txid, &layout.expected_layout())
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+
+                let deleting_current =
+                    snapshot.state.current_account_id.as_deref() == Some(account_id);
+                let mut active_prepared: Option<PreparedActiveHomeTxn> = None;
+                if deleting_current {
+                    let (antigravity_root, gemini_root) = roots
+                        .clone()
+                        .map_or_else(active_home_roots, Ok)
+                        .map_err(StateStoreError::Invalid)?;
+                    let before_ref = snapshot.state.credential_refs.get(account_id).cloned();
+                    let home_permit = transaction
+                        .active_home_mutation_permit_with_ref(None, before_ref)
+                        .map_err(anyhow::Error::new)?;
+                    let home_store = ActiveHomeStore::from_permit_with_roots(
+                        home_permit,
+                        antigravity_root,
+                        gemini_root,
+                    )
+                    .map_err(StateStoreError::Invalid)?;
+                    active_prepared = Some(
+                        prepare_active_home(home_store, Uuid::new_v4(), ActiveHomeAdoption::Strict)
+                            .map_err(StateStoreError::Invalid)?,
+                    );
+                }
+
+                let credential_published = match credential_store.publish(credential_prepared) {
+                    Ok(published) => published,
+                    Err(error) => {
+                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
+                    }
+                };
+                let credential_proof = match credential_store.journal_proof(&credential_published) {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        return Err(match credential_store.restore(credential_published) {
+                            Ok(_) => StateStoreError::Invalid(anyhow::Error::new(error)),
+                            Err(restore_error) => StateStoreError::Invalid(anyhow!(
+                                "{error}; credential rollback failed: {restore_error}"
+                            )),
+                        });
+                    }
+                };
+
+                let mut active_published = if let Some(prepared) = active_prepared {
+                    match publish_active_home(prepared) {
+                        Ok(published) => Some(published),
+                        Err(error) => {
+                            return Err(match credential_store.restore(credential_published) {
+                                Ok(_) => StateStoreError::Invalid(error),
+                                Err(restore_error) => StateStoreError::Invalid(anyhow!(
+                                    "{error}; credential rollback failed: {restore_error}"
+                                )),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                let active_proof = match active_published.take() {
+                    Some(published) => match published.journal_proof() {
+                        Ok(proof) => {
+                            active_published = Some(published);
+                            Some(proof)
+                        }
+                        Err(error) => {
+                            let active_restore = published.restore().err();
+                            let credential_restore =
+                                credential_store.restore(credential_published).err();
+                            let mut message = error.to_string();
+                            if let Some(restore_error) = active_restore {
+                                message.push_str(&format!(
+                                    "; active-home rollback failed: {restore_error}"
+                                ));
+                            }
+                            if let Some(restore_error) = credential_restore {
+                                message.push_str(&format!(
+                                    "; credential rollback failed: {restore_error}"
+                                ));
+                            }
+                            return Err(StateStoreError::Invalid(anyhow!(message)));
+                        }
+                    },
+                    None => None,
+                };
+
+                let mut candidate = snapshot.state;
+                candidate
+                    .accounts
+                    .retain(|account| account.id != account_id);
+                candidate.usage_cache.remove(account_id);
+                candidate.credential_refs.remove(account_id);
+                if deleting_current {
+                    candidate.current_account_id = None;
+                    candidate.active_profile = None;
+                }
+                let receipt = match active_proof {
+                    Some(proof) => transaction.commit_coordinated_with_active(
+                        &candidate,
+                        vec![credential_proof],
+                        Some(proof),
+                    ),
+                    None => transaction.commit_coordinated(&candidate, vec![credential_proof]),
+                };
+                let receipt = match receipt {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let active_restore = active_published
+                            .as_ref()
+                            .and_then(|published| published.restore().err());
+                        let credential_restore =
+                            credential_store.restore(credential_published).err();
+                        if active_restore.is_none() && credential_restore.is_none() {
+                            return Err(error);
+                        }
+                        let mut message = error.to_string();
+                        if let Some(restore_error) = active_restore {
+                            message.push_str(&format!(
+                                "; active-home rollback failed: {restore_error}"
+                            ));
+                        }
+                        if let Some(restore_error) = credential_restore {
+                            message.push_str(&format!(
+                                "; credential rollback failed: {restore_error}"
+                            ));
+                        }
+                        return Err(StateStoreError::Invalid(anyhow!(message)));
+                    }
+                };
+                let mut after = transaction.snapshot()?;
+                let mut recovery = Vec::new();
+                if let Some(published) = active_published {
+                    if let Err(error) = published.finalize(&receipt) {
+                        recovery.push(error.to_string());
+                    }
+                }
+                if let Err(error) = credential_store.finalize(credential_published, &receipt) {
+                    recovery.push(error.to_string());
+                }
+                if recovery.is_empty() {
+                    Ok(MutationResult::Committed {
+                        value: (),
+                        state: after,
+                    })
+                } else {
+                    after.recovery_pending = true;
+                    Ok(MutationResult::CommittedRecoveryPending {
+                        value: (),
+                        state: after,
+                        message: recovery.join("; "),
+                    })
+                }
+            })
+            .map_err(anyhow::Error::new)
+    }
+
+    pub fn remove_account(&self, state_dir: &Path, state: &mut State, id: &str) -> Result<()> {
+        let outcome = self.remove_account_transaction(state_dir, id)?;
+        apply_compat_state(state, &outcome);
+        if let Some(message) = outcome.recovery_message() {
+            bail!("account deletion committed; recovery pending: {message}")
         }
         Ok(())
     }
 }
 
 pub fn compute_credential_fingerprint(secret: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(secret.trim().as_bytes());
-    format!("{:x}", hasher.finalize())
+    PortableCredential::oauth_access_token(secret.trim())
+        .map(|credential| credential.fingerprint())
+        .unwrap_or_else(|_| "sha256:invalid".to_string())
+}
+
+fn apply_compat_state<T>(state: &mut State, outcome: &MutationResult<T>) {
+    *state = outcome.state().state.clone();
+    if let Some(message) = outcome.recovery_message() {
+        // Legacy wrappers cannot carry the typed result, but must still move
+        // their runtime snapshot forward and tell the user recovery is needed.
+        eprintln!("warning: account mutation committed; recovery pending: {message}");
+    }
+}
+
+fn active_profile_for_reference(
+    account_id: &str,
+    reference: &CredentialRef,
+    material_digest: &str,
+    antigravity_root: &crate::core::atomic_io::NormalizedStoreRoot,
+    gemini_root: &crate::core::atomic_io::NormalizedStoreRoot,
+) -> ActiveProfile {
+    // CredentialStore evidence labels digests as `sha256:<hex>`, while the
+    // managed home layout stores the raw 64-character hex digest.
+    let material_digest = material_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(material_digest)
+        .to_string();
+    let managed_layout = match reference.kind {
+        CredentialRefKind::OauthAccessToken => ManagedLayout {
+            antigravity_token: SlotState::Exact {
+                sha256: material_digest.clone(),
+            },
+            gemini_authorized_user: SlotState::Absent,
+        },
+        CredentialRefKind::OauthAuthorizedUser => ManagedLayout {
+            antigravity_token: SlotState::Absent,
+            gemini_authorized_user: SlotState::Exact {
+                sha256: material_digest,
+            },
+        },
+        CredentialRefKind::ApiKey | CredentialRefKind::VertexServiceAccount => {
+            ManagedLayout::default()
+        }
+    };
+    ActiveProfile {
+        account_id: account_id.to_string(),
+        credential_fingerprint: reference.fingerprint.clone(),
+        home_scope_id: active_home_scope_id(antigravity_root, gemini_root),
+        managed_layout,
+    }
+}
+
+fn prepare_active_home(
+    store: ActiveHomeStore,
+    txid: Uuid,
+    adoption: ActiveHomeAdoption,
+) -> Result<PreparedActiveHomeTxn> {
+    let prepared = match adoption {
+        ActiveHomeAdoption::Strict => store.prepare(txid),
+        ActiveHomeAdoption::Adopt => store.prepare_adopt(txid),
+        ActiveHomeAdoption::Takeover => store.prepare_takeover(txid),
+    };
+    prepared.map_err(|error| match error {
+        ActiveHomeError::Invalid(error) => error,
+        ActiveHomeError::ReconcileRequired { source, token } => match restore_reconcile(token) {
+            Ok(()) => source,
+            Err(restore_error) => {
+                anyhow!("{source}; active-home restore failed: {restore_error}")
+            }
+        },
+    })
+}
+
+fn publish_active_home(prepared: PreparedActiveHomeTxn) -> Result<PublishedActiveHomeTxn> {
+    match prepared.publish() {
+        Ok(published) => Ok(published),
+        Err(ActiveHomeError::Invalid(error)) => Err(error),
+        Err(ActiveHomeError::ReconcileRequired { source, token }) => {
+            match restore_reconcile(token) {
+                Ok(()) => Err(source),
+                Err(restore_error) => Err(anyhow!(
+                    "{source}; active-home restore failed: {restore_error}"
+                )),
+            }
+        }
+    }
+}
+
+fn scan_known_oauth_source() -> Result<Option<(PortableCredential, Vec<u8>, String)>> {
+    let active_email = default_gemini_home()
+        .map(|home| home.join("google_accounts.json"))
+        .filter(|path| path.exists())
+        .map(|path| -> Result<Option<String>> {
+            let bytes = read_external_regular_file_bounded(
+                &path,
+                credential_store::MAX_CREDENTIAL_FILE_BYTES,
+            )?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .context("known google_accounts.json is not valid JSON")?;
+            Ok(value
+                .get("active")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string))
+        })
+        .transpose()?
+        .flatten();
+
+    let local_token = default_antigravity_cli_home()
+        .map(|home| home.join("antigravity-oauth-token"))
+        .filter(|path| path.exists())
+        .map(|path| -> Result<Option<String>> {
+            let bytes = read_external_regular_file_bounded(
+                &path,
+                credential_store::MAX_CREDENTIAL_FILE_BYTES,
+            )?;
+            let token = std::str::from_utf8(&bytes)
+                .context("known OAuth token is not UTF-8")?
+                .trim()
+                .to_string();
+            if token.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(token))
+        })
+        .transpose()?
+        .flatten();
+
+    let authorized = default_gemini_home()
+        .map(|home| home.join("oauth_creds.json"))
+        .filter(|path| path.exists())
+        .map(|path| {
+            let bytes = read_import_source(&path)?;
+            let (credential, _) = parse_import_source(&bytes)?;
+            if credential.kind() != CredentialKind::OAuthAuthorizedUser {
+                bail!("known oauth_creds.json is not an authorized-user credential")
+            }
+            Ok((credential, bytes))
+        })
+        .transpose()?;
+
+    let (credential, material) = match (local_token, authorized) {
+        (None, None) => return Ok(None),
+        (Some(token), None) => {
+            let credential =
+                PortableCredential::oauth_access_token(&token).map_err(anyhow::Error::new)?;
+            (credential, token.into_bytes())
+        }
+        (None, Some((credential, bytes))) => (credential, bytes),
+        (Some(token), Some((credential, _))) => {
+            let merged = credential
+                .with_access_token(&token)
+                .map_err(anyhow::Error::new)?;
+            let material = merged
+                .to_native_json_string()
+                .map_err(anyhow::Error::new)?
+                .into_bytes();
+            (merged, material)
+        }
+    };
+    let email = credential_email(&credential)
+        .or(active_email)
+        .unwrap_or_else(|| "antigravity-user@gemini".to_string());
+    Ok(Some((credential, material, email)))
+}
+
+fn read_import_source(path: &Path) -> Result<Vec<u8>> {
+    let bytes =
+        read_external_regular_file_bounded(path, credential_store::MAX_CREDENTIAL_FILE_BYTES)
+            .with_context(|| format!("failed to inspect auth file {}", path.display()))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        bail!("auth credential file is blank")
+    }
+    Ok(bytes)
+}
+
+fn parse_import_source(bytes: &[u8]) -> Result<(PortableCredential, Vec<u8>)> {
+    let text = std::str::from_utf8(bytes).context("auth credential file is not UTF-8")?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("auth credential input cannot be blank")
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let (credential, portable_envelope) = match PortableCredential::from_json_str(trimmed) {
+            Ok(credential) => (credential, true),
+            Err(_) => (
+                PortableCredential::from_native_json_str(trimmed).map_err(anyhow::Error::new)?,
+                false,
+            ),
+        };
+        let material = if credential.kind() == CredentialKind::OAuthAccessToken {
+            credential
+                .access_token()
+                .ok_or_else(|| anyhow::anyhow!("raw OAuth credential has no access token"))?
+                .as_bytes()
+                .to_vec()
+        } else if portable_envelope {
+            credential.to_native_json_string()?.into_bytes()
+        } else {
+            bytes.to_vec()
+        };
+        return Ok((credential, material));
+    }
+
+    let credential = PortableCredential::oauth_access_token(trimmed).map_err(anyhow::Error::new)?;
+    Ok((credential, trimmed.as_bytes().to_vec()))
+}
+
+fn credential_email(credential: &PortableCredential) -> Option<String> {
+    credential.native_document().and_then(|document| {
+        ["email", "client_email", "account", "user"]
+            .into_iter()
+            .find_map(|field| {
+                document
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            })
+    })
+}
+
+fn credential_material(credential: &PortableCredential) -> Result<Vec<u8>> {
+    if credential.kind() == CredentialKind::OAuthAccessToken {
+        return Ok(credential
+            .access_token()
+            .ok_or_else(|| anyhow::anyhow!("raw OAuth credential has no access token"))?
+            .as_bytes()
+            .to_vec());
+    }
+    Ok(credential.to_native_json_string()?.into_bytes())
+}
+
+fn merge_oauth_import(
+    store: &CredentialStore,
+    credential: PortableCredential,
+    existing: Option<&AccountRecord>,
+) -> Result<PortableCredential> {
+    match credential.kind() {
+        CredentialKind::OAuthAccessToken => {
+            let existing_authorized = store
+                .read_kind(crate::core::state::CredentialRefKind::OauthAuthorizedUser)
+                .map_err(anyhow::Error::new)?;
+            if let Some(authorized) = existing_authorized {
+                return authorized
+                    .credential
+                    .with_access_token(
+                        credential
+                            .access_token()
+                            .ok_or_else(|| anyhow::anyhow!("raw OAuth credential has no token"))?,
+                    )
+                    .map_err(anyhow::Error::new);
+            }
+            if existing.is_some_and(|account| {
+                account
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            }) {
+                bail!(
+                    "account has refresh material but no complete authorized-user credential document"
+                );
+            }
+            Ok(credential)
+        }
+        CredentialKind::OAuthAuthorizedUser if credential.access_token().is_none() => {
+            let existing_raw = store
+                .read_kind(crate::core::state::CredentialRefKind::OauthAccessToken)
+                .map_err(anyhow::Error::new)?;
+            if let Some(raw) = existing_raw {
+                return credential
+                    .with_access_token(
+                        raw.credential
+                            .access_token()
+                            .ok_or_else(|| anyhow::anyhow!("raw OAuth credential has no token"))?,
+                    )
+                    .map_err(anyhow::Error::new);
+            }
+            Ok(credential)
+        }
+        _ => Ok(credential),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImportMatch {
+    IdentityOrEmail,
+    IdentityOnly,
+}
+
+fn credential_ref_kind_for(credential: &PortableCredential) -> CredentialRefKind {
+    match credential.kind() {
+        CredentialKind::OAuthAccessToken => CredentialRefKind::OauthAccessToken,
+        CredentialKind::OAuthAuthorizedUser => CredentialRefKind::OauthAuthorizedUser,
+        CredentialKind::ApiKey => CredentialRefKind::ApiKey,
+        CredentialKind::VertexServiceAccount => CredentialRefKind::VertexServiceAccount,
+    }
+}
+
+#[cfg(test)]
+fn recover_credential_journals(state_dir: &Path, state: &StateRead) -> Result<()> {
+    // A completely absent root cannot contain a credential journal.  Avoid
+    // claiming it merely to perform an empty recovery pass; this keeps pure
+    // first-import setup side-effect free while still scanning a present root
+    // that has accounts but no state.json below.
+    if matches!(state.migration, MigrationStatus::Missing)
+        && matches!(
+            fs::symlink_metadata(state_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    {
+        return Ok(());
+    }
+    let store = StateStore::open(state_dir).map_err(anyhow::Error::new)?;
+    let mut session = StateSession::bootstrap_exact(&store).map_err(anyhow::Error::new)?;
+    if session.revision() != &state.revision {
+        bail!("credential recovery snapshot is stale")
+    }
+    recover_credential_journals_session(state_dir, &mut session)
+}
+
+fn recover_credential_journals_session(state_dir: &Path, session: &mut StateSession) -> Result<()> {
+    // A completely absent root cannot contain a credential journal. Avoid
+    // claiming it merely to perform an empty recovery pass during bootstrap.
+    if matches!(session.migration(), MigrationStatus::Missing)
+        && matches!(
+            fs::symlink_metadata(state_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    {
+        return Ok(());
+    }
+    session
+        .with_locked_exact::<(), StateStoreError, _>(|transaction| {
+            let snapshot = transaction.snapshot()?;
+            // Include account directories that are not yet in state.json: a
+            // crash may happen after credential publish but before its State
+            // commit. Both sets are sorted before account locks are acquired.
+            let mut account_ids = transaction.account_ids()?;
+            account_ids.extend(
+                snapshot
+                    .state
+                    .accounts
+                    .iter()
+                    .map(|account| account.id.clone()),
+            );
+            account_ids.sort();
+            account_ids.dedup();
+            let authority = transaction.recovery_authority()?;
+            for account_id in account_ids {
+                let permit = transaction.credential_mutation_permit(&account_id)?;
+                let credential_store = CredentialStore::from_permit(permit)
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+                credential_store
+                    .recover_pending(authority.clone())
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+            }
+            Ok(())
+        })
+        .map_err(anyhow::Error::new)
+}
+
+fn recover_active_home_journals(
+    state_dir: &Path,
+    session: &mut StateSession,
+    roots: Option<(
+        crate::core::atomic_io::NormalizedStoreRoot,
+        crate::core::atomic_io::NormalizedStoreRoot,
+    )>,
+) -> Result<()> {
+    // Active-home journals live below account capabilities. A missing root
+    // has no account directory and must remain a pure empty-v2 bootstrap.
+    if matches!(session.migration(), MigrationStatus::Missing)
+        && matches!(
+            fs::symlink_metadata(state_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    {
+        return Ok(());
+    }
+    session
+        .with_locked_exact::<(), StateStoreError, _>(|transaction| {
+            let mut account_ids = transaction.account_ids()?;
+            account_ids.sort();
+            account_ids.dedup();
+            if account_ids.is_empty() {
+                return Ok(());
+            }
+            // Normalizing roots does not claim or lock them. ActiveHomeStore
+            // acquires account then sorted home locks for each account below.
+            let (antigravity_root, gemini_root) = roots
+                .clone()
+                .map_or_else(active_home_roots, Ok)
+                .map_err(StateStoreError::Invalid)?;
+            let authority = transaction.active_home_recovery_authority()?;
+            for account_id in account_ids {
+                let permit = transaction.active_home_recovery_permit(&account_id)?;
+                let mut pending = permit
+                    .account_capability()
+                    .artifact_locators()
+                    .map_err(StateStoreError::Invalid)?
+                    .into_iter()
+                    .filter_map(|locator| {
+                        let name = locator.as_path().file_name()?.to_str()?;
+                        let raw = name
+                            .strip_prefix(".sagy-active-home-")?
+                            .strip_suffix(".journal")?;
+                        let txid = Uuid::parse_str(raw).ok()?;
+                        (txid.to_string() == raw).then_some(txid)
+                    })
+                    .collect::<Vec<_>>();
+                pending.sort_unstable();
+                pending.dedup();
+                for txid in pending {
+                    let permit = transaction.active_home_recovery_permit(&account_id)?;
+                    let store = ActiveHomeStore::from_permit_with_roots(
+                        permit,
+                        antigravity_root.clone(),
+                        gemini_root.clone(),
+                    )
+                    .map_err(StateStoreError::Invalid)?;
+                    crate::adapters::antigravity::active_home::recover_pending(
+                        store,
+                        authority.clone(),
+                        txid,
+                    )
+                    .map_err(StateStoreError::Invalid)?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(anyhow::Error::new)
+}
+
+fn run_legacy_migration_session(
+    state_dir: &Path,
+    session: &mut StateSession,
+) -> Result<MutationResult<()>> {
+    recover_active_home_journals(state_dir, session, None)?;
+    recover_credential_journals_session(state_dir, session)?;
+    if matches!(session.migration(), MigrationStatus::Missing) {
+        let committed = session.bootstrap_empty_v2().map_err(anyhow::Error::new)?;
+        return Ok(MutationResult::Committed {
+            value: (),
+            state: committed.after().clone(),
+        });
+    }
+    if matches!(session.migration(), MigrationStatus::None) {
+        return Err(anyhow!("state is already current v2"));
+    }
+    let disk = session.read().clone();
+    if disk.recovery_pending {
+        bail!("state recovery is pending; recover before legacy migration")
+    }
+    session
+        .with_locked_exact(|transaction| {
+            let base = transaction.snapshot()?.state;
+            let mut planned = credential_store::MigrationPlanner::plan(state_dir, &base)
+                .map_err(anyhow::Error::new)?
+                .entries;
+            planned.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+
+            let mut staged = Vec::with_capacity(planned.len());
+            for entry in planned {
+                let permit = transaction
+                    .credential_mutation_permit(&entry.account_id)
+                    .map_err(anyhow::Error::new)?;
+                let (store, prepared) =
+                    prepare_credential_with_permit(permit, &entry.credential, entry.material())?;
+                staged.push((entry.account_id, entry.credential_ref, store, prepared));
+            }
+
+            let mut published = Vec::with_capacity(staged.len());
+            for (account_id, reference, store, prepared) in staged {
+                match store.publish(prepared) {
+                    Ok(published_txn) => {
+                        published.push((account_id, reference, store, published_txn))
+                    }
+                    Err(error) => {
+                        restore_published_transactions(published)?;
+                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
+                    }
+                }
+            }
+            let mut proofs = Vec::with_capacity(published.len());
+            for (_, _, store, published_txn) in &published {
+                match store.journal_proof(published_txn) {
+                    Ok(proof) => proofs.push(proof),
+                    Err(error) => {
+                        restore_published_transactions(published)?;
+                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
+                    }
+                }
+            }
+
+            let mut candidate = base;
+            candidate.version = 2;
+            candidate.current_account_id = None;
+            candidate.active_profile = None;
+            candidate.credential_refs.clear();
+            for proof in &proofs {
+                candidate.credential_refs.insert(
+                    proof.account_id().to_string(),
+                    proof.credential_ref().clone(),
+                );
+            }
+            let permit = transaction.migration_commit_permit(proofs)?;
+            let receipt = match transaction.commit_migration(&candidate, permit) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    restore_published_transactions(published)?;
+                    return Err(error);
+                }
+            };
+            let mut after = transaction.snapshot()?;
+            let mut recovery = Vec::new();
+            for (_, _, store, published_txn) in published {
+                if let Err(error) = store.finalize(published_txn, &receipt) {
+                    recovery.push(error.to_string());
+                }
+            }
+            if recovery.is_empty() {
+                Ok(MutationResult::Committed {
+                    value: (),
+                    state: after,
+                })
+            } else {
+                after.recovery_pending = true;
+                Ok(MutationResult::CommittedRecoveryPending {
+                    value: (),
+                    state: after,
+                    message: recovery.join("; "),
+                })
+            }
+        })
+        .map_err(anyhow::Error::new)
+}
+
+/// Coordinate one credential mutation with the exact StateStore transaction.
+/// The state lock is acquired first; every account credential lock is then
+/// acquired in sorted account-id order.  A staged journal is published before
+/// the matching state reference is committed, and only the receipt returned by
+/// that commit may finalize evidence.
+#[allow(clippy::too_many_arguments)]
+fn run_credential_import(
+    state_dir: &Path,
+    incoming: PortableCredential,
+    source_material: Vec<u8>,
+    email: &str,
+    plan_label: Option<&str>,
+    matching: ImportMatch,
+    merge_oauth: bool,
+) -> Result<MutationResult<AccountRecord>> {
+    let store = StateStore::open(state_dir).map_err(anyhow::Error::new)?;
+    let mut session = StateSession::bootstrap_exact(&store).map_err(anyhow::Error::new)?;
+    run_credential_import_session(
+        state_dir,
+        &mut session,
+        incoming,
+        source_material,
+        email,
+        plan_label,
+        matching,
+        merge_oauth,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_credential_import_session(
+    state_dir: &Path,
+    session: &mut StateSession,
+    incoming: PortableCredential,
+    source_material: Vec<u8>,
+    email: &str,
+    plan_label: Option<&str>,
+    matching: ImportMatch,
+    merge_oauth: bool,
+) -> Result<MutationResult<AccountRecord>> {
+    recover_active_home_journals(state_dir, session, None)?;
+    recover_credential_journals_session(state_dir, session)?;
+    if matches!(session.migration(), MigrationStatus::Missing) {
+        // A missing store bootstraps only an empty v2 document.  In particular,
+        // no caller state or ambient ~/.gemini files are allowed to seed it.
+        session.bootstrap_empty_v2().map_err(anyhow::Error::new)?;
+    }
+    let disk = session.read().clone();
+    if disk.recovery_pending {
+        bail!("state recovery is pending; recover before account import")
+    }
+    let migration = matches!(
+        disk.migration,
+        MigrationStatus::Missing | MigrationStatus::LegacyV1
+    );
+    session
+        .with_locked_exact(|transaction| {
+            let transaction_state = transaction.snapshot().map_err(anyhow::Error::new)?;
+            let mut base = transaction_state.state;
+            base.version = base.version.max(1);
+
+            let incoming_fingerprint = incoming.fingerprint();
+            let existing = base.accounts.iter().find(|account| match matching {
+                ImportMatch::IdentityOnly => {
+                    account.identity_fingerprint.as_deref() == Some(incoming_fingerprint.as_str())
+                        || base
+                            .credential_refs
+                            .get(&account.id)
+                            .is_some_and(|reference| reference.fingerprint == incoming_fingerprint)
+                }
+                ImportMatch::IdentityOrEmail => {
+                    account.identity_fingerprint.as_deref() == Some(incoming_fingerprint.as_str())
+                        || base
+                            .credential_refs
+                            .get(&account.id)
+                            .is_some_and(|reference| reference.fingerprint == incoming_fingerprint)
+                        || account.email.eq_ignore_ascii_case(email)
+                }
+            });
+            let account_id = existing
+                .map(|account| account.id.clone())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let read_store =
+                CredentialStore::new(state_dir, &account_id).map_err(anyhow::Error::new)?;
+            let original = incoming.clone();
+            let credential = if merge_oauth {
+                merge_oauth_import(&read_store, incoming, existing)?
+            } else {
+                incoming
+            };
+            let material = if credential == original {
+                source_material.clone()
+            } else {
+                credential_material(&credential)?
+            };
+            let now = Utc::now().timestamp();
+            let mut record =
+                record_from_credential(&account_id, email, &credential, &read_store, now)?;
+            if let Some(existing) = existing {
+                preserve_account_metadata(&mut record, existing, now);
+                if credential.kind() == CredentialKind::OAuthAccessToken
+                    && existing.is_oauth()
+                    && record.refresh_token.is_none()
+                {
+                    record.refresh_token = existing.refresh_token.clone();
+                }
+                if plan_label.is_none() {
+                    record.plan = existing.plan.clone();
+                }
+            }
+            if let Some(plan_label) = plan_label {
+                record.plan = Some(plan_label.to_string());
+            }
+
+            let mut work = Vec::<(String, PortableCredential, Vec<u8>, CredentialRef)>::new();
+            if migration {
+                let mut planned = credential_store::MigrationPlanner::plan(state_dir, &base)
+                    .map_err(anyhow::Error::new)?
+                    .entries;
+                planned.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+                for entry in planned {
+                    if entry.account_id == account_id {
+                        continue;
+                    }
+                    let entry_account_id = entry.account_id.clone();
+                    work.push((
+                        entry_account_id,
+                        entry.credential.clone(),
+                        entry.material().to_vec(),
+                        entry.credential_ref,
+                    ));
+                }
+            }
+            let target_ref = CredentialRef {
+                kind: credential_ref_kind_for(&credential),
+                fingerprint: credential.fingerprint(),
+            };
+            work.push((
+                account_id.clone(),
+                credential.clone(),
+                material,
+                target_ref.clone(),
+            ));
+            work.sort_by(|left, right| left.0.cmp(&right.0));
+
+            let mut staged = Vec::with_capacity(work.len());
+            for (id, credential, material, reference) in work {
+                let permit = transaction
+                    .credential_mutation_permit(&id)
+                    .map_err(anyhow::Error::new)?;
+                let (store, stage) =
+                    prepare_credential_with_permit(permit, &credential, &material)?;
+                staged.push((id, reference, store, stage));
+            }
+
+            let mut published = Vec::with_capacity(staged.len());
+            for (id, reference, store, prepared) in staged {
+                match store.publish(prepared) {
+                    Ok(published_txn) => published.push((id, reference, store, published_txn)),
+                    Err(error) => {
+                        restore_published_transactions(published)?;
+                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
+                    }
+                }
+            }
+            let mut proofs = Vec::with_capacity(published.len());
+            let mut proof_error = None;
+            for (_, _, store, published_txn) in &published {
+                match store.journal_proof(published_txn) {
+                    Ok(proof) => proofs.push(proof),
+                    Err(error) => {
+                        proof_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = proof_error {
+                restore_published_transactions(published)?;
+                return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
+            }
+
+            let mut candidate = base.clone();
+            upsert_account(&mut candidate, record.clone(), now);
+            if migration {
+                for proof in &proofs {
+                    candidate.credential_refs.insert(
+                        proof.account_id().to_string(),
+                        proof.credential_ref().clone(),
+                    );
+                }
+            }
+            candidate
+                .credential_refs
+                .insert(account_id.clone(), target_ref);
+            if migration {
+                candidate.current_account_id = None;
+                candidate.active_profile = None;
+            }
+
+            let receipt = if migration {
+                match transaction
+                    .migration_commit_permit(proofs)
+                    .and_then(|permit| transaction.commit_migration(&candidate, permit))
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        restore_published_transactions(published)?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                match transaction.commit_coordinated(&candidate, proofs) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        restore_published_transactions(published)?;
+                        return Err(error);
+                    }
+                }
+            };
+            let mut after = transaction.snapshot()?;
+            let mut recovery = Vec::new();
+            for (_, _, store, published_txn) in published {
+                if let Err(error) = store.finalize(published_txn, &receipt) {
+                    recovery.push(error.to_string());
+                }
+            }
+            if recovery.is_empty() {
+                Ok(MutationResult::Committed {
+                    value: record,
+                    state: after,
+                })
+            } else {
+                after.recovery_pending = true;
+                Ok(MutationResult::CommittedRecoveryPending {
+                    value: record,
+                    state: after,
+                    message: recovery.join("; "),
+                })
+            }
+        })
+        .map_err(anyhow::Error::new)
+}
+
+fn restore_published_transactions(
+    staged: Vec<(
+        String,
+        CredentialRef,
+        CredentialStore,
+        credential_store::PublishedCredentialTxn,
+    )>,
+) -> std::result::Result<(), StateStoreError> {
+    let mut first_error = None;
+    for (_, _, store, stage) in staged.into_iter().rev() {
+        if let Err(error) = store.restore(stage) {
+            if first_error.is_none() {
+                first_error = Some(StateStoreError::Invalid(anyhow::Error::new(error)));
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Prepare a credential under the state transaction's sealed capability. The
+/// caller must keep the returned staged value alive while it commits the
+/// matching State v2 reference, then call publish and finally finalize on the
+/// same lock order.
+pub(crate) fn prepare_credential_with_permit(
+    permit: crate::core::state_store::CredentialMutationPermit,
+    credential: &PortableCredential,
+    material: &[u8],
+) -> Result<(CredentialStore, credential_store::PreparedCredentialTxn)> {
+    let store = CredentialStore::from_permit(permit).map_err(anyhow::Error::new)?;
+    let staged = store
+        .stage_with_material(Uuid::new_v4(), credential, material)
+        .map_err(anyhow::Error::new)?;
+    Ok((store, staged))
+}
+
+fn record_from_credential(
+    account_id: &str,
+    email: &str,
+    credential: &PortableCredential,
+    store: &CredentialStore,
+    now: i64,
+) -> Result<AccountRecord> {
+    let (account_type, auth_path, provider_id, plan) = match credential.kind() {
+        CredentialKind::OAuthAccessToken => (
+            AccountType::OAuth,
+            account_token_file(store.account_dir()),
+            Some("antigravity-oauth".to_string()),
+            Some("Antigravity OAuth".to_string()),
+        ),
+        CredentialKind::OAuthAuthorizedUser => (
+            AccountType::OAuth,
+            store.account_dir().join("credentials.json"),
+            Some("google".to_string()),
+            Some("Antigravity OAuth".to_string()),
+        ),
+        CredentialKind::ApiKey => (
+            AccountType::ApiKey,
+            store.account_dir().join("credentials.json"),
+            Some("google-ai-studio".to_string()),
+            Some("Gemini API Key".to_string()),
+        ),
+        CredentialKind::VertexServiceAccount => (
+            AccountType::Vertex,
+            store.account_dir().join("credentials.json"),
+            Some("google".to_string()),
+            Some("Vertex AI".to_string()),
+        ),
+    };
+    let document = credential.native_document();
+    Ok(AccountRecord {
+        id: account_id.to_string(),
+        email: email.to_string(),
+        account_type,
+        provider_id,
+        project_id: document
+            .and_then(|value| value.get("project_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        account_id: document
+            .and_then(|value| value.get("account_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        identity_fingerprint: Some(credential.fingerprint()),
+        plan,
+        auth_path: auth_path.to_string_lossy().into_owned(),
+        config_path: None,
+        oauth_token: credential.access_token().map(ToString::to_string),
+        refresh_token: credential.refresh_token().map(ToString::to_string),
+        api_key: credential.api_key_value().map(ToString::to_string),
+        added_at: now,
+        updated_at: now,
+        last_used_at: None,
+    })
+}
+
+fn preserve_account_metadata(record: &mut AccountRecord, existing: &AccountRecord, now: i64) {
+    record.added_at = existing.added_at;
+    record.updated_at = now.max(existing.updated_at);
+    record.last_used_at = existing.last_used_at;
+    record.config_path = existing.config_path.clone();
+    if existing
+        .provider_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        record.provider_id = existing.provider_id.clone();
+    }
+}
+
+fn upsert_account(state: &mut State, record: AccountRecord, now: i64) {
+    if let Some(existing_idx) = state
+        .accounts
+        .iter()
+        .position(|account| account.id == record.id)
+    {
+        state.accounts[existing_idx] = record.clone();
+    } else {
+        state.accounts.push(record.clone());
+    }
+    if !state.usage_cache.contains_key(&record.id) {
+        state.usage_cache.insert(
+            record.id.clone(),
+            UsageSnapshot {
+                plan: record.plan.clone(),
+                health: HealthStatus::Unverified,
+                last_probe_at: Some(now),
+                ..Default::default()
+            },
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::antigravity::account::credential_store::MigrationPlanner;
+    use crate::core::state::{CredentialRefKind, State};
+    use crate::core::state_store::RevisionGeneration;
+    use fs2::FileExt;
+    use sha2::{Digest, Sha256};
+    use std::fs::{self, OpenOptions};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_is_valid_oauth_credential() {
         let valid_oauth = serde_json::json!({
+            "type": "authorized_user",
+            "client_id": "client",
+            "client_secret": "secret",
             "access_token": "ya29.sample",
             "refresh_token": "1//sample",
-            "token_type": "Bearer"
+            "token_uri": "https://oauth2.example.test/token"
         });
         assert!(is_valid_oauth_credential(&valid_oauth));
 
@@ -474,5 +1904,1131 @@ mod tests {
             .unwrap();
         assert_eq!(state.accounts.len(), 1);
         assert_eq!(rec1.id, rec2.id);
+    }
+
+    #[test]
+    fn api_key_import_rejects_blank_and_deduplicates_exact_material() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+        assert!(
+            adapter
+                .import_or_update_api_key(
+                    temp_dir.path(),
+                    &mut state,
+                    "   ",
+                    "user@example.com",
+                    None,
+                )
+                .is_err()
+        );
+        let first = adapter
+            .import_or_update_api_key(
+                temp_dir.path(),
+                &mut state,
+                "api-key-1",
+                "user@example.com",
+                Some("project-a"),
+            )
+            .unwrap();
+        let second = adapter
+            .import_or_update_api_key(
+                temp_dir.path(),
+                &mut state,
+                "api-key-1",
+                "user@example.com",
+                Some("project-a"),
+            )
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(state.accounts.len(), 1);
+    }
+
+    #[test]
+    fn missing_store_bootstraps_empty_v2_and_ignores_stale_caller_state() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut caller = State {
+            accounts: vec![AccountRecord {
+                id: "stale-account".to_string(),
+                email: "stale@example.com".to_string(),
+                ..Default::default()
+            }],
+            current_account_id: Some("stale-account".to_string()),
+            ..State::default()
+        };
+        let imported = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut caller,
+                "fresh@example.com",
+                "fresh-token",
+                None,
+            )
+            .expect("import into missing store");
+        assert_eq!(caller.version, 2);
+        assert_eq!(caller.accounts.len(), 1);
+        assert_eq!(caller.accounts[0].id, imported.id);
+        assert_ne!(caller.accounts[0].id, "stale-account");
+        assert_eq!(caller.current_account_id, None);
+        assert!(state_dir.join("state.json").is_file());
+    }
+
+    #[test]
+    fn session_mutations_advance_one_state_session_owner() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut session = StateSession::open(&state_dir).expect("open missing session");
+        let first = adapter
+            .import_or_update_token_session(
+                &state_dir,
+                &mut session,
+                "session@example.com",
+                "session-token-1",
+                None,
+            )
+            .expect("first session import");
+        assert_eq!(session.state().accounts.len(), 1);
+        assert_eq!(session.revision(), &first.state().revision);
+        let second = adapter
+            .import_or_update_token_session(
+                &state_dir,
+                &mut session,
+                "session@example.com",
+                "session-token-2",
+                None,
+            )
+            .expect("second session import");
+        assert_eq!(session.state().accounts.len(), 1);
+        assert_eq!(session.revision(), &second.state().revision);
+        assert_ne!(first.state().revision, second.state().revision);
+    }
+
+    #[test]
+    fn importing_new_account_stays_inactive_and_preserves_current_profile() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let antigravity_path = temp.path().join("ag");
+        let gemini_path = temp.path().join("gemini");
+        fs::create_dir_all(&antigravity_path).expect("create antigravity root");
+        fs::create_dir_all(&gemini_path).expect("create gemini root");
+        let roots = (
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&antigravity_path)
+                .expect("normalize antigravity root"),
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&gemini_path)
+                .expect("normalize gemini root"),
+        );
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+        let current = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut state,
+                "current@example.com",
+                "current-token",
+                None,
+            )
+            .expect("import current account");
+        let activated = adapter
+            .switch_account_transaction_with_roots(
+                &state_dir,
+                &current.id,
+                ActiveHomeAdoption::Strict,
+                roots.clone(),
+            )
+            .expect("activate current account");
+        state = activated.state().state.clone();
+        let before_profile = state
+            .active_profile
+            .clone()
+            .expect("current profile after activation");
+        let before_token = fs::read(antigravity_path.join("antigravity-oauth-token"))
+            .expect("active token after activation");
+
+        let imported = adapter
+            .import_or_update_token(&state_dir, &mut state, "new@example.com", "new-token", None)
+            .expect("import inactive account");
+        assert_ne!(imported.id, current.id);
+        assert_eq!(
+            state.current_account_id.as_deref(),
+            Some(current.id.as_str())
+        );
+        assert_eq!(state.active_profile, Some(before_profile));
+        assert!(
+            state
+                .accounts
+                .iter()
+                .any(|account| account.id == imported.id)
+        );
+        assert_eq!(
+            fs::read(antigravity_path.join("antigravity-oauth-token"))
+                .expect("active token after inactive import"),
+            before_token
+        );
+    }
+
+    #[test]
+    fn import_accepts_raw_portable_and_native_credentials() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let raw = temp.path().join("token.txt");
+        fs::write(&raw, "raw-token\n").expect("write raw token");
+        let raw_record = adapter
+            .import_auth_path(&state_dir, &mut State::default(), &raw)
+            .expect("import raw token");
+        assert!(raw_record.auth_path.ends_with("antigravity-oauth-token"));
+
+        let portable = temp.path().join("portable.json");
+        let portable_bytes = PortableCredential::oauth_access_token("portable-token")
+            .unwrap()
+            .to_json_string()
+            .unwrap();
+        fs::write(&portable, portable_bytes).expect("write portable credential");
+        let portable_record = adapter
+            .import_auth_path(&state_dir, &mut State::default(), &portable)
+            .expect("import portable credential");
+        assert!(
+            portable_record
+                .auth_path
+                .ends_with("antigravity-oauth-token")
+        );
+
+        let native = temp.path().join("authorized.json");
+        fs::write(
+            &native,
+            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://example.test/token","unknown":"keep"}"#,
+        )
+        .expect("write native credential");
+        let native_record = adapter
+            .import_auth_path(&state_dir, &mut State::default(), &native)
+            .expect("import native credential");
+        assert!(native_record.auth_path.ends_with("credentials.json"));
+        assert_eq!(native_record.refresh_token.as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn raw_import_then_authorized_merge_retains_refresh_and_unknown_fields() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+        let raw = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut state,
+                "user@example.com",
+                "raw-access",
+                None,
+            )
+            .expect("raw import");
+        let authorized_path = temp.path().join("authorized.json");
+        fs::write(
+            &authorized_path,
+            r#"{"type":"authorized_user","email":"user@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_uri":"https://example.test/token","unknown":"keep"}"#,
+        )
+        .expect("write authorized credential");
+        let merged = adapter
+            .import_auth_path(&state_dir, &mut state, &authorized_path)
+            .expect("authorized merge");
+        assert_eq!(raw.id, merged.id);
+        assert_eq!(state.accounts.len(), 1);
+        assert_eq!(merged.refresh_token.as_deref(), Some("refresh"));
+        let bytes = fs::read(
+            state_dir
+                .join("accounts")
+                .join(&merged.id)
+                .join("credentials.json"),
+        )
+        .expect("read merged credential");
+        let document: Value = serde_json::from_slice(&bytes).expect("parse merged credential");
+        assert_eq!(
+            document.get("access_token").and_then(Value::as_str),
+            Some("raw-access")
+        );
+        assert_eq!(
+            document.get("unknown").and_then(Value::as_str),
+            Some("keep")
+        );
+        let restarted = StateStore::read_from_path(&state_dir).expect("reload state after restart");
+        let persisted = restarted
+            .state
+            .accounts
+            .iter()
+            .find(|account| account.id == merged.id)
+            .expect("persisted merged account");
+        assert_eq!(persisted.id, merged.id);
+        let persisted_ref = restarted
+            .state
+            .credential_refs
+            .get(&merged.id)
+            .expect("persisted credential ref");
+        let persisted_credential = CredentialStore::new(&state_dir, &merged.id)
+            .expect("open persisted credential store")
+            .read(persisted_ref)
+            .expect("read persisted credential after restart");
+        assert_eq!(
+            persisted_credential.credential.refresh_token(),
+            Some("refresh")
+        );
+        let mut restarted_state = restarted.state.clone();
+        let resumed = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut restarted_state,
+                "user@example.com",
+                "raw-access",
+                None,
+            )
+            .expect("resume raw token import after restart");
+        assert_eq!(resumed.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn legacy_import_publishes_all_journals_before_sealed_migration_commit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let account_dir = state_dir.join("accounts").join("a-1");
+        fs::create_dir_all(&account_dir).expect("create legacy account directory");
+        fs::write(
+            account_dir.join("credentials.json"),
+            r#"{"type":"authorized_user","email":"legacy@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_uri":"https://example.test/token","access_token":"old-access","unknown":"keep"}"#,
+        )
+        .expect("write legacy credential");
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"accounts":[{"id":"a-1","email":"legacy@example.com","account_type":"oauth","oauth_token":"old-access"}],"usage_cache":{},"current_account_id":"a-1"}"#,
+        )
+        .expect("write legacy state");
+
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut caller_state = State::default();
+        let record = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut caller_state,
+                "legacy@example.com",
+                "new-access",
+                None,
+            )
+            .expect("legacy migration import");
+        assert_eq!(record.id, "a-1");
+        assert_eq!(caller_state.version, 2);
+        assert_eq!(caller_state.accounts.len(), 1);
+        assert_eq!(caller_state.current_account_id, None);
+        assert_eq!(caller_state.active_profile, None);
+        let disk = StateStore::read_from_path(&state_dir).expect("read migrated state");
+        assert_eq!(disk.revision.generation, RevisionGeneration::Current(1));
+        let bytes = fs::read(account_dir.join("credentials.json")).expect("read migrated doc");
+        let document: Value = serde_json::from_slice(&bytes).expect("parse migrated doc");
+        assert_eq!(
+            document.get("access_token").and_then(Value::as_str),
+            Some("new-access")
+        );
+        assert_eq!(
+            document.get("unknown").and_then(Value::as_str),
+            Some("keep")
+        );
+        assert_eq!(
+            document.get("refresh_token").and_then(Value::as_str),
+            Some("refresh")
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_migration_session_needs_no_new_credential() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let account_dir = state_dir.join("accounts").join("legacy-only");
+        fs::create_dir_all(&account_dir).expect("create legacy account directory");
+        fs::write(
+            account_dir.join("credentials.json"),
+            r#"{"type":"authorized_user","email":"legacy-only@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh-only","access_token":"old-access","token_uri":"https://example.test/token"}"#,
+        )
+        .expect("write legacy credential");
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"accounts":[{"id":"legacy-only","email":"legacy-only@example.com","account_type":"oauth","oauth_token":"old-access"}],"usage_cache":{},"current_account_id":"legacy-only"}"#,
+        )
+        .expect("write legacy state");
+
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut session = StateSession::open(&state_dir).expect("open legacy session");
+        let outcome = adapter
+            .migrate_legacy_state_transaction(&state_dir, &mut session)
+            .expect("migrate legacy state without import");
+        assert!(!outcome.recovery_pending());
+        assert_eq!(session.state().version, 2);
+        assert_eq!(session.state().current_account_id, None);
+        assert_eq!(session.state().active_profile, None);
+        assert_eq!(
+            session
+                .state()
+                .credential_refs
+                .get("legacy-only")
+                .map(|reference| reference.kind),
+            Some(CredentialRefKind::OauthAuthorizedUser)
+        );
+        let bytes = fs::read(account_dir.join("credentials.json"))
+            .expect("read migrated legacy credential");
+        let document: Value = serde_json::from_slice(&bytes).expect("parse migrated credential");
+        assert_eq!(
+            document.get("refresh_token").and_then(Value::as_str),
+            Some("refresh-only")
+        );
+        assert_eq!(
+            document.get("access_token").and_then(Value::as_str),
+            Some("old-access")
+        );
+    }
+
+    #[test]
+    fn import_rejects_blank_ambiguous_and_incomplete_credentials() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        for (name, bytes) in [
+            ("blank", b"   \n".as_slice()),
+            (
+                "ambiguous",
+                br#"{"api_key":"key","access_token":"other"}"#.as_slice(),
+            ),
+            (
+                "incomplete",
+                br#"{"type":"authorized_user","client_id":"c"}"#.as_slice(),
+            ),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, bytes).expect("write invalid credential");
+            assert!(
+                adapter
+                    .import_auth_path(&state_dir, &mut State::default(), &path)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn migration_reads_only_fixed_layout_and_folds_raw_access_token() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let account_dir = state_dir.join("accounts").join("a-1");
+        fs::create_dir_all(&account_dir).expect("create account dir");
+        fs::write(
+            account_dir.join("credentials.json"),
+            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://example.test/token"}"#,
+        )
+        .expect("write authorized credential");
+        fs::write(account_dir.join("antigravity-oauth-token"), "new-access")
+            .expect("write raw access token");
+
+        let outside = temp.path().join("outside.json");
+        fs::write(&outside, b"this must never be read").expect("write outside marker");
+        let state = State {
+            accounts: vec![AccountRecord {
+                id: "a-1".to_string(),
+                account_type: AccountType::OAuth,
+                auth_path: outside.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = MigrationPlanner::plan(&state_dir, &state).expect("plan migration");
+        assert_eq!(plan.entries.len(), 1);
+        let credential = &plan.entries[0].credential;
+        assert_eq!(credential.access_token(), Some("new-access"));
+        assert_eq!(credential.refresh_token(), Some("r"));
+        assert_eq!(
+            plan.entries[0].credential_ref.kind,
+            CredentialRefKind::OauthAuthorizedUser
+        );
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn migration_rejects_isolated_refresh_token() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let state = State {
+            accounts: vec![AccountRecord {
+                id: "a-1".to_string(),
+                account_type: AccountType::OAuth,
+                refresh_token: Some("refresh-only".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(MigrationPlanner::plan(&state_dir, &state).is_err());
+        assert!(!state_dir.exists());
+    }
+
+    #[test]
+    fn switch_transaction_covers_all_four_credential_targets_and_delete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(temp.path().join("ag")).expect("create antigravity root");
+        fs::create_dir_all(temp.path().join("gemini")).expect("create gemini root");
+        let antigravity_root =
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&temp.path().join("ag"))
+                .expect("normalize antigravity root");
+        let gemini_root =
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&temp.path().join("gemini"))
+                .expect("normalize gemini root");
+        let roots = (antigravity_root, gemini_root);
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+
+        let raw = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut state,
+                "raw@example.com",
+                "raw-switch-token",
+                None,
+            )
+            .expect("import raw account");
+        let authorized_path = temp.path().join("authorized.json");
+        fs::write(
+            &authorized_path,
+            r#"{"type":"authorized_user","email":"authorized@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","access_token":"authorized-access","token_uri":"https://example.test/token"}"#,
+        )
+        .expect("write authorized credential");
+        let authorized = adapter
+            .import_auth_path(&state_dir, &mut state, &authorized_path)
+            .expect("import authorized account");
+        let api = adapter
+            .import_or_update_api_key(
+                &state_dir,
+                &mut state,
+                "api-switch-key",
+                "api@example.com",
+                Some("project-a"),
+            )
+            .expect("import api account");
+        let vertex_path = temp.path().join("vertex.json");
+        fs::write(
+            &vertex_path,
+            r#"{"type":"service_account","project_id":"vertex-project","private_key_id":"key-id","private_key":"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n","client_email":"vertex@example.com","client_id":"123","auth_uri":"https://accounts.example.test/o/oauth2/auth","token_uri":"https://oauth2.example.test/token","auth_provider_x509_cert_url":"https://www.example.test/cert","client_x509_cert_url":"https://www.example.test/client-cert"}"#,
+        )
+        .expect("write vertex credential");
+        let vertex = adapter
+            .import_auth_path(&state_dir, &mut state, &vertex_path)
+            .expect("import vertex account");
+
+        for (account, expected_kind) in [
+            (&raw, CredentialRefKind::OauthAccessToken),
+            (&authorized, CredentialRefKind::OauthAuthorizedUser),
+            (&api, CredentialRefKind::ApiKey),
+            (&vertex, CredentialRefKind::VertexServiceAccount),
+        ] {
+            assert_eq!(
+                state
+                    .credential_refs
+                    .get(&account.id)
+                    .map(|reference| reference.kind),
+                Some(expected_kind)
+            );
+        }
+
+        let matrix = [&raw, &authorized, &api, &vertex];
+        for from in matrix {
+            let activated = adapter
+                .switch_account_transaction_with_roots(
+                    &state_dir,
+                    &from.id,
+                    ActiveHomeAdoption::Strict,
+                    roots.clone(),
+                )
+                .expect("activate matrix source");
+            assert!(!activated.recovery_pending());
+            state = activated.state().state.clone();
+            assert_active_layout(&state, from, &roots);
+            for to in matrix {
+                let outcome = adapter
+                    .switch_account_transaction_with_roots(
+                        &state_dir,
+                        &to.id,
+                        ActiveHomeAdoption::Strict,
+                        roots.clone(),
+                    )
+                    .expect("switch account matrix cell");
+                assert!(!outcome.recovery_pending());
+                state = outcome.state().state.clone();
+                assert_eq!(state.current_account_id.as_deref(), Some(to.id.as_str()));
+                assert_eq!(
+                    state
+                        .active_profile
+                        .as_ref()
+                        .map(|profile| &profile.account_id),
+                    Some(&to.id)
+                );
+                assert_active_layout(&state, to, &roots);
+            }
+        }
+
+        let _raw_active = adapter
+            .switch_account_transaction_with_roots(
+                &state_dir,
+                &raw.id,
+                ActiveHomeAdoption::Strict,
+                roots.clone(),
+            )
+            .expect("activate raw before non-current delete");
+        let noncurrent_delete = adapter
+            .remove_account_transaction_with_roots(&state_dir, &api.id, roots.clone())
+            .expect("delete non-current account");
+        assert!(!noncurrent_delete.recovery_pending());
+        state = noncurrent_delete.state().state.clone();
+        assert!(!state.accounts.iter().any(|account| account.id == api.id));
+        assert_eq!(state.current_account_id.as_deref(), Some(raw.id.as_str()));
+
+        let raw_delete = adapter
+            .remove_account_transaction_with_roots(&state_dir, &raw.id, roots.clone())
+            .expect("delete current raw account");
+        assert!(!raw_delete.recovery_pending());
+        state = raw_delete.state().state.clone();
+        assert_eq!(state.current_account_id, None);
+        assert_eq!(state.active_profile, None);
+        let active_token = temp.path().join("ag").join("antigravity-oauth-token");
+        let active_document = temp.path().join("gemini").join("oauth_creds.json");
+        assert!(!active_token.exists());
+        assert!(!active_document.exists());
+
+        let _auth_active = adapter
+            .switch_account_transaction_with_roots(
+                &state_dir,
+                &authorized.id,
+                ActiveHomeAdoption::Strict,
+                roots.clone(),
+            )
+            .expect("activate authorized before delete");
+        let auth_delete = adapter
+            .remove_account_transaction_with_roots(&state_dir, &authorized.id, roots.clone())
+            .expect("delete current authorized account");
+        assert!(!auth_delete.recovery_pending());
+        state = auth_delete.state().state.clone();
+        assert_eq!(state.current_account_id, None);
+        assert_eq!(state.active_profile, None);
+        assert!(!active_token.exists());
+        assert!(!active_document.exists());
+
+        let _vertex_active = adapter
+            .switch_account_transaction_with_roots(
+                &state_dir,
+                &vertex.id,
+                ActiveHomeAdoption::Strict,
+                roots.clone(),
+            )
+            .expect("activate vertex before delete");
+        let vertex_delete = adapter
+            .remove_account_transaction_with_roots(&state_dir, &vertex.id, roots)
+            .expect("delete current vertex account");
+        assert!(!vertex_delete.recovery_pending());
+        state = vertex_delete.state().state.clone();
+        assert_eq!(state.current_account_id, None);
+        assert_eq!(state.active_profile, None);
+        assert!(!state.accounts.iter().any(|account| account.id == vertex.id));
+        assert!(!active_token.exists());
+        assert!(!active_document.exists());
+    }
+
+    #[test]
+    fn switch_waits_for_external_credential_lock_and_succeeds_after_release() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let antigravity_path = temp.path().join("ag");
+        let gemini_path = temp.path().join("gemini");
+        fs::create_dir_all(&antigravity_path).expect("create antigravity root");
+        fs::create_dir_all(&gemini_path).expect("create gemini root");
+        let roots = (
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&antigravity_path)
+                .expect("normalize antigravity root"),
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&gemini_path)
+                .expect("normalize gemini root"),
+        );
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+        let account = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut state,
+                "lease@example.com",
+                "lease-original-token",
+                None,
+            )
+            .expect("import account");
+        let account_dir = state_dir.join("accounts").join(&account.id);
+        let lock_path = account_dir.join(".sagy-credential.lock");
+
+        let external_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open credential lock");
+        external_lock
+            .lock_exclusive()
+            .expect("hold external credential lock");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let switch_state_dir = state_dir.clone();
+        let switch_account_id = account.id.clone();
+        let switch_roots = roots.clone();
+        let switch_thread = thread::spawn(move || {
+            started_tx.send(()).expect("signal switch start");
+            let result = adapter.switch_account_transaction_with_roots(
+                &switch_state_dir,
+                &switch_account_id,
+                ActiveHomeAdoption::Strict,
+                switch_roots,
+            );
+            done_tx.send(result.is_ok()).expect("signal switch result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("switch thread started");
+
+        // The switch must still be waiting on the account credential lease;
+        // state and both active-home slots therefore remain untouched.
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            StateStore::read_from_path(&state_dir)
+                .expect("read unchanged state")
+                .state
+                .current_account_id,
+            None
+        );
+        assert!(!antigravity_path.join("antigravity-oauth-token").exists());
+        assert!(!gemini_path.join("oauth_creds.json").exists());
+
+        external_lock.unlock().expect("release credential lock");
+        drop(external_lock);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("switch result")
+        );
+        switch_thread.join().expect("join switch thread");
+
+        let activated = StateStore::read_from_path(&state_dir).expect("read final state");
+        assert_eq!(
+            activated.state.current_account_id.as_deref(),
+            Some(account.id.as_str())
+        );
+        assert_eq!(
+            fs::read(antigravity_path.join("antigravity-oauth-token"))
+                .expect("read activated token"),
+            b"lease-original-token"
+        );
+        assert!(!gemini_path.join("oauth_creds.json").exists());
+    }
+
+    #[test]
+    fn switch_rejects_replaced_credential_after_lease_release() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let antigravity_path = temp.path().join("ag");
+        let gemini_path = temp.path().join("gemini");
+        fs::create_dir_all(&antigravity_path).expect("create antigravity root");
+        fs::create_dir_all(&gemini_path).expect("create gemini root");
+        let roots = (
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&antigravity_path)
+                .expect("normalize antigravity root"),
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&gemini_path)
+                .expect("normalize gemini root"),
+        );
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+        let account = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut state,
+                "replacement@example.com",
+                "replacement-original-token",
+                None,
+            )
+            .expect("import account");
+        let account_dir = state_dir.join("accounts").join(&account.id);
+        let lock_path = account_dir.join(".sagy-credential.lock");
+        let token_path = account_dir.join("antigravity-oauth-token");
+        let external_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open credential lock");
+        external_lock
+            .lock_exclusive()
+            .expect("hold external credential lock");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let switch_state_dir = state_dir.clone();
+        let switch_account_id = account.id.clone();
+        let switch_roots = roots.clone();
+        let switch_thread = thread::spawn(move || {
+            started_tx.send(()).expect("signal switch start");
+            let result = adapter.switch_account_transaction_with_roots(
+                &switch_state_dir,
+                &switch_account_id,
+                ActiveHomeAdoption::Strict,
+                switch_roots,
+            );
+            done_tx.send(result.is_ok()).expect("signal switch result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("switch thread started");
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            StateStore::read_from_path(&state_dir)
+                .expect("read unchanged state")
+                .state
+                .current_account_id,
+            None
+        );
+        assert!(!antigravity_path.join("antigravity-oauth-token").exists());
+        assert!(!gemini_path.join("oauth_creds.json").exists());
+
+        // An external writer that ignores the lock cannot make a different
+        // valid material satisfy the sealed State credential reference.
+        fs::write(&token_path, b"replacement-new-token").expect("replace credential");
+        external_lock.unlock().expect("release credential lock");
+        drop(external_lock);
+        assert!(
+            !done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("switch result")
+        );
+        switch_thread.join().expect("join switch thread");
+
+        let unchanged = StateStore::read_from_path(&state_dir).expect("read final state");
+        assert_eq!(unchanged.state.current_account_id, None);
+        assert!(unchanged.state.active_profile.is_none());
+        assert!(!antigravity_path.join("antigravity-oauth-token").exists());
+        assert!(!gemini_path.join("oauth_creds.json").exists());
+    }
+
+    #[test]
+    fn strict_switch_rejects_unmanaged_first_home_and_adopt_is_explicit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let ag_path = temp.path().join("ag");
+        let gemini_path = temp.path().join("gemini");
+        fs::create_dir_all(&ag_path).expect("create antigravity root");
+        fs::create_dir_all(&gemini_path).expect("create gemini root");
+        let roots = (
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&ag_path)
+                .expect("normalize antigravity root"),
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&gemini_path)
+                .expect("normalize gemini root"),
+        );
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+        let account = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut state,
+                "adopt@example.com",
+                "adopt-token",
+                None,
+            )
+            .expect("import adopt account");
+        fs::write(ag_path.join("antigravity-oauth-token"), b"unmanaged-token")
+            .expect("write unmanaged token");
+        assert!(
+            adapter
+                .switch_account_transaction_with_roots(
+                    &state_dir,
+                    &account.id,
+                    ActiveHomeAdoption::Strict,
+                    roots.clone(),
+                )
+                .is_err()
+        );
+        assert_eq!(state.current_account_id, None);
+        assert_eq!(
+            fs::read(ag_path.join("antigravity-oauth-token")).expect("read unmanaged token"),
+            b"unmanaged-token"
+        );
+
+        // Replacing the unmanaged slot with exact target material permits an
+        // explicit adopt without taking ownership of another layout.
+        fs::write(ag_path.join("antigravity-oauth-token"), b"adopt-token")
+            .expect("write adoptable token");
+        let adopted = adapter
+            .switch_account_transaction_with_roots(
+                &state_dir,
+                &account.id,
+                ActiveHomeAdoption::Adopt,
+                roots,
+            )
+            .expect("explicit adopt");
+        assert_eq!(
+            adopted.state().state.current_account_id.as_deref(),
+            Some(account.id.as_str())
+        );
+    }
+
+    fn assert_active_layout(
+        state: &State,
+        account: &AccountRecord,
+        roots: &(
+            crate::core::atomic_io::NormalizedStoreRoot,
+            crate::core::atomic_io::NormalizedStoreRoot,
+        ),
+    ) {
+        let profile = state
+            .active_profile
+            .as_ref()
+            .expect("matrix switch has active profile");
+        assert_eq!(profile.account_id, account.id);
+        let token_path = roots.0.as_path().join("antigravity-oauth-token");
+        let document_path = roots.1.as_path().join("oauth_creds.json");
+        let token = fs::read(&token_path).ok();
+        let document = fs::read(&document_path).ok();
+        match state
+            .credential_refs
+            .get(&account.id)
+            .expect("matrix account ref")
+            .kind
+        {
+            CredentialRefKind::OauthAccessToken => {
+                let bytes = token.expect("raw target token slot");
+                assert!(document.is_none(), "raw target must clear document slot");
+                assert_eq!(
+                    profile.managed_layout.antigravity_token,
+                    SlotState::Exact {
+                        sha256: digest_bytes(&bytes)
+                    }
+                );
+                assert!(matches!(
+                    profile.managed_layout.gemini_authorized_user,
+                    SlotState::Absent
+                ));
+            }
+            CredentialRefKind::OauthAuthorizedUser => {
+                let bytes = document.expect("authorized target document slot");
+                assert!(token.is_none(), "authorized target must clear token slot");
+                assert_eq!(
+                    profile.managed_layout.gemini_authorized_user,
+                    SlotState::Exact {
+                        sha256: digest_bytes(&bytes)
+                    }
+                );
+                assert!(matches!(
+                    profile.managed_layout.antigravity_token,
+                    SlotState::Absent
+                ));
+            }
+            CredentialRefKind::ApiKey | CredentialRefKind::VertexServiceAccount => {
+                assert!(token.is_none(), "non-OAuth target must clear token slot");
+                assert!(
+                    document.is_none(),
+                    "non-OAuth target must clear document slot"
+                );
+                assert_eq!(profile.managed_layout, ManagedLayout::default());
+            }
+        }
+    }
+
+    fn digest_bytes(bytes: &[u8]) -> String {
+        let mut digest = Sha256::new();
+        digest.update(bytes);
+        format!("{:x}", digest.finalize())
+    }
+
+    #[test]
+    fn active_home_restart_recovery_rolls_back_precommit_and_finalizes_postcommit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(temp.path().join("ag")).expect("create antigravity root");
+        fs::create_dir_all(temp.path().join("gemini")).expect("create gemini root");
+        let antigravity_root =
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&temp.path().join("ag"))
+                .expect("normalize antigravity root");
+        let gemini_root =
+            crate::core::atomic_io::NormalizedStoreRoot::normalize(&temp.path().join("gemini"))
+                .expect("normalize gemini root");
+        let roots = (antigravity_root, gemini_root);
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut state = State::default();
+        let account = adapter
+            .import_or_update_token(
+                &state_dir,
+                &mut state,
+                "recovery@example.com",
+                "recovery-token",
+                None,
+            )
+            .expect("import recovery account");
+        let reference = state
+            .credential_refs
+            .get(&account.id)
+            .cloned()
+            .expect("recovery credential ref");
+        let stored = CredentialStore::new(&state_dir, &account.id)
+            .expect("open recovery credential store")
+            .read(&reference)
+            .expect("read recovery credential");
+        let profile = active_profile_for_reference(
+            &account.id,
+            &reference,
+            &stored.material_digest,
+            &roots.0,
+            &roots.1,
+        );
+
+        // Publish without the State commit. Restart recovery must use the
+        // current State proof and restore the before layout.
+        let store = StateStore::open(&state_dir).expect("open state store");
+        let snapshot = store.read().expect("read state");
+        store
+            .with_locked_exact(&snapshot.revision, |transaction| {
+                let permit = transaction
+                    .active_home_mutation_permit_with_ref(
+                        Some(profile.clone()),
+                        Some(reference.clone()),
+                    )
+                    .map_err(anyhow::Error::new)
+                    .map_err(StateStoreError::Invalid)?;
+                let home_store = ActiveHomeStore::from_permit_with_roots(
+                    permit,
+                    roots.0.clone(),
+                    roots.1.clone(),
+                )
+                .map_err(StateStoreError::Invalid)?;
+                let prepared =
+                    prepare_active_home(home_store, Uuid::new_v4(), ActiveHomeAdoption::Strict)
+                        .map_err(StateStoreError::Invalid)?;
+                let _published = publish_active_home(prepared).map_err(StateStoreError::Invalid)?;
+                Ok(())
+            })
+            .expect("publish precommit active-home journal");
+        assert!(roots.0.as_path().join("antigravity-oauth-token").exists());
+
+        let mut recovery_session = StateSession::open(&state_dir).expect("open recovery session");
+        recover_active_home_journals(&state_dir, &mut recovery_session, Some(roots.clone()))
+            .expect("rollback precommit active-home journal");
+        assert!(!roots.0.as_path().join("antigravity-oauth-token").exists());
+        assert!(!active_journal_exists(&state_dir, &account.id));
+
+        // Commit a second published journal but deliberately skip finalize.
+        let store = StateStore::open(&state_dir).expect("reopen state store");
+        let snapshot = store.read().expect("read rollback state");
+        store
+            .with_locked_exact(&snapshot.revision, |transaction| {
+                let permit = transaction
+                    .active_home_mutation_permit_with_ref(
+                        Some(profile.clone()),
+                        Some(reference.clone()),
+                    )
+                    .map_err(anyhow::Error::new)
+                    .map_err(StateStoreError::Invalid)?;
+                let home_store = ActiveHomeStore::from_permit_with_roots(
+                    permit,
+                    roots.0.clone(),
+                    roots.1.clone(),
+                )
+                .map_err(StateStoreError::Invalid)?;
+                let prepared =
+                    prepare_active_home(home_store, Uuid::new_v4(), ActiveHomeAdoption::Strict)
+                        .map_err(StateStoreError::Invalid)?;
+                let published = publish_active_home(prepared).map_err(StateStoreError::Invalid)?;
+                let proof = published
+                    .journal_proof()
+                    .map_err(StateStoreError::Invalid)?;
+                let mut candidate = transaction.snapshot()?.state;
+                candidate.current_account_id = Some(account.id.clone());
+                candidate.active_profile = Some(profile.clone());
+                let _receipt = transaction.commit_coordinated_with_active(
+                    &candidate,
+                    Vec::new(),
+                    Some(proof),
+                )?;
+                // Simulate process death before native finalize by dropping
+                // the opaque published transaction after the State commit.
+                drop(published);
+                Ok(())
+            })
+            .expect("commit postcommit active-home journal");
+        assert!(active_journal_exists(&state_dir, &account.id));
+        let mut recovery_session = StateSession::open(&state_dir).expect("open final session");
+        recover_active_home_journals(&state_dir, &mut recovery_session, Some(roots.clone()))
+            .expect("finalize postcommit active-home journal");
+        assert!(roots.0.as_path().join("antigravity-oauth-token").exists());
+        assert!(!active_journal_exists(&state_dir, &account.id));
+        assert_eq!(
+            recovery_session.state().current_account_id.as_deref(),
+            Some(account.id.as_str())
+        );
+    }
+
+    fn active_journal_exists(state_dir: &Path, account_id: &str) -> bool {
+        fs::read_dir(state_dir.join("accounts").join(account_id))
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".sagy-active-home-")
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn restart_recovery_scans_new_account_not_yet_in_state() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let store = StateStore::open(&state_dir).expect("open state store");
+        let missing = store.read().expect("read missing state");
+        assert!(matches!(missing.migration, MigrationStatus::Missing));
+
+        // Simulate the crash window after credential publish and before the
+        // new account has entered state.json.  The published transaction is
+        // intentionally dropped with its journal/evidence still present.
+        store
+            .with_locked_exact(&missing.revision, |transaction| {
+                let permit = transaction.credential_mutation_permit("new-account")?;
+                let credential_store = CredentialStore::from_permit(permit)
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+                let credential = PortableCredential::oauth_access_token("crash-token")
+                    .map_err(anyhow::Error::new)
+                    .map_err(StateStoreError::Invalid)?;
+                let prepared = credential_store
+                    .stage(Uuid::new_v4(), &credential)
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+                let _published = credential_store
+                    .publish(prepared)
+                    .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
+                Ok(())
+            })
+            .expect("publish before simulated crash");
+
+        let account_dir = state_dir.join("accounts").join("new-account");
+        assert!(account_dir.join("antigravity-oauth-token").exists());
+        assert!(fs::read_dir(&account_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".journal")
+        }));
+
+        recover_credential_journals(&state_dir, &missing).expect("restart recovery");
+        assert!(!account_dir.join("antigravity-oauth-token").exists());
+        assert!(!fs::read_dir(&account_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".journal")
+        }));
     }
 }

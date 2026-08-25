@@ -39,19 +39,21 @@ impl super::AntigravityAdapter {
 
             let usage = state.usage_cache.get(&account.id);
             let status_str = if let Some(u) = usage {
-                if let Some(cooldown) = u.cooldown_until {
+                if let Some(cooldown) = u.cooldown_until() {
                     if now < cooldown {
                         format!("Cooldown ({}s)", cooldown - now)
                     } else {
-                        u.status.clone()
+                        u.health.to_string()
                     }
-                } else if u.needs_relogin {
+                } else if u.needs_relogin() {
                     "Relogin Required".to_string()
                 } else {
-                    u.status.clone()
+                    u.health.to_string()
                 }
             } else {
-                "Ready".to_string()
+                // 缺少探测记录不是成功证据；UI 必须与 eligibility 的 fail-closed
+                // 语义一致，避免把尚未验证的凭据展示成 Ready。
+                "Unverified".to_string()
             };
 
             let quota_str = usage

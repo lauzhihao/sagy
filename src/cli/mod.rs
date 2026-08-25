@@ -1,12 +1,18 @@
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 
-use crate::adapters::antigravity::AntigravityAdapter;
+use crate::adapters::antigravity::account::{ActiveHomeAdoption, MutationResult};
+use crate::adapters::antigravity::{AntigravityAdapter, LaunchDiagnostic, ProcessTermination};
+use crate::core::atomic_io::NormalizedStoreRoot;
+use crate::core::health::{ProbeOutcome, ProbeSubject, reduce_usage_observed};
+use crate::core::state::{AccountRecord, CredentialRef, CredentialRefKind};
+use crate::core::state_store::{MigrationStatus, StateSession};
 use crate::core::storage;
 use crate::core::ui;
 use crate::core::update;
@@ -15,6 +21,7 @@ pub mod args;
 pub mod help;
 pub mod launch;
 pub mod repo_sync;
+pub mod router;
 
 pub use args::{
     AddArgs, AutoArgs, ImportAuthArgs, LaunchArgs, LoginArgs, RepoSyncArgs, RmArgs, UpdateArgs,
@@ -22,9 +29,9 @@ pub use args::{
 };
 
 use args::resolve_login_mode;
-use help::{is_known_subcmd, render_help, requested_help_topic};
-use launch::{ensure_launch_account, print_selection};
+use launch::{print_selection, select_launch_account};
 use repo_sync::resolve_repo_sync_repo;
+use router::{Route, route};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,100 +70,32 @@ pub enum Command {
 impl Cli {
     pub fn parse_args() -> Self {
         let raw_args = env::args_os().collect::<Vec<_>>();
-        if let Some(topic) = requested_help_topic(&raw_args) {
-            print!("{}", render_help(topic));
-            std::process::exit(0);
-        }
-
-        // Handle --version / -V explicitly
-        if raw_args.len() > 1 {
-            let first = raw_args[1].to_string_lossy();
-            if first == "--version" || first == "-V" {
-                println!("sagy {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-        }
-
-        let first_subcmd = find_first_subcmd(&raw_args);
-        let has_known_subcmd = first_subcmd
-            .as_deref()
-            .map(is_known_subcmd)
-            .unwrap_or(false);
-
-        // If no explicit subcommand is given, rewrite flags directly to launch
-        if raw_args.len() > 1 && !has_known_subcmd {
-            let rewritten = rewrite_launch_args(&raw_args);
-            return Self::parse_from(rewritten);
-        }
-
-        Self::parse()
-    }
-}
-
-fn find_first_subcmd(raw_args: &[OsString]) -> Option<String> {
-    let mut iter = raw_args.iter().skip(1);
-    while let Some(arg) = iter.next() {
-        let s = arg.to_string_lossy();
-        if s == "--state-dir" {
-            iter.next();
-            continue;
-        }
-        if s.starts_with("--state-dir=") {
-            continue;
-        }
-        if !s.starts_with('-') {
-            return Some(s.to_string());
+        match route(&raw_args) {
+            Route::Clap(args) => Self::parse_from(args),
+            Route::Passthrough { state_dir, args } => Self {
+                state_dir,
+                command: Some(Command::Passthrough(args)),
+            },
         }
     }
-    None
-}
-
-fn is_sagy_launch_flag(s: &str) -> bool {
-    matches!(
-        s,
-        "--dry-run" | "--no-resume" | "--no-launch" | "--no-import-known"
-    )
-}
-
-fn rewrite_launch_args(raw_args: &[OsString]) -> Vec<OsString> {
-    let mut rewritten = Vec::new();
-    rewritten.push(OsString::from("sagy"));
-
-    let mut launch_flags = Vec::new();
-    let mut extra_args = Vec::new();
-    let mut iter = raw_args.iter().skip(1);
-
-    while let Some(arg) = iter.next() {
-        let s = arg.to_string_lossy();
-        if s == "--state-dir" {
-            rewritten.push(arg.clone());
-            if let Some(val) = iter.next() {
-                rewritten.push(val.clone());
-            }
-        } else if s.starts_with("--state-dir=") {
-            rewritten.push(arg.clone());
-        } else if is_sagy_launch_flag(&s) {
-            launch_flags.push(arg.clone());
-        } else {
-            extra_args.push(arg.clone());
-        }
-    }
-
-    rewritten.push(OsString::from("launch"));
-    rewritten.extend(launch_flags);
-    if !extra_args.is_empty() {
-        rewritten.push(OsString::from("--"));
-        rewritten.extend(extra_args);
-    }
-
-    rewritten
 }
 
 pub fn run(cli: Cli) -> Result<i32> {
+    run_with_update(cli, |state_dir, force| {
+        update::self_update(state_dir, force)
+    })
+}
+
+fn run_with_update<F>(cli: Cli, update_fn: F) -> Result<i32>
+where
+    F: Fn(&Path, bool) -> Result<update::UpdateOutcome>,
+{
     let ui = ui::messages();
     let adapter = AntigravityAdapter;
-    let state_dir = storage::resolve_state_dir(cli.state_dir.as_deref())?;
-    let mut state = storage::load_state(&state_dir)?;
+    let requested_state_dir = storage::resolve_state_dir(cli.state_dir.as_deref())?;
+    let state_dir = NormalizedStoreRoot::normalize(&requested_state_dir)?
+        .as_path()
+        .to_path_buf();
     let command = cli.command.unwrap_or(Command::Launch(LaunchArgs {
         no_import_known: false,
         dry_run: false,
@@ -165,179 +104,150 @@ pub fn run(cli: Cli) -> Result<i32> {
         extra_args: Vec::new(),
     }));
 
-    let exit_code = match command {
-        Command::Launch(args) => {
-            match ensure_launch_account(
-                &adapter,
-                &state_dir,
-                &mut state,
-                args.no_import_known,
-                !args.dry_run,
-            )? {
-                Some((account, usage, _pulled)) => {
-                    if args.dry_run {
-                        print_selection(ui.selection_would_select(), &account, &usage);
-                        storage::save_state(&state_dir, &state)?;
-                        0
-                    } else {
-                        let now = Utc::now().timestamp();
-                        if let Some(pos) = state.accounts.iter().position(|a| a.id == account.id) {
-                            state.accounts[pos].last_used_at = Some(now);
-                        }
-                        print_selection(ui.selection_switched(), &account, &usage);
-                        storage::save_state(&state_dir, &state)?;
+    // Update 只依赖 updater 自身，不应被损坏的账号 state 阻断恢复路径。
+    if let Command::Update(args) = &command {
+        return run_update(&state_dir, args.force, ui, &update_fn);
+    }
 
-                        if args.no_launch {
-                            0
-                        } else {
-                            let code = adapter.launch_agy(
-                                &state_dir,
-                                &account,
-                                &args.extra_args,
-                                !args.no_resume,
-                            )?;
-
-                            if code != 0 {
-                                adapter
-                                    .refresh_account_usage(&state_dir, &mut state, &account, true);
-                                storage::save_state(&state_dir, &state)?;
-                            }
-
-                            code
-                        }
-                    }
-                }
-                None => {
-                    println!("{}", ui.no_usable_account_hint());
-                    storage::save_state(&state_dir, &state)?;
-                    1
-                }
-            }
-        }
-        Command::Auto(args) => {
-            match ensure_launch_account(
-                &adapter,
-                &state_dir,
-                &mut state,
-                args.no_import_known,
-                !args.dry_run,
-            )? {
-                Some((account, usage, _pulled)) => {
-                    if args.dry_run {
-                        print_selection(ui.selection_would_select(), &account, &usage);
-                    } else {
-                        let now = Utc::now().timestamp();
-                        if let Some(pos) = state.accounts.iter().position(|a| a.id == account.id) {
-                            state.accounts[pos].last_used_at = Some(now);
-                        }
-                        print_selection(ui.selection_switched(), &account, &usage);
-                    }
-                    storage::save_state(&state_dir, &state)?;
-                    0
-                }
-                None => {
-                    println!("{}", ui.no_usable_account_hint());
-                    storage::save_state(&state_dir, &state)?;
-                    1
-                }
-            }
-        }
+    let mut session = StateSession::open(&state_dir)?;
+    match command {
+        Command::Launch(args) => run_launch(
+            &adapter,
+            &state_dir,
+            &mut session,
+            &args.extra_args,
+            !args.no_resume,
+            args.no_import_known,
+            args.dry_run,
+            args.no_launch,
+            ui,
+        ),
+        Command::Auto(args) => run_auto(
+            &adapter,
+            &state_dir,
+            &mut session,
+            args.no_import_known,
+            args.dry_run,
+            ui,
+        ),
         Command::Login(args) => {
-            let mode = resolve_login_mode(&args)?;
-            let record = adapter.run_login_mode(&state_dir, &mut state, mode)?;
-            let usage = adapter.refresh_account_usage(&state_dir, &mut state, &record, true);
-            println!("{}", ui.added_account(&record.email));
-            adapter.switch_account(&record)?;
-            state.current_account_id = Some(record.id.clone());
-            let now = Utc::now().timestamp();
-            if let Some(pos) = state.accounts.iter().position(|a| a.id == record.id) {
-                state.accounts[pos].last_used_at = Some(now);
+            if let Some(code) = prepare_existing_session(&adapter, &state_dir, &mut session)? {
+                return Ok(code);
             }
+            let outcome = adapter.run_login_mode_session(
+                &state_dir,
+                &mut session,
+                resolve_login_mode(&args)?,
+            )?;
+            let Some(record) = finalized_value(outcome) else {
+                return Ok(2);
+            };
+            let usage = refresh_one_and_commit(&adapter, &state_dir, &mut session, &record, true)?;
+            println!("{}", ui.added_account(&record.email));
+            let outcome = adapter.switch_account_session(
+                &state_dir,
+                &mut session,
+                &record.id,
+                ActiveHomeAdoption::Strict,
+            )?;
+            let Some(record) = finalized_value(outcome) else {
+                return Ok(2);
+            };
             print_selection(ui.selection_switched(), &record, &usage);
-            storage::save_state(&state_dir, &state)?;
-            0
+            Ok(0)
         }
         Command::Add(args) => {
-            let mode = resolve_login_mode(&args.login)?;
-            let record = adapter.run_login_mode(&state_dir, &mut state, mode)?;
-            let usage = adapter.refresh_account_usage(&state_dir, &mut state, &record, true);
+            if let Some(code) = prepare_existing_session(&adapter, &state_dir, &mut session)? {
+                return Ok(code);
+            }
+            let outcome = adapter.run_login_mode_session(
+                &state_dir,
+                &mut session,
+                resolve_login_mode(&args.login)?,
+            )?;
+            let Some(record) = finalized_value(outcome) else {
+                return Ok(2);
+            };
+            let usage = refresh_one_and_commit(&adapter, &state_dir, &mut session, &record, true)?;
             println!("{}", ui.added_account(&record.email));
             if args.switch {
-                adapter.switch_account(&record)?;
-                state.current_account_id = Some(record.id.clone());
-                let now = Utc::now().timestamp();
-                if let Some(pos) = state.accounts.iter().position(|a| a.id == record.id) {
-                    state.accounts[pos].last_used_at = Some(now);
-                }
+                let outcome = adapter.switch_account_session(
+                    &state_dir,
+                    &mut session,
+                    &record.id,
+                    ActiveHomeAdoption::Strict,
+                )?;
+                let Some(record) = finalized_value(outcome) else {
+                    return Ok(2);
+                };
                 print_selection(ui.selection_switched(), &record, &usage);
             }
-            storage::save_state(&state_dir, &state)?;
-            0
+            Ok(0)
         }
         Command::Use(args) => {
-            let _ = adapter.import_known_sources(&state_dir, &mut state);
-            let Some(record) = adapter.find_account_by_email(&state, &args.email).cloned() else {
+            if let Some(code) = ensure_current_session(&adapter, &state_dir, &mut session, false)? {
+                return Ok(code);
+            }
+            let Some(record) = adapter
+                .find_account_by_email(session.state(), &args.email)
+                .cloned()
+            else {
                 println!("{}", ui.unknown_account(&args.email));
-                storage::save_state(&state_dir, &state)?;
                 return Ok(1);
             };
-            adapter.switch_account(&record)?;
-            state.current_account_id = Some(record.id.clone());
-            let now = Utc::now().timestamp();
-            if let Some(pos) = state.accounts.iter().position(|a| a.id == record.id) {
-                state.accounts[pos].last_used_at = Some(now);
-            }
-            let usage = state
+            let outcome = adapter.switch_account_session(
+                &state_dir,
+                &mut session,
+                &record.id,
+                ActiveHomeAdoption::Strict,
+            )?;
+            let Some(record) = finalized_value(outcome) else {
+                return Ok(2);
+            };
+            let usage = session
+                .state()
                 .usage_cache
                 .get(&record.id)
                 .cloned()
                 .unwrap_or_default();
             print_selection(ui.selection_switched(), &record, &usage);
-            storage::save_state(&state_dir, &state)?;
-            0
+            Ok(0)
         }
         Command::Rm(args) => {
-            let _ = adapter.import_known_sources(&state_dir, &mut state);
+            if let Some(code) = ensure_current_session(&adapter, &state_dir, &mut session, false)? {
+                return Ok(code);
+            }
             let Some((id, email)) = adapter
-                .find_account_by_email(&state, &args.email)
+                .find_account_by_email(session.state(), &args.email)
                 .map(|record| (record.id.clone(), record.email.clone()))
             else {
                 println!("{}", ui.unknown_account(&args.email));
-                storage::save_state(&state_dir, &state)?;
                 return Ok(1);
             };
             if !args.assume_yes {
-                use std::io::{self, IsTerminal, Write};
                 if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                     println!("{}", ui.rm_requires_tty());
                     return Ok(1);
                 }
-                loop {
-                    print!("{}", ui.confirm_rm(&email));
-                    let _ = io::stdout().flush();
-                    let mut line = String::new();
-                    io::stdin().read_line(&mut line)?;
-                    let trimmed = line.trim().to_ascii_lowercase();
-                    if trimmed == "y" || trimmed == "yes" {
-                        break;
-                    } else if trimmed == "n" || trimmed == "no" || trimmed.is_empty() {
-                        println!("{}", ui.rm_cancelled());
-                        return Ok(0);
-                    } else {
-                        println!("{}", ui.invalid_yes_no());
-                    }
+                if !confirm_remove(&email, ui)? {
+                    return Ok(0);
                 }
             }
-            adapter.remove_account(&state_dir, &mut state, &id)?;
-            storage::save_state(&state_dir, &state)?;
+            let outcome = adapter.remove_account_session(&state_dir, &mut session, &id)?;
+            if finalized_value(outcome).is_none() {
+                return Ok(2);
+            }
             println!("{}", ui.removed_account(&email));
-            0
+            Ok(0)
         }
         Command::Push(args) => {
+            if let Some(code) = ensure_current_session(&adapter, &state_dir, &mut session, false)? {
+                return Ok(code);
+            }
             let repo = resolve_repo_sync_repo(&state_dir, args.repo.as_deref())?;
-            let outcome = adapter.push_account_pool(
+            let outcome = adapter.push_account_pool_v2(
                 &state_dir,
-                &state,
+                &mut session,
                 &repo,
                 crate::adapters::antigravity::PushOptions {
                     bundle_dir: args.path.as_deref(),
@@ -354,123 +264,468 @@ pub fn run(cli: Cli) -> Result<i32> {
             } else {
                 println!("{}", ui.repo_push_no_changes(&repo));
             }
-            0
+            Ok(0)
         }
         Command::Pull(args) => {
+            if let Some(code) = prepare_existing_session(&adapter, &state_dir, &mut session)? {
+                return Ok(code);
+            }
             let repo = resolve_repo_sync_repo(&state_dir, args.repo.as_deref())?;
-            let outcome = adapter.pull_account_pool(
+            let result = adapter.pull_account_pool_v2_session(
                 &state_dir,
-                &mut state,
+                &mut session,
                 &repo,
                 crate::adapters::antigravity::PullOptions {
                     bundle_dir: args.path.as_deref(),
                     identity_file: args.identity_file.as_deref(),
                     insecure_host_key: args.insecure_host_key,
                 },
-            )?;
-            storage::save_state(&state_dir, &state)?;
+            );
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(_) if session.read().recovery_pending => {
+                    print_recovery_pending();
+                    return Ok(2);
+                }
+                Err(error) => return Err(error),
+            };
             println!(
                 "{}",
                 ui.repo_pull_completed(&repo, outcome.imported_accounts)
             );
-            adapter.refresh_all_accounts(&state_dir, &mut state, false);
-            storage::save_state(&state_dir, &state)?;
-            let active = adapter.active_identity_from_state(&state);
-            println!("{}", adapter.render_account_table(&state, active.as_ref()));
-            0
+            refresh_all_and_commit(&adapter, &state_dir, &mut session, false)?;
+            print_account_table(&adapter, session.state());
+            Ok(0)
         }
         Command::List => {
-            adapter.refresh_all_accounts(&state_dir, &mut state, false);
-            storage::save_state(&state_dir, &state)?;
-            let active = adapter.active_identity_from_state(&state);
-            println!("{}", adapter.render_account_table(&state, active.as_ref()));
-            0
+            if let Some(code) = ensure_current_session(&adapter, &state_dir, &mut session, false)? {
+                return Ok(code);
+            }
+            refresh_all_and_commit(&adapter, &state_dir, &mut session, false)?;
+            print_account_table(&adapter, session.state());
+            Ok(0)
         }
         Command::Refresh => {
-            adapter.refresh_all_accounts(&state_dir, &mut state, true);
-            storage::save_state(&state_dir, &state)?;
-            let active = adapter.active_identity_from_state(&state);
-            println!("{}", adapter.render_account_table(&state, active.as_ref()));
-            println!("{}", ui.refreshed_accounts(state.accounts.len()));
-            0
-        }
-        Command::Update(args) => {
-            let outcome = update::self_update(&state_dir, args.force)?;
-            match outcome.status {
-                update::UpdateStatus::AlreadyCurrent => {
-                    println!(
-                        "{}",
-                        ui.update_already_current(
-                            &outcome.installed_version,
-                            &outcome.executable_path
-                        )
-                    );
-                }
-                update::UpdateStatus::Updated => {
-                    println!(
-                        "{}",
-                        ui.update_completed(
-                            &outcome.previous_version,
-                            &outcome.installed_version,
-                            &outcome.executable_path
-                        )
-                    );
-                    if cfg!(windows) {
-                        println!("{}", ui.restart_terminal_hint());
-                    }
-                }
+            if let Some(code) = ensure_current_session(&adapter, &state_dir, &mut session, false)? {
+                return Ok(code);
             }
-            0
+            refresh_all_and_commit(&adapter, &state_dir, &mut session, true)?;
+            print_account_table(&adapter, session.state());
+            println!("{}", ui.refreshed_accounts(session.state().accounts.len()));
+            Ok(0)
         }
+        Command::Update(args) => run_update(&state_dir, args.force, ui, &update_fn),
         Command::ImportAuth(args) => {
-            let record = adapter.import_auth_path(&state_dir, &mut state, &args.path)?;
-            if state.current_account_id.is_none() {
-                state.current_account_id = Some(record.id.clone());
+            if let Some(code) = prepare_existing_session(&adapter, &state_dir, &mut session)? {
+                return Ok(code);
             }
-            storage::save_state(&state_dir, &state)?;
+            let outcome = adapter.import_auth_path_session(&state_dir, &mut session, &args.path)?;
+            let Some(record) = finalized_value(outcome) else {
+                return Ok(2);
+            };
             println!("{}", ui.imported_account(&record.email, &record.id));
-            0
+            Ok(0)
         }
         Command::ImportKnown => {
-            let imported = adapter.import_known_sources(&state_dir, &mut state);
+            if let Some(code) = prepare_existing_session(&adapter, &state_dir, &mut session)? {
+                return Ok(code);
+            }
+            let outcome = adapter.import_known_sources_session(&state_dir, &mut session)?;
+            let Some(imported) = finalized_value(outcome) else {
+                return Ok(2);
+            };
             if imported.is_empty() {
                 println!("{}", ui.no_importable_accounts());
-                storage::save_state(&state_dir, &state)?;
                 return Ok(1);
             }
-            if state.current_account_id.is_none() {
-                state.current_account_id = Some(imported[0].id.clone());
-            }
-            storage::save_state(&state_dir, &state)?;
             for account in imported {
                 println!("{}", ui.imported_account(&account.email, &account.id));
             }
-            0
+            Ok(0)
         }
-        Command::Passthrough(args) => {
-            match ensure_launch_account(&adapter, &state_dir, &mut state, false, true)? {
-                Some((account, usage, _pulled)) => {
-                    let now = Utc::now().timestamp();
-                    if let Some(pos) = state.accounts.iter().position(|a| a.id == account.id) {
-                        state.accounts[pos].last_used_at = Some(now);
-                    }
-                    print_selection(ui.selection_switched(), &account, &usage);
-                    storage::save_state(&state_dir, &state)?;
-                    let code = adapter.run_passthrough(&state_dir, &account, &args)?;
-                    if code != 0 {
-                        adapter.refresh_account_usage(&state_dir, &mut state, &account, true);
-                        storage::save_state(&state_dir, &state)?;
-                    }
-                    code
-                }
-                None => {
-                    println!("{}", ui.no_usable_account_hint());
-                    storage::save_state(&state_dir, &state)?;
-                    1
-                }
+        Command::Passthrough(args) => run_launch(
+            &adapter,
+            &state_dir,
+            &mut session,
+            &args,
+            false,
+            false,
+            false,
+            false,
+            ui,
+        ),
+    }
+}
+
+fn prepare_existing_session(
+    adapter: &AntigravityAdapter,
+    state_dir: &Path,
+    session: &mut StateSession,
+) -> Result<Option<i32>> {
+    if matches!(session.migration(), MigrationStatus::LegacyV1) {
+        let outcome = adapter.migrate_legacy_state_session(state_dir, session)?;
+        if finalized_value(outcome).is_none() {
+            return Ok(Some(2));
+        }
+    }
+    if matches!(session.migration(), MigrationStatus::None) {
+        adapter.recover_account_transactions_session(state_dir, session)?;
+        if session.read().recovery_pending {
+            print_recovery_pending();
+            return Ok(Some(2));
+        }
+    }
+    Ok(None)
+}
+
+fn ensure_current_session(
+    adapter: &AntigravityAdapter,
+    state_dir: &Path,
+    session: &mut StateSession,
+    discover_if_empty: bool,
+) -> Result<Option<i32>> {
+    if let Some(code) = prepare_existing_session(adapter, state_dir, session)? {
+        return Ok(Some(code));
+    }
+    if matches!(session.migration(), MigrationStatus::Missing) {
+        let pending = if discover_if_empty {
+            adapter
+                .import_known_sources_session(state_dir, session)?
+                .recovery_pending()
+        } else {
+            adapter
+                .bootstrap_empty_v2_session(state_dir, session)?
+                .recovery_pending()
+        };
+        if pending {
+            print_recovery_pending();
+            return Ok(Some(2));
+        }
+    } else if discover_if_empty && session.state().accounts.is_empty() {
+        let outcome = adapter.import_known_sources_session(state_dir, session)?;
+        if outcome.recovery_pending() {
+            print_recovery_pending();
+            return Ok(Some(2));
+        }
+    }
+    Ok(None)
+}
+
+fn finalized_value<T>(outcome: MutationResult<T>) -> Option<T> {
+    if outcome.recovery_pending() {
+        print_recovery_pending();
+        None
+    } else {
+        Some(outcome.into_value())
+    }
+}
+
+fn print_recovery_pending() {
+    eprintln!("[sagy] A committed change still needs recovery; rerun before another mutation.");
+}
+
+fn refresh_all_and_commit(
+    adapter: &AntigravityAdapter,
+    state_dir: &Path,
+    session: &mut StateSession,
+    force: bool,
+) -> Result<()> {
+    let mut candidate = session.state().clone();
+    adapter.refresh_all_accounts(state_dir, &mut candidate, force);
+    session.commit(&candidate)?;
+    Ok(())
+}
+
+fn refresh_one_and_commit(
+    adapter: &AntigravityAdapter,
+    state_dir: &Path,
+    session: &mut StateSession,
+    account: &AccountRecord,
+    force: bool,
+) -> Result<crate::core::state::UsageSnapshot> {
+    let mut candidate = session.state().clone();
+    let usage = adapter.refresh_account_usage(state_dir, &mut candidate, account, force);
+    session.commit(&candidate)?;
+    Ok(usage)
+}
+
+fn run_auto(
+    adapter: &AntigravityAdapter,
+    state_dir: &Path,
+    session: &mut StateSession,
+    no_import_known: bool,
+    dry_run: bool,
+    ui: ui::Messages,
+) -> Result<i32> {
+    if let Some(code) = ensure_current_session(adapter, state_dir, session, !no_import_known)? {
+        return Ok(code);
+    }
+    refresh_all_and_commit(adapter, state_dir, session, false)?;
+    let Some((account, usage)) =
+        select_launch_account(state_dir, session.state(), Utc::now().timestamp())
+    else {
+        println!("{}", ui.no_usable_account_hint());
+        return Ok(1);
+    };
+    if dry_run {
+        print_selection(ui.selection_would_select(), &account, &usage);
+        return Ok(0);
+    }
+    let outcome = adapter.switch_account_session(
+        state_dir,
+        session,
+        &account.id,
+        ActiveHomeAdoption::Strict,
+    )?;
+    let Some(account) = finalized_value(outcome) else {
+        return Ok(2);
+    };
+    print_selection(ui.selection_switched(), &account, &usage);
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_launch(
+    adapter: &AntigravityAdapter,
+    state_dir: &Path,
+    session: &mut StateSession,
+    extra_args: &[OsString],
+    resume: bool,
+    no_import_known: bool,
+    dry_run: bool,
+    no_launch: bool,
+    ui: ui::Messages,
+) -> Result<i32> {
+    if let Some(code) = ensure_current_session(adapter, state_dir, session, !no_import_known)? {
+        return Ok(code);
+    }
+    refresh_all_and_commit(adapter, state_dir, session, false)?;
+    if dry_run {
+        let Some((account, usage)) =
+            select_launch_account(state_dir, session.state(), Utc::now().timestamp())
+        else {
+            println!("{}", ui.no_usable_account_hint());
+            return Ok(1);
+        };
+        print_selection(ui.selection_would_select(), &account, &usage);
+        return Ok(0);
+    }
+
+    let mut last_rate_limit_code = None;
+    for attempt in 0..3 {
+        let Some((account, usage)) =
+            select_launch_account(state_dir, session.state(), Utc::now().timestamp())
+        else {
+            if last_rate_limit_code.is_none() {
+                println!("{}", ui.no_usable_account_hint());
+            }
+            return Ok(last_rate_limit_code.unwrap_or(1));
+        };
+        let outcome = adapter.switch_account_session(
+            state_dir,
+            session,
+            &account.id,
+            ActiveHomeAdoption::Strict,
+        )?;
+        let Some(account) = finalized_value(outcome) else {
+            return Ok(2);
+        };
+        print_selection(ui.selection_switched(), &account, &usage);
+        if no_launch {
+            return Ok(0);
+        }
+
+        let reference = session
+            .state()
+            .credential_refs
+            .get(&account.id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("selected account has no credential reference"))?;
+        let credential = adapter
+            .resolve_launch_credential(state_dir, session, &account.id)
+            .map_err(anyhow::Error::new)?;
+        let observed_at = Utc::now().timestamp();
+        let outcome = adapter
+            .launch_agy_observed_resolved(state_dir, &credential, extra_args, resume)
+            .map_err(anyhow::Error::new)?;
+        // 账号与 active-home lease 必须在任何 State CAS 或 fallback 切换前释放。
+        drop(credential);
+
+        let exit_code = termination_exit_code(outcome.termination);
+        let rate_limited = matches!(outcome.diagnostic, LaunchDiagnostic::RateLimited { .. });
+        if !matches!(outcome.diagnostic, LaunchDiagnostic::None) {
+            record_launch_diagnostic(
+                session,
+                &account.id,
+                &reference,
+                &outcome.diagnostic,
+                observed_at,
+            )?;
+        } else if exit_code != 0 {
+            let _ = refresh_one_and_commit(adapter, state_dir, session, &account, true)?;
+        }
+
+        if rate_limited && attempt < 2 {
+            last_rate_limit_code = Some(exit_code.max(1));
+            continue;
+        }
+        return Ok(exit_code);
+    }
+    Ok(last_rate_limit_code.unwrap_or(1))
+}
+
+fn record_launch_diagnostic(
+    session: &mut StateSession,
+    account_id: &str,
+    reference: &CredentialRef,
+    diagnostic: &LaunchDiagnostic,
+    observed_at: i64,
+) -> Result<()> {
+    if session.state().credential_refs.get(account_id) != Some(reference) {
+        bail!("selected credential changed before launch observation could be committed");
+    }
+    let subject = probe_subject(reference.kind);
+    let observation = match diagnostic {
+        LaunchDiagnostic::None => return Ok(()),
+        LaunchDiagnostic::RateLimited {
+            retry_after_seconds,
+        } => ProbeOutcome::Http429 {
+            subject,
+            retry_after_secs: i64::try_from(*retry_after_seconds).ok(),
+        },
+        LaunchDiagnostic::AuthRejected => ProbeOutcome::Http401 { subject },
+        LaunchDiagnostic::PermissionDenied => ProbeOutcome::Http403 { subject },
+    };
+    let now = Utc::now().timestamp();
+    let previous = session
+        .state()
+        .usage_cache
+        .get(account_id)
+        .cloned()
+        .unwrap_or_default();
+    let next = reduce_usage_observed(&previous, &observation, observed_at, now);
+    let mut candidate = session.state().clone();
+    candidate.usage_cache.insert(account_id.to_string(), next);
+    session.commit(&candidate)?;
+    Ok(())
+}
+
+const fn probe_subject(kind: CredentialRefKind) -> ProbeSubject {
+    match kind {
+        CredentialRefKind::OauthAccessToken => ProbeSubject::RawToken,
+        CredentialRefKind::OauthAuthorizedUser => ProbeSubject::AuthorizedUser,
+        CredentialRefKind::ApiKey => ProbeSubject::ApiKey,
+        CredentialRefKind::VertexServiceAccount => ProbeSubject::Vertex,
+    }
+}
+
+fn termination_exit_code(termination: ProcessTermination) -> i32 {
+    match termination {
+        ProcessTermination::Exited { code } => code,
+        ProcessTermination::Signaled { signal } => 128_i32
+            .saturating_add(signal.saturating_abs())
+            .clamp(1, 255),
+        ProcessTermination::SpawnFailed | ProcessTermination::WaitFailed => 1,
+    }
+}
+
+fn confirm_remove(email: &str, ui: ui::Messages) -> Result<bool> {
+    loop {
+        print!("{}", ui.confirm_rm(email));
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => {
+                println!("{}", ui.rm_cancelled());
+                return Ok(false);
+            }
+            _ => println!("{}", ui.invalid_yes_no()),
+        }
+    }
+}
+
+fn print_account_table(adapter: &AntigravityAdapter, state: &crate::core::state::State) {
+    let active = adapter.active_identity_from_state(state);
+    println!("{}", adapter.render_account_table(state, active.as_ref()));
+}
+
+fn run_update<F>(state_dir: &Path, force: bool, ui: ui::Messages, update_fn: &F) -> Result<i32>
+where
+    F: Fn(&Path, bool) -> Result<update::UpdateOutcome>,
+{
+    let outcome = update_fn(state_dir, force)?;
+    match outcome.status {
+        update::UpdateStatus::AlreadyCurrent => {
+            println!(
+                "{}",
+                ui.update_already_current(&outcome.installed_version, &outcome.executable_path)
+            );
+        }
+        update::UpdateStatus::Updated => {
+            println!(
+                "{}",
+                ui.update_completed(
+                    &outcome.previous_version,
+                    &outcome.installed_version,
+                    &outcome.executable_path,
+                )
+            );
+            if cfg!(windows) {
+                println!("{}", ui.restart_terminal_hint());
             }
         }
-    };
+    }
+    Ok(0)
+}
 
-    Ok(exit_code)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn update_dispatch_does_not_load_corrupt_state() {
+        use std::cell::Cell;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::write(temp_dir.path().join("state.json"), b"not-json").expect("write state");
+
+        let called = Cell::new(false);
+        let cli = Cli {
+            state_dir: Some(temp_dir.path().to_path_buf()),
+            command: Some(Command::Update(UpdateArgs { force: false })),
+        };
+        let result = run_with_update(cli, |state_dir, force| {
+            called.set(true);
+            assert_eq!(
+                state_dir,
+                fs::canonicalize(temp_dir.path())
+                    .expect("canonical temp dir")
+                    .as_path()
+            );
+            assert!(!force);
+            Ok(update::UpdateOutcome {
+                status: update::UpdateStatus::AlreadyCurrent,
+                previous_version: env!("CARGO_PKG_VERSION").to_string(),
+                installed_version: env!("CARGO_PKG_VERSION").to_string(),
+                executable_path: temp_dir.path().join("sagy"),
+            })
+        });
+
+        assert!(result.is_ok());
+        assert!(called.get());
+    }
+
+    #[test]
+    fn production_cli_never_uses_legacy_state_load_or_save() {
+        let source = include_str!("mod.rs");
+        for forbidden in [
+            ["storage::", "load_state("].concat(),
+            ["storage::", "save_state("].concat(),
+        ] {
+            assert!(!source.contains(&forbidden));
+        }
+    }
 }

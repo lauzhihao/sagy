@@ -4,7 +4,9 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
+use crate::core::atomic_io::NormalizedStoreRoot;
 use crate::core::storage::expand_user_path;
 
 pub fn find_agy_bin(state_dir: Option<&Path>) -> Option<PathBuf> {
@@ -63,21 +65,72 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
 }
 
 pub fn default_antigravity_cli_home() -> Option<PathBuf> {
-    if let Some(override_path) = env::var_os("ANTIGRAVITY_CONFIG_DIR") {
-        return Some(expand_user_path(Path::new(&override_path)));
+    if let Some(override_path) = non_empty_env_path("ANTIGRAVITY_CONFIG_DIR") {
+        return Some(expand_user_path(&override_path));
     }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".gemini").join("antigravity-cli"))
+    platform_home_dir().map(|home| home.join(".gemini").join("antigravity-cli"))
 }
 
 pub fn default_gemini_home() -> Option<PathBuf> {
-    if let Some(override_path) = env::var_os("GEMINI_HOME") {
-        return Some(expand_user_path(Path::new(&override_path)));
+    if let Some(override_path) = non_empty_env_path("GEMINI_HOME") {
+        return Some(expand_user_path(&override_path));
     }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".gemini"))
+    platform_home_dir().map(|home| home.join(".gemini"))
+}
+
+/// Return the two normalized roots used by the managed active profile.  The
+/// normalized values retain only an internal capability-safe path; callers
+/// must still claim/adopt them before mutating anything.
+pub(crate) fn active_home_roots() -> Result<(NormalizedStoreRoot, NormalizedStoreRoot)> {
+    let cli = default_antigravity_cli_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine Antigravity config directory"))?;
+    let gemini = default_gemini_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine Gemini home directory"))?;
+    Ok((
+        NormalizedStoreRoot::normalize(&cli)?,
+        NormalizedStoreRoot::normalize(&gemini)?,
+    ))
+}
+
+/// Compute the opaque active-home scope used in State.  It intentionally
+/// stores no raw paths in the wire document; the domain separator prevents a
+/// digest from being confused with another feature's path identity.
+pub(crate) fn active_home_scope_id(
+    antigravity_root: &NormalizedStoreRoot,
+    gemini_root: &NormalizedStoreRoot,
+) -> String {
+    let stable = |root: &NormalizedStoreRoot| root.as_path().to_string_lossy().replace('\\', "/");
+    let representation = format!("{}\0{}", stable(antigravity_root), stable(gemini_root));
+    let mut digest = Sha256::new();
+    digest.update(b"sagy/active-home/v1\0");
+    digest.update(representation.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    non_empty_path_value(env::var_os(name))
+}
+
+fn non_empty_path_value(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.and_then(|value| {
+        let path = PathBuf::from(value);
+        (!path.as_os_str().to_string_lossy().trim().is_empty()).then_some(path)
+    })
+}
+
+fn platform_home_dir() -> Option<PathBuf> {
+    if let Some(home) = non_empty_env_path("HOME") {
+        return Some(home);
+    }
+
+    #[cfg(windows)]
+    {
+        non_empty_env_path("USERPROFILE")
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 pub fn account_dir(state_dir: &Path, account_id: &str) -> PathBuf {
@@ -307,5 +360,50 @@ mod tests {
 
         let settings_file = account_settings_file(&acc_dir);
         assert_eq!(settings_file, acc_dir.join("settings.json"));
+    }
+
+    #[test]
+    fn empty_environment_paths_are_not_treated_as_the_working_directory() {
+        assert_eq!(non_empty_path_value(None), None);
+        assert_eq!(non_empty_path_value(Some("".into())), None);
+        assert_eq!(non_empty_path_value(Some("   ".into())), None);
+        assert_eq!(
+            non_empty_path_value(Some("/isolated/home".into())),
+            Some(PathBuf::from("/isolated/home"))
+        );
+    }
+
+    #[test]
+    fn active_home_scope_uses_normalized_root_identity_and_domain_separator() {
+        let temp = tempfile::tempdir().unwrap();
+        let antigravity = NormalizedStoreRoot::normalize(&temp.path().join("cli")).unwrap();
+        let gemini = NormalizedStoreRoot::normalize(&temp.path().join("gemini")).unwrap();
+        let first = active_home_scope_id(&antigravity, &gemini);
+        let reversed = active_home_scope_id(&gemini, &antigravity);
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, reversed);
+        assert!(!first.contains('/'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_home_scope_collapses_an_ancestor_alias_before_hashing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_parent = temp.path().join("real");
+        let real_root = real_parent.join("active");
+        fs::create_dir_all(&real_root).unwrap();
+        let alias_parent = temp.path().join("alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let real = NormalizedStoreRoot::normalize(&real_root).unwrap();
+        let alias = NormalizedStoreRoot::normalize(&alias_parent.join("active")).unwrap();
+        assert_eq!(real, alias);
+
+        let gemini = NormalizedStoreRoot::normalize(&temp.path().join("gemini")).unwrap();
+        assert_eq!(
+            active_home_scope_id(&real, &gemini),
+            active_home_scope_id(&alias, &gemini)
+        );
     }
 }

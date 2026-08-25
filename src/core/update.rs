@@ -1,14 +1,16 @@
 use std::collections::HashSet;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use semver::Version;
 use serde::Deserialize;
 use tar::Archive;
 use uuid::Uuid;
@@ -17,6 +19,7 @@ use zip::ZipArchive;
 use crate::core::storage;
 
 const DEFAULT_REPO: &str = "lauzhihao/sagy";
+const UPDATER_USER_AGENT: &str = concat!("sagy-updater/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseTarget {
@@ -52,28 +55,41 @@ struct GithubRelease {
 }
 
 pub fn is_newer_version(remote: &str, current: &str) -> bool {
-    let parse_semver = |v: &str| -> Vec<u64> {
-        let clean = v.trim().strip_prefix('v').unwrap_or(v.trim());
-        clean
-            .split(['.', '-', '+'])
-            .filter_map(|part| part.parse::<u64>().ok())
-            .collect()
-    };
-
-    let remote_parts = parse_semver(remote);
-    let current_parts = parse_semver(current);
-
-    let max_len = remote_parts.len().max(current_parts.len());
-    for i in 0..max_len {
-        let r = remote_parts.get(i).copied().unwrap_or(0);
-        let c = current_parts.get(i).copied().unwrap_or(0);
-        if r > c {
-            return true;
-        } else if r < c {
-            return false;
-        }
+    match (
+        parse_release_version(remote),
+        parse_release_version(current),
+    ) {
+        (Ok(remote), Ok(current)) => remote.cmp_precedence(&current).is_gt(),
+        // 保持这个便捷判断函数的 bool API；真正更新路径使用有错误信息的
+        // `update_decision`，不会把非法版本静默当成“当前版本”。
+        _ => false,
     }
-    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateDecision {
+    Update,
+    AlreadyCurrent,
+}
+
+fn parse_release_version(tag: &str) -> Result<Version> {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    Version::parse(version).with_context(|| format!("invalid release version tag: {tag:?}"))
+}
+
+fn update_decision(remote: &str, current: &str, force: bool) -> Result<UpdateDecision> {
+    let remote_version = parse_release_version(remote)?;
+    let current_version = parse_release_version(current)
+        .with_context(|| format!("invalid installed package version: {current:?}"))?;
+
+    match remote_version.cmp_precedence(&current_version) {
+        std::cmp::Ordering::Less => {
+            bail!("refusing to downgrade from {current} to {remote}; remote release is older")
+        }
+        std::cmp::Ordering::Equal if force => Ok(UpdateDecision::Update),
+        std::cmp::Ordering::Equal => Ok(UpdateDecision::AlreadyCurrent),
+        std::cmp::Ordering::Greater => Ok(UpdateDecision::Update),
+    }
 }
 
 pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
@@ -82,14 +98,16 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
     let previous_version = env!("CARGO_PKG_VERSION").to_string();
     let asset = resolve_release_asset()?;
 
-    let is_newer = is_newer_version(&asset.version, &previous_version);
-    if !is_newer && !force {
-        return Ok(UpdateOutcome {
-            status: UpdateStatus::AlreadyCurrent,
-            previous_version: previous_version.clone(),
-            installed_version: previous_version,
-            executable_path,
-        });
+    match update_decision(&asset.version, &previous_version, force)? {
+        UpdateDecision::AlreadyCurrent => {
+            return Ok(UpdateOutcome {
+                status: UpdateStatus::AlreadyCurrent,
+                previous_version: previous_version.clone(),
+                installed_version: previous_version,
+                executable_path,
+            });
+        }
+        UpdateDecision::Update => {}
     }
 
     let binary = download_release_binary(&asset)?;
@@ -128,15 +146,38 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
 fn resolve_release_asset() -> Result<ReleaseAsset> {
     let target = current_release_target()?;
     let repo = env::var("SAGY_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
+    validate_repository(&repo)?;
     let release = fetch_latest_release(&repo)?;
-    let tag = release.tag_name.trim().to_string();
-    let version = tag.strip_prefix('v').unwrap_or(&tag).trim().to_string();
+    let tag = release.tag_name;
+    let version = parse_release_version(&tag)?.to_string();
     Ok(ReleaseAsset {
         repo,
         tag,
         version,
         target,
     })
+}
+
+fn validate_repository(repo: &str) -> Result<()> {
+    let mut parts = repo.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || !is_safe_repository_component(owner)
+        || !is_safe_repository_component(name)
+    {
+        bail!("invalid update repository name: {repo:?}");
+    }
+    Ok(())
+}
+
+fn is_safe_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn fetch_latest_release(repo: &str) -> Result<GithubRelease> {
@@ -158,6 +199,15 @@ fn fetch_latest_release(repo: &str) -> Result<GithubRelease> {
 }
 
 fn download_release_binary(asset: &ReleaseAsset) -> Result<Vec<u8>> {
+    validate_repository(&asset.repo)?;
+    let parsed_version = parse_release_version(&asset.tag)?;
+    if asset.version != parsed_version.to_string() {
+        bail!(
+            "release asset version does not match its tag: {} vs {}",
+            asset.version,
+            asset.tag
+        );
+    }
     let client = http_client()?;
     let asset_name = format!(
         "sagy-{}-{}.{}",
@@ -182,6 +232,9 @@ fn download_release_binary(asset: &ReleaseAsset) -> Result<Vec<u8>> {
         .bytes()
         .with_context(|| format!("failed to read payload from {download_url}"))?
         .to_vec();
+    if bytes.is_empty() {
+        bail!("release asset from {download_url} is empty");
+    }
 
     verify_checksum(&client, asset, &asset_name, &bytes)?;
 
@@ -194,6 +247,9 @@ fn verify_checksum(
     asset_name: &str,
     payload: &[u8],
 ) -> Result<()> {
+    if payload.is_empty() {
+        bail!("release asset {asset_name} is empty");
+    }
     let sums_url = format!(
         "https://github.com/{}/releases/download/{}/SHA256SUMS.txt",
         asset.repo, asset.tag
@@ -250,7 +306,10 @@ fn parse_checksum_entry(sums_text: &str, asset_name: &str) -> Result<String> {
 
         // `*filename` is the binary-mode spelling emitted by common checksum tools.
         let file = raw_file.strip_prefix('*').unwrap_or(raw_file);
-        if file.is_empty() || !seen_files.insert(file) {
+        if !is_safe_checksum_filename(file) {
+            bail!("unsafe checksum target on line {}", line_number + 1);
+        }
+        if !seen_files.insert(file) {
             bail!(
                 "duplicate or empty checksum target on line {}",
                 line_number + 1
@@ -264,6 +323,15 @@ fn parse_checksum_entry(sums_text: &str, asset_name: &str) -> Result<String> {
     matching_hash.ok_or_else(|| anyhow::anyhow!("checksum entry for {asset_name} is missing"))
 }
 
+fn is_safe_checksum_filename(file: &str) -> bool {
+    !file.is_empty()
+        && file != "."
+        && file != ".."
+        && file
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+}
+
 fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result<Vec<u8>> {
     let expected_name = binary_filename_for_current_platform(bin_name);
     match ext {
@@ -273,14 +341,17 @@ fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result
             for entry in archive.entries().context("invalid tar archive")? {
                 let mut entry = entry.context("invalid tar entry")?;
                 let path = entry.path().context("invalid entry path")?;
-                if let Some(file_name) = path.file_name() {
-                    if file_name == expected_name.as_str() {
-                        let mut buffer = Vec::new();
-                        entry
-                            .read_to_end(&mut buffer)
-                            .context("failed to read binary from archive")?;
-                        return Ok(buffer);
+                if is_safe_archive_entry_path(&path, &expected_name)
+                    && entry.header().entry_type().is_file()
+                {
+                    let mut buffer = Vec::new();
+                    entry
+                        .read_to_end(&mut buffer)
+                        .context("failed to read binary from archive")?;
+                    if buffer.is_empty() {
+                        bail!("binary {expected_name} in tar archive is empty");
                     }
+                    return Ok(buffer);
                 }
             }
             bail!("binary {expected_name} not found in tar archive");
@@ -289,10 +360,16 @@ fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result
             let mut archive = ZipArchive::new(Cursor::new(bytes)).context("invalid zip archive")?;
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i).context("invalid zip entry")?;
-                if file.name().ends_with(&expected_name) {
+                if is_safe_archive_entry_path(Path::new(file.name()), &expected_name)
+                    && !file.is_dir()
+                    && !is_zip_symlink(file.unix_mode())
+                {
                     let mut buffer = Vec::new();
                     file.read_to_end(&mut buffer)
                         .context("failed to read binary from zip archive")?;
+                    if buffer.is_empty() {
+                        bail!("binary {expected_name} in zip archive is empty");
+                    }
                     return Ok(buffer);
                 }
             }
@@ -302,9 +379,20 @@ fn unpack_binary_from_archive(bytes: &[u8], ext: &str, bin_name: &str) -> Result
     }
 }
 
+fn is_zip_symlink(unix_mode: Option<u32>) -> bool {
+    unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000)
+}
+
+fn is_safe_archive_entry_path(path: &Path, expected_name: &str) -> bool {
+    path.file_name() == Some(OsStr::new(expected_name))
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 fn http_client() -> Result<Client> {
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static("sagy-updater/0.1.0"));
+    headers.insert(USER_AGENT, HeaderValue::from_static(UPDATER_USER_AGENT));
     headers.insert(
         ACCEPT,
         HeaderValue::from_static("application/vnd.github.v3+json"),
@@ -368,6 +456,17 @@ mod tests {
         assert!(
             parse_checksum_entry(&format!("{VALID_HASH}  ./sagy.tar.gz\n"), "sagy.tar.gz").is_err()
         );
+        assert!(
+            parse_checksum_entry(&format!("{VALID_HASH}  ../sagy.tar.gz\n"), "sagy.tar.gz")
+                .is_err()
+        );
+        assert!(
+            parse_checksum_entry(
+                &format!("{VALID_HASH}  sagy-1.2.3+build.tar.gz\n"),
+                "sagy-1.2.3+build.tar.gz"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -380,6 +479,25 @@ mod tests {
     }
 
     #[test]
+    fn archive_entry_paths_reject_escape_and_allow_safe_nested_files() {
+        assert!(is_safe_archive_entry_path(Path::new("dist/sagy"), "sagy"));
+        assert!(!is_safe_archive_entry_path(Path::new("../sagy"), "sagy"));
+        assert!(!is_safe_archive_entry_path(
+            Path::new("dist/../sagy"),
+            "sagy"
+        ));
+        assert!(!is_safe_archive_entry_path(Path::new("sagy-link"), "sagy"));
+    }
+
+    #[test]
+    fn zip_symlink_mode_is_rejected() {
+        assert!(is_zip_symlink(Some(0o120777)));
+        assert!(is_zip_symlink(Some(0o120000)));
+        assert!(!is_zip_symlink(Some(0o100755)));
+        assert!(!is_zip_symlink(None));
+    }
+
+    #[test]
     fn test_is_newer_version() {
         assert!(is_newer_version("0.2.0", "0.1.0"));
         assert!(is_newer_version("1.0.0", "0.9.9"));
@@ -387,5 +505,78 @@ mod tests {
         assert!(!is_newer_version("0.1.0", "0.1.0"));
         assert!(!is_newer_version("0.1.0", "0.2.0"));
         assert!(!is_newer_version("v0.0.9", "0.1.0"));
+    }
+
+    #[test]
+    fn strict_release_tags_allow_one_v_prefix_only() {
+        assert_eq!(
+            parse_release_version("v1.2.3")
+                .expect("v prefix")
+                .to_string(),
+            "1.2.3"
+        );
+        assert_eq!(
+            parse_release_version("1.2.3-rc.1+build.7")
+                .expect("pre-release and build metadata")
+                .to_string(),
+            "1.2.3-rc.1+build.7"
+        );
+        for malformed in [
+            "vv1.2.3",
+            "V1.2.3",
+            "1.2",
+            "1.2.3junk",
+            " 1.2.3",
+            "1.2.3 ",
+            "1.2.03",
+            "1.2.3/other",
+        ] {
+            assert!(
+                parse_release_version(malformed).is_err(),
+                "accepted malformed tag {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semver_pre_release_and_build_order_is_correct() {
+        assert!(is_newer_version("1.0.0", "1.0.0-rc.1"));
+        assert!(is_newer_version("1.0.0-rc.2", "1.0.0-rc.1"));
+        assert!(!is_newer_version("1.0.0-rc.2", "1.0.0-rc.10"));
+        assert!(!is_newer_version("1.0.0+build.2", "1.0.0+build.1"));
+        assert!(!is_newer_version(
+            "1.0.0-rc.1+build.2",
+            "1.0.0-rc.1+build.1"
+        ));
+    }
+
+    #[test]
+    fn update_policy_never_downgrades_and_force_only_reinstalls_same_version() {
+        assert_eq!(
+            update_decision("v1.1.0", "1.0.0", false).expect("newer release"),
+            UpdateDecision::Update
+        );
+        assert_eq!(
+            update_decision("v1.0.0", "1.0.0", false).expect("same release"),
+            UpdateDecision::AlreadyCurrent
+        );
+        assert_eq!(
+            update_decision("v1.0.0", "1.0.0", true).expect("forced same release"),
+            UpdateDecision::Update
+        );
+        assert_eq!(
+            update_decision("v1.0.0+build.2", "1.0.0+build.1", false)
+                .expect("build metadata does not change precedence"),
+            UpdateDecision::AlreadyCurrent
+        );
+        assert_eq!(
+            update_decision("v1.0.0+build.2", "1.0.0+build.1", true)
+                .expect("forced same precedence"),
+            UpdateDecision::Update
+        );
+        assert!(update_decision("v0.9.9", "1.0.0", false).is_err());
+        assert!(update_decision("v0.9.9", "1.0.0", true).is_err());
+        assert!(update_decision("v1.2", "1.0.0", false).is_err());
+        assert!(update_decision("v1.0.0junk", "1.0.0", false).is_err());
     }
 }

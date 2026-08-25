@@ -20,8 +20,8 @@
                  v                               v
 +--------------------------------+ +-----------------------------+
 |          Core Engine           | |     Antigravity Adapter     |
-| - Storage (atomic persistence) | | - Binary Discovery (agy)    |
-| - Policy (scoring & cooldown)  | | - Account Model (OAuth/API) |
+| - State v2 (CAS transactions)  | | - Binary Discovery (agy)    |
+| - Policy (eligibility tiers)   | | - OAuth/API/Vertex Model    |
 | - UI (ANSI tables & messages)  | | - Env & Profile Switcher    |
 | - Update (GitHub release DL)   | | - XChaCha20Poly1305 Repo Sync |
 +--------------------------------+ +-----------------------------+
@@ -44,25 +44,30 @@
     bin/              # Installed executable binaries (sagy, sagy-original)
     runtime/          # Optional local toolchains or runtimes
     tmp/              # Temporary download, extraction and repo-sync working trees
-    accounts/         # Isolated account directories (<account-id>/credentials.json, token)
-    state.json        # Atomic state file (account inventory, current account, usage cache)
+    accounts/         # Fixed, isolated credential slots for each validated account ID
+    state.json        # Versioned account inventory, credential refs, active profile, and usage
     repo-sync.json    # Last synced repository configuration
   ```
 
 ## 3. Account Selection & Cooldown Policy
 
-1. **Stickiness**: If the currently active account is healthy (not in cooldown, no re-login flag, positive quota remaining), `sagy` keeps using it to prevent churn.
-2. **Account Scoring**:
-   - Accounts requiring re-login receive a `-10000.0` penalty.
-   - Accounts in active rate-limit cooldown (`429 ResourceExhausted`) receive a `-5000.0` penalty + remaining cooldown duration penalty.
-   - Positive score bonuses for remaining quota percentage, Pro/Advanced plans, and recent usage history.
-3. **Automatic Fallback**: When an active account is rate-limited, it enters a 5-minute cooldown window, and subsequent `sagy launch` calls smoothly fall back to the next healthiest available account.
+1. **Fail-closed eligibility**: Every candidate must have a compatible State v2 credential reference and a locally verified fixed credential slot. Zero quota, active cooldown, invalid authentication, permission failures, and transient failures are ineligible.
+2. **Typed tiers**: A successful probe is `Primary`, a refreshable authorized-user credential is `Secondary`, and a locally verified but unprobed credential is `Fallback`. Small quota/plan/recency bonuses only order accounts inside those safety tiers.
+3. **Stickiness**: The current account is retained only when it passes the same eligibility predicate as every other candidate.
+4. **Automatic fallback**: Only a bounded, canonical Google JSON error from a failed `agy` child can establish `RESOURCE_EXHAUSTED`. The exact credential enters a bounded cooldown without further probes, and one launch can try at most three eligible accounts.
 
-## 4. Encrypted Account Pool Synchronization
+## 4. State and Credential Transactions
+
+- One CLI invocation owns one exact `StateSession`; all mutations use revision-checked compare-and-swap commits.
+- State stores credential references and digests, never credential payloads or caller-controlled credential paths.
+- Credential files and the two active-home OAuth slots are published with durable journals before State commits. Recovery is receipt-bound and runs before later mutations.
+- OAuth access tokens, OAuth authorized-user documents, API keys, and Vertex service accounts have mutually exclusive launch environments and fixed managed layouts.
+
+## 5. Encrypted Account Pool Synchronization
 
 - **Algorithm**: `XChaCha20Poly1305` authenticated encryption with Argon2id key derivation.
 - **Key Source**: `SAGY_POOL_KEY` environment variable.
-- **Payload Format**: Encrypted bundle (`.sagy-account-pool/bundle.enc.json`) committed to a private Git repository.
+- **Payload Format**: Strict, bounded v2 bundle (`.sagy-account-pool/bundle.enc.json`) containing portable credential material, typed usage, and rollback watermarks.
 - **Cross-Host Workflow**:
   - `sagy push <repo>`: Exports local accounts, encrypts into bundle, commits and pushes to Git.
   - `sagy pull <repo>`: Clones repository, decrypts bundle, merges accounts into local state, and refreshes usage cache.

@@ -174,10 +174,16 @@ fn push_round_trip_uses_a_disposable_local_bare_repository() {
     run_git(&git_bin, Some(&seed), &["push", "origin", "HEAD"]);
 
     let state_dir = temp.path().join("state");
+    let token_path = state_dir
+        .join("accounts")
+        .join("safe-account")
+        .join("antigravity-oauth-token");
+    storage::write_secret_file(&token_path, b"token").expect("fixed token");
     let mut state = State::default();
     state.accounts.push(AccountRecord {
         id: "safe-account".to_string(),
         email: "safe@example.test".to_string(),
+        auth_path: token_path.to_string_lossy().into_owned(),
         oauth_token: Some("token".to_string()),
         ..AccountRecord::default()
     });
@@ -301,7 +307,59 @@ fn scp_like_ssh_repo_is_accepted_and_save_errors_propagate() {
     fs::write(&state_file, b"not a directory").expect("state file");
     let error =
         resolve_repo_sync_repo(&state_file, Some(repo)).expect_err("save failure should propagate");
-    assert!(format!("{error:#}").contains("failed to save repository sync configuration"));
+    assert!(
+        format!("{error:#}").contains("repository sync configuration"),
+        "configuration read/write failure lost its operation context: {error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repo_sync_config_is_private_and_parent_directory_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    resolve_repo_sync_repo(&state_dir, Some("git@github.com:user/pool.git"))
+        .expect("save repo config");
+
+    let config_mode = fs::metadata(state_dir.join("repo-sync.json"))
+        .expect("config metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let dir_mode = fs::metadata(&state_dir)
+        .expect("state directory metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(config_mode, 0o600);
+    assert_eq!(dir_mode, 0o700);
+
+    fs::set_permissions(
+        state_dir.join("repo-sync.json"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("relax config mode");
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755))
+        .expect("relax directory mode");
+    let _ = resolve_repo_sync_repo(&state_dir, None).expect("load and migrate config");
+    assert_eq!(
+        fs::metadata(state_dir.join("repo-sync.json"))
+            .expect("migrated config metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&state_dir)
+            .expect("migrated directory metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
 }
 
 #[test]

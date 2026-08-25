@@ -11,11 +11,14 @@ set -eu
 url=""
 out=""
 previous=""
+write_status=0
 for arg in "$@"; do
     if [ "$previous" = "-o" ]; then
         out="$arg"
     elif printf '%s' "$arg" | grep -q '^https://'; then
         url="$arg"
+    elif [ "$previous" = "-w" ]; then
+        write_status=1
     fi
     previous="$arg"
 done
@@ -28,13 +31,16 @@ if printf '%s' "$url" | grep -q 'SHA256SUMS.txt'; then
         duplicate) printf '%s  %s\n%s  %s\n' "$FAKE_HASH" "$FAKE_ASSET" "$FAKE_HASH" "$FAKE_ASSET" > "$out" ;;
         malformed) printf 'not-a-hash  %s\n' "$FAKE_ASSET" > "$out" ;;
         mismatch) printf '%064d  %s\n' 0 "$FAKE_ASSET" > "$out" ;;
+        unsafe-target) printf '%s  ../%s\n' "$FAKE_HASH" "$FAKE_ASSET" > "$out" ;;
+        redirect) printf '%s  %s\n' "$FAKE_HASH" "$FAKE_ASSET" > "$out"; [ "$write_status" -eq 0 ] || printf '302' ; exit 0 ;;
         valid) printf '%s  %s\n' "$FAKE_HASH" "$FAKE_ASSET" > "$out" ;;
         *) exit 1 ;;
     esac
 else
     if [ "${FAKE_SUMS_MODE}" = archive-timeout ]; then exit 28; fi
-    cp "$FAKE_ARCHIVE" "$out"
+    if [ "${FAKE_SUMS_MODE}" = empty-archive ]; then : > "$out"; else cp "$FAKE_ARCHIVE" "$out"; fi
 fi
+if [ "$write_status" -ne 0 ]; then printf '200'; fi
 "#;
     let path = bin_dir.join("curl");
     fs::write(&path, script).expect("write fake curl");
@@ -98,13 +104,16 @@ fn unix_installer_requires_checksum_before_install() {
     let asset = format!("sagy-v1.0.0-{target}.tar.gz");
     for mode in [
         "archive-timeout",
+        "empty-archive",
         "checksum-timeout",
         "http-error",
+        "redirect",
         "empty",
         "missing",
         "duplicate",
         "malformed",
         "mismatch",
+        "unsafe-target",
     ] {
         let home = fixture.path().join(mode);
         let output = Command::new("bash")
@@ -160,6 +169,48 @@ fn unix_installer_requires_checksum_before_install() {
 }
 
 #[test]
+#[cfg(unix)]
+fn unix_installer_rejects_missing_hash_tool_before_download() {
+    let fixture = TempDir::new().expect("fixture tempdir");
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("create fake bin");
+
+    for command in ["bash", "curl", "tar", "mktemp", "awk", "tr"] {
+        let source = Command::new("sh")
+            .args(["-c", "command -v \"$1\"", "sh", command])
+            .output()
+            .expect("locate dependency");
+        assert!(source.status.success(), "missing test dependency {command}");
+        std::os::unix::fs::symlink(
+            String::from_utf8(source.stdout)
+                .expect("dependency path")
+                .trim(),
+            fake_bin.join(command),
+        )
+        .expect("link dependency");
+    }
+
+    let home = fixture.path().join("missing-hash-tool");
+    let output = Command::new(fake_bin.join("bash"))
+        .arg(env!("CARGO_MANIFEST_DIR").to_string() + "/install.sh")
+        .env("HOME", &home)
+        .env("SAGY_HOME", home.join(".sagy"))
+        .env("SAGY_VERSION", "v1.0.0")
+        .env("SAGY_REPO", "test/repo")
+        .env("PATH", &fake_bin)
+        .output()
+        .expect("run installer without hash tool");
+    assert!(
+        !output.status.success(),
+        "installer accepted missing hash tool"
+    );
+    assert!(
+        !home.join(".sagy").exists(),
+        "installer created state directory"
+    );
+}
+
+#[test]
 fn powershell_installer_has_fail_closed_checksum_guard() {
     let unix_source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
         .expect("read Unix installer");
@@ -176,6 +227,14 @@ fn powershell_installer_has_fail_closed_checksum_guard() {
     assert!(source.contains("Checksum entry for $assetName is missing"));
     assert!(source.contains("Malformed checksum entry in $sumsPath"));
     assert!(source.contains("Duplicate or empty checksum target in $sumsPath"));
+    assert!(source.contains("Unsafe checksum target in $sumsPath"));
+    assert!(source.contains("Checksum verification requires Get-FileHash."));
+    assert!(source.contains("Downloaded archive is empty: $zipPath"));
+    assert!(source.contains("Checksum manifest is empty: $sumsPath"));
     assert!(source.contains("SHA-256 checksum mismatch for $assetName"));
+    assert!(source.contains("if ($actualHash -ne $expectedHash)"));
+    assert!(
+        source.contains("Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue")
+    );
     assert!(!source.contains("Checksum verification skipped or failed"));
 }
