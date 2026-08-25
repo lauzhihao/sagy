@@ -25,10 +25,17 @@ const LAUNCH_SHORTCUT_FLAGS: [&str; 4] = [
     "--no-import-known",
 ];
 
+const NO_RESUME_FLAG: &str = "--no-resume";
+
 /// 根据固定的 sagy global prefix 决定交给 clap 还是直接交给 agy。
 ///
-/// 路由只看 prefix 后的第一个 token。遇到未知 option、裸 prompt 或 `--`
-/// 后，剩余 argv 都是 agy passthrough，绝不继续扫描其中的 token。
+/// 路由只看 prefix 后的第一个 token。遇到未知 option 或裸 prompt 后，
+/// 剩余 argv 都是 agy passthrough，绝不继续扫描其中的 token。
+///
+/// `--` 边界的会话语义在这里落地：三条真实输入路径（`sagy -- X`、
+/// `sagy <shortcut> -- X`、`sagy launch <shortcut> -- X）都会被改写成显式的
+/// `launch --no-resume -- X`。之所以放在 router 而不是靠 launcher 去认 `--`，
+/// 是因为 clap 与 shortcut 改写都会吃掉这个 token，launcher 根本看不到它。
 pub fn route(raw_args: &[OsString]) -> Route {
     let program = raw_args
         .first()
@@ -77,13 +84,18 @@ pub fn route(raw_args: &[OsString]) -> Route {
     }
 
     if !launch_shortcuts.is_empty() {
+        let remaining = raw_args.get(index..).unwrap_or_default();
+        let boundary = remaining.first().is_some_and(|arg| arg == "--");
+        // `--` 边界即新会话；shortcut 里已经显式写了 --no-resume 就不要重复注入。
+        if boundary && !launch_shortcuts.iter().any(|flag| flag == NO_RESUME_FLAG) {
+            launch_shortcuts.push(OsString::from(NO_RESUME_FLAG));
+        }
         let mut clap_args = clap_prefix;
         clap_args.push(OsString::from("launch"));
         clap_args.extend(launch_shortcuts);
-        let remaining = raw_args.get(index..).unwrap_or_default();
         if !remaining.is_empty() {
             clap_args.push(OsString::from("--"));
-            if remaining.first().is_some_and(|arg| arg == "--") {
+            if boundary {
                 clap_args.extend_from_slice(&remaining[1..]);
             } else {
                 clap_args.extend_from_slice(remaining);
@@ -97,15 +109,19 @@ pub fn route(raw_args: &[OsString]) -> Route {
     };
 
     if first == "--" {
-        return Route::Passthrough {
-            state_dir,
-            args: raw_args.get(index + 1..).unwrap_or_default().to_vec(),
-        };
+        // 裸 `--` 边界也走显式 launch，让"边界即新会话"这条规则真的可达；
+        // `--` 本身不透传给 agy，否则 agy 会把后面的 option 当成 positional。
+        let mut clap_args = clap_prefix;
+        clap_args.push(OsString::from("launch"));
+        clap_args.push(OsString::from(NO_RESUME_FLAG));
+        clap_args.push(OsString::from("--"));
+        clap_args.extend_from_slice(raw_args.get(index + 1..).unwrap_or_default());
+        return Route::Clap(clap_args);
     }
 
     if is_known_subcmd(&first.to_string_lossy()) {
         let mut clap_args = clap_prefix;
-        clap_args.extend_from_slice(&raw_args[index..]);
+        clap_args.extend(with_boundary_new_session(&raw_args[index..]));
         return Route::Clap(clap_args);
     }
 
@@ -113,6 +129,33 @@ pub fn route(raw_args: &[OsString]) -> Route {
         state_dir,
         args: raw_args[index..].to_vec(),
     }
+}
+
+/// 显式 `sagy launch ... -- <agy args>` 也要遵守"`--` 边界即新会话"。
+///
+/// clap 在解析 `launch` 时会吃掉 `--`，所以必须在进 clap 前把边界翻译成
+/// 一个显式的 `--no-resume`。只扫描 launch 自己那几个 flag，扫到第一个非
+/// flag 的 token 就停手，避免误读 agy 的参数。
+fn with_boundary_new_session(subcommand_args: &[OsString]) -> Vec<OsString> {
+    if subcommand_args.first().map(OsString::as_os_str) != Some("launch".as_ref()) {
+        return subcommand_args.to_vec();
+    }
+    let mut cursor = 1;
+    while subcommand_args
+        .get(cursor)
+        .is_some_and(|arg| LAUNCH_SHORTCUT_FLAGS.contains(&arg.to_string_lossy().as_ref()))
+    {
+        cursor += 1;
+    }
+    let mut rewritten = subcommand_args.to_vec();
+    if subcommand_args.get(cursor).is_some_and(|arg| arg == "--")
+        && !subcommand_args[1..cursor]
+            .iter()
+            .any(|arg| arg == NO_RESUME_FLAG)
+    {
+        rewritten.insert(cursor, OsString::from(NO_RESUME_FLAG));
+    }
+    rewritten
 }
 
 #[cfg(test)]
@@ -195,14 +238,88 @@ mod tests {
     }
 
     #[test]
-    fn routes_delimiter_without_inspecting_following_tokens() {
-        let routed = route(&args(&["sagy", "--", "--help", "list"]));
+    fn delimiter_becomes_an_explicit_new_session_launch() {
+        // 裸边界。
         assert_eq!(
-            routed,
-            Route::Passthrough {
-                state_dir: None,
-                args: args(&["--help", "list"]),
-            }
+            route(&args(&["sagy", "--", "--help", "list"])),
+            Route::Clap(args(&[
+                "sagy",
+                "launch",
+                "--no-resume",
+                "--",
+                "--help",
+                "list"
+            ]))
+        );
+        // prefix 之后的边界。
+        assert_eq!(
+            route(&args(&[
+                "sagy",
+                "--state-dir",
+                "/tmp/state",
+                "--",
+                "--version"
+            ])),
+            Route::Clap(args(&[
+                "sagy",
+                "--state-dir",
+                "/tmp/state",
+                "launch",
+                "--no-resume",
+                "--",
+                "--version"
+            ]))
+        );
+        // shortcut 之后的边界：注入一次，且不与已有的 --no-resume 重复。
+        assert_eq!(
+            route(&args(&["sagy", "--dry-run", "--", "--version"])),
+            Route::Clap(args(&[
+                "sagy",
+                "launch",
+                "--dry-run",
+                "--no-resume",
+                "--",
+                "--version"
+            ]))
+        );
+        // 显式 launch 子命令的边界。
+        assert_eq!(
+            route(&args(&["sagy", "launch", "--", "--version"])),
+            Route::Clap(args(&["sagy", "launch", "--no-resume", "--", "--version"]))
+        );
+        assert_eq!(
+            route(&args(&[
+                "sagy",
+                "launch",
+                "--no-import-known",
+                "--",
+                "--version"
+            ])),
+            Route::Clap(args(&[
+                "sagy",
+                "launch",
+                "--no-import-known",
+                "--no-resume",
+                "--",
+                "--version"
+            ]))
+        );
+        assert_eq!(
+            route(&args(&["sagy", "launch", "--no-resume", "--", "--version"])),
+            Route::Clap(args(&["sagy", "launch", "--no-resume", "--", "--version"]))
+        );
+    }
+
+    #[test]
+    fn launch_without_a_delimiter_keeps_its_arguments_verbatim() {
+        // `--` 之外的 launch 调用不得被注入 --no-resume。
+        assert_eq!(
+            route(&args(&["sagy", "launch", "--no-import-known"])),
+            Route::Clap(args(&["sagy", "launch", "--no-import-known"]))
+        );
+        assert_eq!(
+            route(&args(&["sagy", "list"])),
+            Route::Clap(args(&["sagy", "list"]))
         );
     }
 

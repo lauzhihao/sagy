@@ -1,5 +1,5 @@
 # sagy Project Map
-> Generated: 2026年 8月20日 星期四 11时22分01秒 CST
+> Generated: Tue Aug 25 18:42:18 CST 2026
 > Strategy: Source Focused (src expanded, target collapsed)
 
 ## Package
@@ -8,22 +8,27 @@
 - version: 0.1.0
 - edition: 2024
 - description: Cross-platform account-aware launcher and scheduler for Google Antigravity CLI (agy).
-- dependencies (17): anyhow, argon2, base64, chacha20poly1305, chrono, clap, directories, flate2, reqwest, serde, serde_json, self-replace, sha2, tar, unicode-width, uuid, zip
+- dependencies (20): anyhow, argon2, base64, chacha20poly1305, chrono, clap, directories, flate2, fs2, reqwest, rpassword, serde, serde_json, semver, self-replace, sha2, tar, unicode-width, uuid, zip
 
 ## Rust Modules
 
 - crate root: lib, main
 - adapters: mod
-- adapters::antigravity: account, auth, launcher, mod, paths, repo_sync, ui, usage
-- cli: args, help, launch, mod, repo_sync
-- core: mod, policy, state, storage, ui, update
+- adapters::antigravity: account, active_home, auth, launch_observation, launcher, mod, paths, repo_bundle, repo_sync, ui, usage
+- adapters::antigravity::account: credential_store
+- cli: args, help, launch, mod, repo_sync, router
+- core: atomic_io, atomic_store, credential, health, mod, policy, state, state_store, storage, ui, update
 
 ## Directory Structure
 ```text
 |-- [D] .github/
 |   -- [D] workflows/
+|       |-- [F] ci.yml
 |       -- [F] release.yml
 |-- [D] backlog/
+|   |-- [D] reviews/
+|   |   |-- [F] 2026-08-24-full-code-review.md
+|   |   -- [F] 2026-08-25-post-refactor-audit.md
 |   |-- [D] tasks/
 |   |   |-- [F] bugs-001-cargo-test-overwrites-real-credentials.md
 |   |   |-- [F] bugs-002-oauth-probe-blocks-launch.md
@@ -42,7 +47,38 @@
 |   |   |-- [F] bugs-010-alias-launcher-doc.md
 |   |   |-- [F] bugs-013-drop-model-aliases.md
 |   |   |-- [F] bugs-014-cleanup-dead-api-and-install-upgrade.md
+|   |   |-- [F] bugs-015-remove-dead-no-login-flag.md
 |   |   -- [F] TEMPLATE.md
+|   |-- [D] tasks-v3/
+|   |   |-- [D] round2/
+|   |   |   |-- [F] COMMON.md
+|   |   |   |-- [F] R1-state-store.md
+|   |   |   |-- [F] R2-account.md
+|   |   |   |-- [F] R3-active-home.md
+|   |   |   |-- [F] R4-repo-sync.md
+|   |   |   |-- [F] R5-launch.md
+|   |   |   |-- [F] R6-health.md
+|   |   |   |-- [F] R7-supply.md
+|   |   |   |-- [F] R8-docs.md
+|   |   |   -- [F] R9-cli.md
+|   |   |-- [D] round3/
+|   |   |   |-- [F] COMMON.md
+|   |   |   |-- [F] R10-sync-commit.md
+|   |   |   |-- [F] R11-launch.md
+|   |   |   -- [F] R12-cleanup.md
+|   |   |-- [D] round4/
+|   |   |   |-- [F] COMMON.md
+|   |   |   -- [F] R13-first-run-adoption.md
+|   |   |-- [F] COMMON.md
+|   |   |-- [F] T1-state-root-usability.md
+|   |   |-- [F] T2-migration-and-account-lifecycle.md
+|   |   |-- [F] T3-active-home-crash-recovery.md
+|   |   |-- [F] T4-repo-sync-pool-integrity.md
+|   |   |-- [F] T5-launch-observation-and-tty.md
+|   |   |-- [F] T6-health-policy-availability.md
+|   |   |-- [F] T7-cli-surface-cleanup.md
+|   |   |-- [F] T8-supply-chain-and-installers.md
+|   |   -- [F] T9-docs-consistency.md
 |   |-- [D] verify/
 |   |   |-- [F] bugs-001.sh
 |   |   |-- [F] bugs-002.sh
@@ -55,19 +91,32 @@
 |   |   |-- [F] bugs-012.sh
 |   |   |-- [F] bugs-013.sh
 |   |   |-- [F] bugs-014.sh
+|   |   |-- [F] bugs-015.sh
 |   |   |-- [F] fixtures.sh
-|   |   -- [F] lib.sh
+|   |   |-- [F] lib.sh
+|   |   |-- [F] t1-state-root.sh
+|   |   |-- [F] t10-sync-commit.sh
+|   |   |-- [F] t11-first-run.sh
+|   |   |-- [F] t2-migration.sh
+|   |   |-- [F] t4-repo-sync.sh
+|   |   |-- [F] t6-offline.sh
+|   |   -- [F] t7-cli.sh
 |   -- [F] README.md
 |-- [D] scripts/
 |   -- [F] map_project.py
 |-- [D] src/
 |   |-- [D] adapters/
 |   |   |-- [D] antigravity/
+|   |   |   |-- [D] account/
+|   |   |   |   -- [F] credential_store.rs
 |   |   |   |-- [F] account.rs
+|   |   |   |-- [F] active_home.rs
 |   |   |   |-- [F] auth.rs
+|   |   |   |-- [F] launch_observation.rs
 |   |   |   |-- [F] launcher.rs
 |   |   |   |-- [F] mod.rs
 |   |   |   |-- [F] paths.rs
+|   |   |   |-- [F] repo_bundle.rs
 |   |   |   |-- [F] repo_sync.rs
 |   |   |   |-- [F] ui.rs
 |   |   |   -- [F] usage.rs
@@ -77,17 +126,43 @@
 |   |   |-- [F] help.rs
 |   |   |-- [F] launch.rs
 |   |   |-- [F] mod.rs
-|   |   -- [F] repo_sync.rs
+|   |   |-- [F] repo_sync.rs
+|   |   -- [F] router.rs
 |   |-- [D] core/
+|   |   |-- [F] atomic_io.rs
+|   |   |-- [F] atomic_store.rs
+|   |   |-- [F] credential.rs
+|   |   |-- [F] health.rs
 |   |   |-- [F] mod.rs
 |   |   |-- [F] policy.rs
 |   |   |-- [F] state.rs
+|   |   |-- [F] state_store.rs
 |   |   |-- [F] storage.rs
 |   |   |-- [F] ui.rs
 |   |   -- [F] update.rs
 |   |-- [F] lib.rs
 |   -- [F] main.rs
-|-- [D] target/  [collapsed: 15371 files]
+|-- [D] target/  [collapsed: 138056 files]
+|-- [D] tests/
+|   |-- [F] ci_workflow.rs
+|   |-- [F] cli_routing.rs
+|   |-- [F] p0_checksum.ps1
+|   |-- [F] p0_checksum.rs
+|   |-- [F] p0_first_run_adoption.rs
+|   |-- [F] p0_repo_boundaries.rs
+|   |-- [F] p0_state_load_boundaries.rs
+|   |-- [F] p0_state_root_layout.rs
+|   |-- [F] p1_active_home_recovery.rs
+|   |-- [F] p1_auth_secret_input.rs
+|   |-- [F] p1_launch_observation.rs
+|   |-- [F] p1_launcher_auth_env.rs
+|   |-- [F] p1_legacy_migration.rs
+|   |-- [F] p1_offline_availability.rs
+|   |-- [F] p1_rate_limit_fallback.rs
+|   |-- [F] p1_refresh_token_preservation.rs
+|   |-- [F] p1_repo_sync_pool.rs
+|   |-- [F] p2_cli_surface.rs
+|   -- [F] windows_runtime.rs
 |-- [F] AGENTS.md
 |-- [F] ARCHITECTURE.md
 |-- [F] Cargo.lock

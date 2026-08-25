@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use fs2::FileExt;
-use sagy::core::credential::PortableCredential;
+use sagy::core::credential::{GOOGLE_AUTH_ENV_VARS, PortableCredential};
 use sagy::core::state::{AccountType, CredentialRefKind, ManagedLayout, SlotState};
 use sagy::core::storage;
 use serde_json::json;
@@ -24,6 +24,7 @@ struct Harness {
     home_dir: PathBuf,
     fake_agy: PathBuf,
     observed_env: PathBuf,
+    observed_dump: PathBuf,
 }
 
 impl Harness {
@@ -33,6 +34,7 @@ impl Harness {
         let home_dir = temp.path().join("home");
         let fake_agy = temp.path().join("fake-agy");
         let observed_env = temp.path().join("observed-env");
+        let observed_dump = temp.path().join("observed-google-auth-env");
         fs::create_dir_all(&home_dir).expect("create isolated home");
         write_fake_agy(&fake_agy);
         Self {
@@ -41,6 +43,7 @@ impl Harness {
             home_dir,
             fake_agy,
             observed_env,
+            observed_dump,
         }
     }
 
@@ -127,14 +130,25 @@ impl Harness {
     }
 
     fn run(&self) -> Output {
+        self.run_with_parent_env(&[])
+    }
+
+    /// `parent_env` 是父进程额外注入的变量, 用来验证 deny-list 的清理范围。
+    fn run_with_parent_env(&self, parent_env: &[(&str, &str)]) -> Output {
         let _ = fs::remove_file(&self.observed_env);
-        Command::new(env!("CARGO_BIN_EXE_sagy"))
+        let _ = fs::remove_file(&self.observed_dump);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+        for (name, value) in parent_env {
+            command.env(name, value);
+        }
+        command
             .env("HOME", &self.home_dir)
             .env("SAGY_HOME", &self.state_dir)
             .env("ANTIGRAVITY_CONFIG_DIR", self.home_dir.join("antigravity"))
             .env("GEMINI_HOME", self.home_dir.join("gemini"))
             .env("AGY_BIN", &self.fake_agy)
             .env("FAKE_AGY_OUTPUT", &self.observed_env)
+            .env("FAKE_AGY_ENV_DUMP", &self.observed_dump)
             .env("GEMINI_API_KEY", PARENT_API_KEY)
             .env("GOOGLE_APPLICATION_CREDENTIALS", PARENT_CREDENTIALS)
             .env("GOOGLE_CLOUD_PROJECT", PARENT_PROJECT)
@@ -151,6 +165,15 @@ impl Harness {
 
     fn observed(&self) -> String {
         fs::read_to_string(&self.observed_env).expect("fake agy should record environment")
+    }
+
+    /// `NAME=value` / `NAME=<unset>` for every Google authentication variable.
+    fn observed_google_auth_env(&self) -> Vec<String> {
+        fs::read_to_string(&self.observed_dump)
+            .expect("fake agy should dump the Google auth environment")
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
     }
 }
 
@@ -268,6 +291,67 @@ fn child_auth_environment_is_rebuilt_for_each_account_type() {
         authorized.observed(),
         expected_env(None, None, Some("selected-authorized-project"))
     );
+}
+
+/// AC-R5-4.2: 父进程设置整张 Google 认证 deny-list 后启动, 子进程只能看到
+/// 当前账号类型重建出来的那几个, 其余一律 `<unset>`。
+#[test]
+fn the_parent_google_auth_environment_never_reaches_the_child() {
+    let harness = Harness::new();
+    let document = valid_vertex_document();
+    harness.write_credentials("vertex-account", "credentials.json", document);
+    let credential =
+        PortableCredential::from_native_json_str(document).expect("parse Vertex fixture");
+    harness.save_v2_account(
+        "vertex-account",
+        "vertex@example.test",
+        AccountType::Vertex,
+        Some("selected-project"),
+        CredentialRefKind::VertexServiceAccount,
+        &credential,
+        ManagedLayout::default(),
+    );
+
+    // 工单点名的三个之外, 整张表都由父进程注入, 一个都不能漏。
+    let parent_env = GOOGLE_AUTH_ENV_VARS
+        .iter()
+        .map(|name| (*name, "parent-inherited-value"))
+        .collect::<Vec<_>>();
+    assert!(parent_env.iter().any(|(name, _)| *name == "GOOGLE_API_KEY"));
+    assert!(
+        parent_env
+            .iter()
+            .any(|(name, _)| *name == "GOOGLE_GENAI_USE_VERTEXAI")
+    );
+    assert!(
+        parent_env
+            .iter()
+            .any(|(name, _)| *name == "GOOGLE_CLOUD_LOCATION")
+    );
+
+    assert_success(
+        harness.run_with_parent_env(&parent_env),
+        "Vertex launch with a fully populated parent auth environment",
+    );
+
+    // 这次 launch 只应重建 GOOGLE_APPLICATION_CREDENTIALS 与 GOOGLE_CLOUD_PROJECT。
+    let credentials_path =
+        fs::canonicalize(harness.account_credentials_path("vertex-account", "credentials.json"))
+            .expect("canonicalize Vertex path");
+    let expected = GOOGLE_AUTH_ENV_VARS
+        .iter()
+        .map(|name| match *name {
+            "GOOGLE_APPLICATION_CREDENTIALS" => {
+                format!(
+                    "GOOGLE_APPLICATION_CREDENTIALS={}",
+                    credentials_path.display()
+                )
+            }
+            "GOOGLE_CLOUD_PROJECT" => "GOOGLE_CLOUD_PROJECT=selected-project".to_string(),
+            other => format!("{other}=<unset>"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(harness.observed_google_auth_env(), expected);
 }
 
 #[test]
@@ -430,25 +514,41 @@ fn expected_env(
 }
 
 fn write_fake_agy(path: &Path) {
-    let script = r#"#!/bin/sh
+    // deny-list 的清理范围只能由子进程亲眼所见来证明, 所以 fake agy 把整张表
+    // 的实际可见性 dump 出来, 而不是由测试去读 launcher 的内部函数。
+    let dump = GOOGLE_AUTH_ENV_VARS
+        .iter()
+        .map(|name| {
+            format!(
+                "if [ \"${{{name}+x}}\" = x ]; then\n    printf '{name}=%s\\n' \"${name}\"\nelse\n    printf '{name}=<unset>\\n'\nfi\n"
+            )
+        })
+        .collect::<String>();
+    let script = format!(
+        r#"#!/bin/sh
 set -eu
+if [ "${{FAKE_AGY_ENV_DUMP+x}}" = x ]; then
+(
+{dump}) > "$FAKE_AGY_ENV_DUMP"
+fi
 exec > "$FAKE_AGY_OUTPUT"
-if [ "${GEMINI_API_KEY+x}" = x ]; then
+if [ "${{GEMINI_API_KEY+x}}" = x ]; then
     printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY"
 else
     printf 'GEMINI_API_KEY=<unset>\n'
 fi
-if [ "${GOOGLE_APPLICATION_CREDENTIALS+x}" = x ]; then
+if [ "${{GOOGLE_APPLICATION_CREDENTIALS+x}}" = x ]; then
     printf 'GOOGLE_APPLICATION_CREDENTIALS=%s\n' "$GOOGLE_APPLICATION_CREDENTIALS"
 else
     printf 'GOOGLE_APPLICATION_CREDENTIALS=<unset>\n'
 fi
-if [ "${GOOGLE_CLOUD_PROJECT+x}" = x ]; then
+if [ "${{GOOGLE_CLOUD_PROJECT+x}}" = x ]; then
     printf 'GOOGLE_CLOUD_PROJECT=%s\n' "$GOOGLE_CLOUD_PROJECT"
 else
     printf 'GOOGLE_CLOUD_PROJECT=<unset>\n'
 fi
-"#;
+"#
+    );
     fs::write(path, script).expect("write fake agy");
     make_executable(path);
 }

@@ -29,6 +29,17 @@ pub const MAX_BUNDLE_PLAINTEXT_BYTES: usize = 8 * 1024 * 1024;
 /// This catches accidental millisecond values and sentinel overflows without
 /// making normal clock skew a synchronization failure.
 pub const MAX_BUNDLE_EXPORTED_AT: i64 = 4_102_444_800;
+/// Maximum number of deletion records carried by one bundle.
+///
+/// Tombstones must stay bounded: an unbounded list would grow forever and
+/// eventually push the plaintext past [`MAX_BUNDLE_PLAINTEXT_BYTES`].
+pub const MAX_BUNDLE_TOMBSTONES: usize = 256;
+/// A tombstone stops being replayed after this many seconds.
+///
+/// 90 days is comfortably longer than any realistic offline window for a
+/// machine that still participates in the pool, and short enough that the
+/// list drains on its own.
+pub const BUNDLE_TOMBSTONE_TTL_SECONDS: i64 = 90 * 24 * 60 * 60;
 
 const MAX_BUNDLE_NESTING_DEPTH: usize = MAX_CREDENTIAL_NESTING_DEPTH + 8;
 const MAX_BUNDLE_CONTAINER_ITEMS: usize = 256;
@@ -111,6 +122,64 @@ impl BundleAccountMetadata {
     }
 }
 
+/// A bounded deletion record.
+///
+/// The pool carries deletions explicitly: without them a machine that already
+/// holds a removed account would simply merge it back on the next pull and the
+/// deletion could never propagate.  `fingerprint` pins the record to the exact
+/// credential that was deleted so a later re-import under the same id is not
+/// mistaken for the deleted account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleTombstone {
+    pub account_id: String,
+    pub fingerprint: String,
+    pub deleted_at: i64,
+}
+
+impl BundleTombstone {
+    /// Construct a tombstone after validating its portable scalar fields.
+    pub fn new(
+        account_id: impl Into<String>,
+        fingerprint: impl Into<String>,
+        deleted_at: i64,
+    ) -> Result<Self, BundleError> {
+        let tombstone = Self {
+            account_id: account_id.into(),
+            fingerprint: fingerprint.into(),
+            deleted_at,
+        };
+        tombstone.validate()?;
+        Ok(tombstone)
+    }
+
+    /// True when the record is still inside the replay window.
+    pub fn is_live_at(&self, now: i64) -> bool {
+        now.saturating_sub(self.deleted_at) <= BUNDLE_TOMBSTONE_TTL_SECONDS
+    }
+
+    fn validate(&self) -> Result<(), BundleError> {
+        validate_account_id(&self.account_id).map_err(|_| BundleError::InvalidTombstone)?;
+        validate_credential_fingerprint(&self.fingerprint)?;
+        if !(0..=MAX_BUNDLE_EXPORTED_AT).contains(&self.deleted_at) {
+            return Err(BundleError::InvalidTombstone);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for BundleTombstone {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let StrictValue(value) = StrictValue::deserialize(deserializer)?;
+        let wire: BundleTombstoneWire = serde_json::from_value(value)
+            .map_err(|_| de::Error::custom(BundleError::InvalidStructure))?;
+        Self::new(wire.account_id, wire.fingerprint, wire.deleted_at).map_err(de::Error::custom)
+    }
+}
+
 /// One account's path-free metadata and complete portable credential.
 #[derive(Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -167,6 +236,11 @@ pub struct BundleV2 {
     pub generation: u64,
     pub exported_at: i64,
     pub accounts: Vec<BundleAccount>,
+    // 空 tombstone 列表必须完全不出现在 wire 上：这样没有删除记录的 bundle 与
+    // 旧版本产生的字节完全一致，既不破坏已存储的 semantic 水位，也不会让旧
+    // 二进制的 deny_unknown_fields 解析失败。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones: Vec<BundleTombstone>,
 }
 
 impl BundleV2 {
@@ -177,12 +251,24 @@ impl BundleV2 {
         exported_at: i64,
         accounts: Vec<BundleAccount>,
     ) -> Result<Self, BundleError> {
+        Self::new_with_tombstones(pool_id, generation, exported_at, accounts, Vec::new())
+    }
+
+    /// Construct and validate a bundle that also carries deletion records.
+    pub fn new_with_tombstones(
+        pool_id: impl Into<String>,
+        generation: u64,
+        exported_at: i64,
+        accounts: Vec<BundleAccount>,
+        tombstones: Vec<BundleTombstone>,
+    ) -> Result<Self, BundleError> {
         let mut bundle = Self {
             version: BUNDLE_VERSION,
             pool_id: pool_id.into(),
             generation,
             exported_at,
             accounts,
+            tombstones,
         };
         bundle.validate_and_sort()?;
         Ok(bundle)
@@ -237,6 +323,7 @@ impl BundleV2 {
             version: BUNDLE_VERSION,
             pool_id: bundle.pool_id,
             accounts: bundle.accounts,
+            tombstones: bundle.tombstones,
         };
         serialize_bounded(&semantic)
     }
@@ -321,6 +408,10 @@ impl BundleV2 {
         &self.accounts
     }
 
+    pub fn tombstones(&self) -> &[BundleTombstone] {
+        &self.tombstones
+    }
+
     fn from_value(value: Value) -> Result<Self, BundleError> {
         let mut budget = MAX_BUNDLE_JSON_VALUES;
         validate_json_value(&value, 0, &mut budget)?;
@@ -333,11 +424,12 @@ impl BundleV2 {
         if wire.version != BUNDLE_VERSION {
             return Err(BundleError::UnsupportedVersion);
         }
-        Self::new(
+        Self::new_with_tombstones(
             wire.pool_id,
             wire.generation,
             wire.exported_at,
             wire.accounts,
+            wire.tombstones,
         )
     }
 
@@ -365,11 +457,11 @@ impl BundleV2 {
             return Err(BundleError::TooManyAccounts);
         }
 
-        let mut ids = HashSet::with_capacity(self.accounts.len());
+        let mut ids = HashSet::<String>::with_capacity(self.accounts.len());
         let mut fingerprints = HashSet::with_capacity(self.accounts.len());
         for account in &self.accounts {
             account.validate()?;
-            if !ids.insert(account.id.as_str()) {
+            if !ids.insert(account.id.clone()) {
                 return Err(BundleError::DuplicateAccountId);
             }
             if !fingerprints.insert(account.credential.fingerprint()) {
@@ -377,6 +469,24 @@ impl BundleV2 {
             }
         }
         self.accounts.sort_by(|left, right| left.id.cmp(&right.id));
+
+        if self.tombstones.len() > MAX_BUNDLE_TOMBSTONES {
+            return Err(BundleError::TooManyTombstones);
+        }
+        let mut tombstone_ids = HashSet::with_capacity(self.tombstones.len());
+        for tombstone in &self.tombstones {
+            tombstone.validate()?;
+            if !tombstone_ids.insert(tombstone.account_id.as_str()) {
+                return Err(BundleError::DuplicateTombstone);
+            }
+            // 一个账号不可能同时"存在"和"已删除"：这种自相矛盾的 bundle 只会
+            // 让接收方无法判断该保留还是该删除，直接拒绝。
+            if ids.contains(tombstone.account_id.as_str()) {
+                return Err(BundleError::TombstoneConflictsWithAccount);
+            }
+        }
+        self.tombstones
+            .sort_by(|left, right| left.account_id.cmp(&right.account_id));
 
         // Serialize once after normalization so programmatically-built values
         // receive the same global limit as decoded plaintext.
@@ -465,6 +575,10 @@ pub enum BundleError {
     CredentialKindMismatch,
     DuplicateAccountId,
     DuplicateCredentialFingerprint,
+    InvalidTombstone,
+    DuplicateTombstone,
+    TombstoneConflictsWithAccount,
+    TooManyTombstones,
     TooManyAccounts,
     PlaintextTooLarge,
     TooDeep,
@@ -496,6 +610,10 @@ impl BundleError {
             Self::DuplicateCredentialFingerprint => {
                 "bundle contains duplicate credential fingerprints"
             }
+            Self::InvalidTombstone => "bundle deletion record is invalid",
+            Self::DuplicateTombstone => "bundle contains duplicate deletion records",
+            Self::TombstoneConflictsWithAccount => "bundle deletes and carries the same account id",
+            Self::TooManyTombstones => "bundle contains too many deletion records",
             Self::TooManyAccounts => "bundle contains too many accounts",
             Self::PlaintextTooLarge => "bundle plaintext exceeds the size limit",
             Self::TooDeep => "bundle JSON is nested too deeply",
@@ -532,6 +650,16 @@ struct BundleWire {
     generation: u64,
     exported_at: i64,
     accounts: Vec<BundleAccount>,
+    #[serde(default)]
+    tombstones: Vec<BundleTombstone>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleTombstoneWire {
+    account_id: String,
+    fingerprint: String,
+    deleted_at: i64,
 }
 
 #[derive(Deserialize)]
@@ -562,6 +690,52 @@ struct SemanticBundle {
     version: u32,
     pool_id: String,
     accounts: Vec<BundleAccount>,
+    // 同上：无删除记录时不写入该字段，保持既有 semantic hash 不变。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tombstones: Vec<BundleTombstone>,
+}
+
+/// A best-effort description of a pre-v2 bundle plaintext.
+///
+/// It exists purely so the adapter can print an actionable recovery message
+/// instead of a bare "unsupported bundle version": a repository that still
+/// holds a legacy bundle would otherwise be permanently unusable in both
+/// directions with no indication of what the user must do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyBundleSummary {
+    pub version: u64,
+    pub account_count: usize,
+    pub emails: Vec<String>,
+}
+
+/// Recognize a decrypted plaintext that is a bundle older than
+/// [`BUNDLE_VERSION`].  Returns `None` for anything else, including a v2
+/// bundle that merely failed strict validation.
+pub fn inspect_legacy_bundle(bytes: &[u8]) -> Option<LegacyBundleSummary> {
+    if bytes.len() > MAX_BUNDLE_PLAINTEXT_BYTES {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    let object = value.as_object()?;
+    let version = object.get("version")?.as_u64()?;
+    if version == 0 || version >= u64::from(BUNDLE_VERSION) {
+        return None;
+    }
+    let accounts = object.get("accounts")?.as_array()?;
+    let emails = accounts
+        .iter()
+        .filter_map(|account| account.as_object())
+        .filter_map(|account| account.get("email"))
+        .filter_map(Value::as_str)
+        .filter(|email| !email.trim().is_empty() && email.is_ascii())
+        .take(MAX_BUNDLE_ACCOUNTS)
+        .map(str::to_owned)
+        .collect();
+    Some(LegacyBundleSummary {
+        version,
+        account_count: accounts.len(),
+        emails,
+    })
 }
 
 fn serialize_bounded<T: Serialize>(value: &T) -> Result<Vec<u8>, BundleError> {
@@ -626,6 +800,20 @@ fn validate_credential_pair(
     } else {
         Err(BundleError::CredentialKindMismatch)
     }
+}
+
+fn validate_credential_fingerprint(value: &str) -> Result<(), BundleError> {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return Err(BundleError::InvalidTombstone);
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(BundleError::InvalidTombstone);
+    }
+    Ok(())
 }
 
 fn validate_semantic_sha256(value: &str) -> Result<(), BundleError> {

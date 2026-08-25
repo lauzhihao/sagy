@@ -15,9 +15,7 @@ pub struct Messages {
 }
 
 pub fn messages() -> Messages {
-    Messages {
-        language: detect_ui_language(),
-    }
+    Messages::new(detect_ui_language())
 }
 
 pub fn detect_ui_language() -> UiLanguage {
@@ -65,15 +63,22 @@ pub fn format_top_level_error(error: &Error) -> String {
 }
 
 impl Messages {
+    pub const fn new(language: UiLanguage) -> Self {
+        Self { language }
+    }
+
     pub fn is_zh(&self) -> bool {
         matches!(self.language, UiLanguage::ZhHans)
     }
 
+    /// 原文只让用户去 `sagy add`，而最常见的真实原因是探测通道不可达
+    /// （断网 / 代理 / DNS / 域名被墙），与"没有账号"毫无关系。提示必须先说明
+    /// sagy 在探测失败时仍然会使用缓存与本地校验结果，再给出添加账号的指引。
     pub fn no_usable_account_hint(&self) -> &'static str {
         if self.is_zh() {
-            "没有可用账号，请先执行 `sagy add` 或 `sagy login`，或执行 `sagy import-known` 导入当前配置。"
+            "当前没有账号可以被选中。若健康探测通道不可达（断网、代理、DNS 或网关故障），sagy 会继续使用缓存与本地校验结果，请执行 `sagy list` 查看每个账号的真实状态；若确实还没有账号，请执行 `sagy add`、`sagy login` 或 `sagy import-known`。"
         } else {
-            "No usable accounts found. Run `sagy add`, `sagy login`, or `sagy import-known` first."
+            "No account is currently selectable. If the health probe endpoint is unreachable (offline, proxy, DNS, or gateway failure), sagy keeps using its cached and locally validated credentials; run `sagy list` to see the real per-account status. If you have no accounts yet, run `sagy add`, `sagy login`, or `sagy import-known`."
         }
     }
 
@@ -222,5 +227,26 @@ impl Messages {
         } else {
             "Please restart your terminal to use the new binary."
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC-1.4：提示语必须说明真实原因（探测通道不可达 + 仍在用缓存/本地校验），
+    /// 不能只让用户去 `sagy add`。
+    #[test]
+    fn no_usable_account_hint_names_the_probe_channel_in_both_languages() {
+        let english = Messages::new(UiLanguage::En).no_usable_account_hint();
+        assert!(english.contains("probe"), "{english}");
+        assert!(english.contains("unreachable"), "{english}");
+        assert!(english.contains("cached"), "{english}");
+        assert!(english.contains("locally validated"), "{english}");
+        assert!(english.is_ascii(), "{english}");
+
+        let chinese = Messages::new(UiLanguage::ZhHans).no_usable_account_hint();
+        assert!(chinese.contains("\u{63a2}\u{6d4b}"), "{chinese}");
+        assert!(chinese.contains("\u{7f13}\u{5b58}"), "{chinese}");
     }
 }

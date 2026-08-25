@@ -9,7 +9,6 @@ use sagy::adapters::antigravity::paths::{
 };
 use sagy::cli::repo_sync::resolve_repo_sync_repo;
 use sagy::core::state::{AccountRecord, State};
-use sagy::core::storage;
 
 #[test]
 fn bundle_path_is_a_safe_relative_path() {
@@ -173,21 +172,16 @@ fn push_round_trip_uses_a_disposable_local_bare_repository() {
     );
     run_git(&git_bin, Some(&seed), &["push", "origin", "HEAD"]);
 
+    // legacy `storage::save_state` 已删除。这里直接铺一份真实 v1 磁盘文档,
+    // 让 `sagy push` 走生产读路径（含 v1 -> v2 迁移）把凭据自己物化出来,
+    // 而不是绕过生产路径手工摆放 state。
     let state_dir = temp.path().join("state");
-    let token_path = state_dir
-        .join("accounts")
-        .join("safe-account")
-        .join("antigravity-oauth-token");
-    storage::write_secret_file(&token_path, b"token").expect("fixed token");
-    let mut state = State::default();
-    state.accounts.push(AccountRecord {
-        id: "safe-account".to_string(),
-        email: "safe@example.test".to_string(),
-        auth_path: token_path.to_string_lossy().into_owned(),
-        oauth_token: Some("token".to_string()),
-        ..AccountRecord::default()
-    });
-    storage::save_state(&state_dir, &state).expect("state");
+    fs::create_dir_all(&state_dir).expect("state dir");
+    fs::write(
+        state_dir.join("state.json"),
+        br#"{"accounts":[{"id":"safe-account","email":"safe@example.test","account_type":"oauth","oauth_token":"token"}]}"#,
+    )
+    .expect("state");
 
     let output = Command::new(sagy_bin)
         .env("SAGY_POOL_KEY", "test-pool-key")

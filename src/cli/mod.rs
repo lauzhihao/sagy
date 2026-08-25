@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 
-use crate::adapters::antigravity::account::{ActiveHomeAdoption, MutationResult};
+use crate::adapters::antigravity::account::{ActiveHomeAdoption, MutationResult, ascii_console};
 use crate::adapters::antigravity::{AntigravityAdapter, LaunchDiagnostic, ProcessTermination};
 use crate::core::atomic_io::NormalizedStoreRoot;
 use crate::core::health::{ProbeOutcome, ProbeSubject, reduce_usage_observed};
@@ -40,7 +40,11 @@ use router::{Route, route};
     about = "Google Antigravity CLI (agy) smart multi-account manager & launcher"
 )]
 pub struct Cli {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Override the state and account directory (default: ~/.sagy or $SAGY_HOME)"
+    )]
     pub state_dir: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -53,15 +57,20 @@ pub enum Command {
     Auto(AutoArgs),
     Add(AddArgs),
     Login(LoginArgs),
+    #[command(about = "Encrypt and push the local account pool to a Git repository")]
     Push(RepoSyncArgs),
+    #[command(about = "Pull and decrypt an account pool from a Git repository")]
     Pull(RepoSyncArgs),
     Use(UseArgs),
     Rm(RmArgs),
+    #[command(about = "List every known account with its health and quota")]
     List,
+    #[command(about = "Force a health and quota probe for every account")]
     Refresh,
     #[command(visible_alias = "upgrade")]
     Update(UpdateArgs),
     ImportAuth(ImportAuthArgs),
+    #[command(about = "Discover and import existing local Gemini credentials")]
     ImportKnown,
     #[command(external_subcommand)]
     Passthrough(Vec<OsString>),
@@ -101,6 +110,7 @@ where
         dry_run: false,
         no_resume: false,
         no_launch: false,
+        takeover: false,
         extra_args: Vec::new(),
     }));
 
@@ -120,6 +130,7 @@ where
             args.no_import_known,
             args.dry_run,
             args.no_launch,
+            adoption(args.takeover),
             ui,
         ),
         Command::Auto(args) => run_auto(
@@ -128,6 +139,7 @@ where
             &mut session,
             args.no_import_known,
             args.dry_run,
+            adoption(args.takeover),
             ui,
         ),
         Command::Login(args) => {
@@ -143,12 +155,12 @@ where
                 return Ok(2);
             };
             let usage = refresh_one_and_commit(&adapter, &state_dir, &mut session, &record, true)?;
-            println!("{}", ui.added_account(&record.email));
+            println!("{}", ui.added_account(&ascii_console(&record.email)));
             let outcome = adapter.switch_account_session(
                 &state_dir,
                 &mut session,
                 &record.id,
-                ActiveHomeAdoption::Strict,
+                adoption(args.takeover),
             )?;
             let Some(record) = finalized_value(outcome) else {
                 return Ok(2);
@@ -169,13 +181,13 @@ where
                 return Ok(2);
             };
             let usage = refresh_one_and_commit(&adapter, &state_dir, &mut session, &record, true)?;
-            println!("{}", ui.added_account(&record.email));
+            println!("{}", ui.added_account(&ascii_console(&record.email)));
             if args.switch {
                 let outcome = adapter.switch_account_session(
                     &state_dir,
                     &mut session,
                     &record.id,
-                    ActiveHomeAdoption::Strict,
+                    adoption(args.login.takeover),
                 )?;
                 let Some(record) = finalized_value(outcome) else {
                     return Ok(2);
@@ -192,14 +204,14 @@ where
                 .find_account_by_email(session.state(), &args.email)
                 .cloned()
             else {
-                println!("{}", ui.unknown_account(&args.email));
+                println!("{}", ui.unknown_account(&ascii_console(&args.email)));
                 return Ok(1);
             };
             let outcome = adapter.switch_account_session(
                 &state_dir,
                 &mut session,
                 &record.id,
-                ActiveHomeAdoption::Strict,
+                adoption(args.takeover),
             )?;
             let Some(record) = finalized_value(outcome) else {
                 return Ok(2);
@@ -221,7 +233,7 @@ where
                 .find_account_by_email(session.state(), &args.email)
                 .map(|record| (record.id.clone(), record.email.clone()))
             else {
-                println!("{}", ui.unknown_account(&args.email));
+                println!("{}", ui.unknown_account(&ascii_console(&args.email)));
                 return Ok(1);
             };
             if !args.assume_yes {
@@ -229,7 +241,7 @@ where
                     println!("{}", ui.rm_requires_tty());
                     return Ok(1);
                 }
-                if !confirm_remove(&email, ui)? {
+                if !confirm_remove(&ascii_console(&email), ui)? {
                     return Ok(0);
                 }
             }
@@ -237,7 +249,7 @@ where
             if finalized_value(outcome).is_none() {
                 return Ok(2);
             }
-            println!("{}", ui.removed_account(&email));
+            println!("{}", ui.removed_account(&ascii_console(&email)));
             Ok(0)
         }
         Command::Push(args) => {
@@ -252,17 +264,16 @@ where
                 crate::adapters::antigravity::PushOptions {
                     bundle_dir: args.path.as_deref(),
                     identity_file: args.identity_file.as_deref(),
-                    include_all: args.all,
                     insecure_host_key: args.insecure_host_key,
                 },
             )?;
             if outcome.changed {
                 println!(
                     "{}",
-                    ui.repo_push_completed(&repo, outcome.exported_accounts)
+                    ui.repo_push_completed(&ascii_console(&repo), outcome.exported_accounts)
                 );
             } else {
-                println!("{}", ui.repo_push_no_changes(&repo));
+                println!("{}", ui.repo_push_no_changes(&ascii_console(&repo)));
             }
             Ok(0)
         }
@@ -291,7 +302,7 @@ where
             };
             println!(
                 "{}",
-                ui.repo_pull_completed(&repo, outcome.imported_accounts)
+                ui.repo_pull_completed(&ascii_console(&repo), outcome.imported_accounts)
             );
             refresh_all_and_commit(&adapter, &state_dir, &mut session, false)?;
             print_account_table(&adapter, session.state());
@@ -323,7 +334,10 @@ where
             let Some(record) = finalized_value(outcome) else {
                 return Ok(2);
             };
-            println!("{}", ui.imported_account(&record.email, &record.id));
+            println!(
+                "{}",
+                ui.imported_account(&ascii_console(&record.email), &ascii_console(&record.id))
+            );
             Ok(0)
         }
         Command::ImportKnown => {
@@ -339,19 +353,28 @@ where
                 return Ok(1);
             }
             for account in imported {
-                println!("{}", ui.imported_account(&account.email, &account.id));
+                println!(
+                    "{}",
+                    ui.imported_account(
+                        &ascii_console(&account.email),
+                        &ascii_console(&account.id)
+                    )
+                );
             }
             Ok(0)
         }
+        // Passthrough 与显式 launch 必须共用同一条 resume 规则：只有 --no-resume
+        // 能关闭续接。否则多带一个与会话无关的 sagy flag 就会改变会话续接行为。
         Command::Passthrough(args) => run_launch(
             &adapter,
             &state_dir,
             &mut session,
             &args,
+            true,
             false,
             false,
             false,
-            false,
+            adoption(false),
             ui,
         ),
     }
@@ -411,6 +434,17 @@ fn ensure_current_session(
     Ok(None)
 }
 
+/// CLI 默认 `Adopt`：active home 里的凭据只要与目标账号逐字节一致就直接接管，
+/// 否则 `prepare_inner` 会自动降级回 `Strict` 并 fail-closed。`--takeover` 是
+/// 唯一能覆盖陌生凭据的显式逃生口，与 `--insecure-host-key` 同形状。
+const fn adoption(takeover: bool) -> ActiveHomeAdoption {
+    if takeover {
+        ActiveHomeAdoption::Takeover
+    } else {
+        ActiveHomeAdoption::Adopt
+    }
+}
+
 fn finalized_value<T>(outcome: MutationResult<T>) -> Option<T> {
     if outcome.recovery_pending() {
         print_recovery_pending();
@@ -455,6 +489,7 @@ fn run_auto(
     session: &mut StateSession,
     no_import_known: bool,
     dry_run: bool,
+    adoption: ActiveHomeAdoption,
     ui: ui::Messages,
 ) -> Result<i32> {
     if let Some(code) = ensure_current_session(adapter, state_dir, session, !no_import_known)? {
@@ -471,12 +506,7 @@ fn run_auto(
         print_selection(ui.selection_would_select(), &account, &usage);
         return Ok(0);
     }
-    let outcome = adapter.switch_account_session(
-        state_dir,
-        session,
-        &account.id,
-        ActiveHomeAdoption::Strict,
-    )?;
+    let outcome = adapter.switch_account_session(state_dir, session, &account.id, adoption)?;
     let Some(account) = finalized_value(outcome) else {
         return Ok(2);
     };
@@ -494,6 +524,7 @@ fn run_launch(
     no_import_known: bool,
     dry_run: bool,
     no_launch: bool,
+    adoption: ActiveHomeAdoption,
     ui: ui::Messages,
 ) -> Result<i32> {
     if let Some(code) = ensure_current_session(adapter, state_dir, session, !no_import_known)? {
@@ -521,12 +552,7 @@ fn run_launch(
             }
             return Ok(last_rate_limit_code.unwrap_or(1));
         };
-        let outcome = adapter.switch_account_session(
-            state_dir,
-            session,
-            &account.id,
-            ActiveHomeAdoption::Strict,
-        )?;
+        let outcome = adapter.switch_account_session(state_dir, session, &account.id, adoption)?;
         let Some(account) = finalized_value(outcome) else {
             return Ok(2);
         };
@@ -629,9 +655,12 @@ fn termination_exit_code(termination: ProcessTermination) -> i32 {
     }
 }
 
-fn confirm_remove(email: &str, ui: ui::Messages) -> Result<bool> {
+/// 参数名带 `_ascii` 后缀是硬约定：这里是一个 stdout 出口，调用方必须先过
+/// `ascii_console`，`console_outlets_never_print_a_raw_user_string` 依赖这个
+/// 命名来区分"已转义"和"生字符串"。
+fn confirm_remove(email_ascii: &str, ui: ui::Messages) -> Result<bool> {
     loop {
-        print!("{}", ui.confirm_rm(email));
+        print!("{}", ui.confirm_rm(email_ascii));
         io::stdout().flush()?;
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
@@ -684,6 +713,88 @@ where
 mod tests {
     use super::*;
     use std::fs;
+
+    /// 用户可控字符串在控制台出口的标识符黑名单。
+    const RAW_USER_IDENTIFIERS: [&str; 3] = ["email", "repo", "id"];
+
+    /// 取出 `text` 中从 `open` 位置起的一对平衡括号内的文本。
+    fn balanced_args(text: &str, open: usize) -> (String, usize) {
+        let bytes = text.as_bytes();
+        let mut depth = 0_i32;
+        let mut start = open;
+        for (index, byte) in bytes.iter().enumerate().skip(open) {
+            match byte {
+                b'(' => {
+                    if depth == 0 {
+                        start = index + 1;
+                    }
+                    depth += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (text[start..index].to_string(), index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (text[start..].to_string(), text.len())
+    }
+
+    /// 把 `ascii_console(...)` 调用整段抠掉，剩下的就是"没有经过转义"的部分。
+    fn strip_escaped_calls(mut text: String) -> String {
+        while let Some(index) = text.find("ascii_console(") {
+            let open = index + "ascii_console".len();
+            let (_, end) = balanced_args(&text, open);
+            text.replace_range(index..end, "");
+        }
+        text
+    }
+
+    /// AC-R12-4.1 / AC-R12-4.2: 遗漏检查的方法。
+    ///
+    /// 这条测试就是"我怎么确认没有遗漏出口"的答案：它在编译期把本文件的源码
+    /// 整份读进来，枚举**每一个** `print!` / `println!` / `eprintln!` 调用，
+    /// 抠掉其中 `ascii_console(..)` 包住的部分，然后要求剩下的实参里不再出现
+    /// 任何用户可控标识符（`email` / `repo` / `id`，含 `x.email` 这类字段访问）。
+    /// 新写一个直接打印 `record.email` 的出口会立刻让它变红。
+    ///
+    /// 已知边界：本扫描只覆盖 `src/cli/mod.rs` 自己的出口。`print_selection`
+    /// （src/cli/launch.rs）与 `render_account_table`（adapters/antigravity/ui.rs）
+    /// 也会打印 email，但不在本工单的归属文件里。
+    #[test]
+    fn console_outlets_never_print_a_raw_user_string() {
+        let source = include_str!("mod.rs");
+        // 只扫描测试模块之前的产品代码，避免把本测试自己的字面量算进去。
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(head, _)| head)
+            .expect("cli::mod must keep its test module last");
+
+        let mut checked = 0_usize;
+        for macro_name in ["println!", "eprintln!", "print!"] {
+            let mut cursor = 0_usize;
+            while let Some(found) = production[cursor..].find(macro_name) {
+                let open = cursor + found + macro_name.len() - 1;
+                let (args, end) = balanced_args(production, open);
+                cursor = end;
+                checked += 1;
+                let remainder = strip_escaped_calls(args.clone());
+                for token in remainder.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    assert!(
+                        !RAW_USER_IDENTIFIERS.contains(&token),
+                        "console outlet prints a raw user-controlled value `{token}`; \
+wrap it in ascii_console(..): {macro_name}({args})"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= 20,
+            "the scanner found only {checked} console outlets; it is no longer scanning the file"
+        );
+    }
 
     #[test]
     fn update_dispatch_does_not_load_corrupt_state() {

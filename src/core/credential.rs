@@ -30,6 +30,34 @@ pub const MAX_CREDENTIAL_CONTAINER_ITEMS: usize = 256;
 const MAX_CREDENTIAL_VALUES: usize = 4096;
 const FINGERPRINT_DOMAIN: &[u8] = b"sagy-portable-credential\0v1\0";
 
+/// Every Google authentication variable a launched child must never inherit.
+///
+/// 收口策略是 deny-by-default：子进程环境先清空这张表里的**全部**变量，之后再由
+/// 启动方按当前账号显式写回需要的那几个。旧实现只清 3 个变量的 allowlist，
+/// 父进程里的 `GOOGLE_API_KEY` / `GOOGLE_GENAI_USE_VERTEXAI` /
+/// `GOOGLE_CLOUD_LOCATION` 会原样继承下去，从而用与当前账号无关的凭据发请求。
+/// 保持 ASCII、去重且按字典序排列，方便调用方直接遍历。
+pub const GOOGLE_AUTH_ENV_VARS: &[&str] = &[
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "CLOUDSDK_CORE_PROJECT",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_ACCESS_TOKEN",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
+    "GOOGLE_GENAI_USE_GCA",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+];
+
+/// Report whether a variable name belongs to the Google authentication surface
+/// that a launched child must not inherit.
+pub fn is_google_auth_env_var(name: &str) -> bool {
+    GOOGLE_AUTH_ENV_VARS.contains(&name)
+}
+
 /// The four credential payloads that can be transported by the portable schema.
 ///
 /// JSON documents are kept as complete maps for the two document variants.  In
@@ -1120,6 +1148,56 @@ mod tests {
         let error = PortableCredential::oauth_access_token(" ").unwrap_err();
         let error_text = format!("{error:?} {error}");
         assert!(!error_text.contains("first-secret"));
+    }
+
+    #[test]
+    fn google_auth_env_deny_list_covers_the_inherited_variables() {
+        // AC-6.1: 这三个变量原来会被子进程原样继承，属于与当前账号无关的认证输入。
+        for name in [
+            "GOOGLE_API_KEY",
+            "GOOGLE_GENAI_USE_VERTEXAI",
+            "GOOGLE_CLOUD_LOCATION",
+        ] {
+            assert!(
+                is_google_auth_env_var(name),
+                "{name} must be part of the deny-by-default set"
+            );
+        }
+        // launcher 已经清理的三个变量必须仍在表内，收口不能变窄。
+        for name in [
+            "GEMINI_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+        ] {
+            assert!(is_google_auth_env_var(name));
+        }
+        assert!(!is_google_auth_env_var("PATH"));
+        assert!(!is_google_auth_env_var("HOME"));
+
+        let mut sorted = GOOGLE_AUTH_ENV_VARS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), GOOGLE_AUTH_ENV_VARS);
+        assert!(
+            GOOGLE_AUTH_ENV_VARS
+                .iter()
+                .all(|name| name.is_ascii() && !name.is_empty())
+        );
+        // R5 会直接遍历这张常量表来 deny-by-default 地清空子进程环境，
+        // 所以名字必须是合法的环境变量名，且严格无重复。
+        let unique: BTreeSet<&&str> = GOOGLE_AUTH_ENV_VARS.iter().collect();
+        assert_eq!(unique.len(), GOOGLE_AUTH_ENV_VARS.len());
+        assert!(GOOGLE_AUTH_ENV_VARS.iter().all(|name| {
+            name.chars()
+                .all(|value| value.is_ascii_uppercase() || value.is_ascii_digit() || value == '_')
+                && !name.starts_with(|value: char| value.is_ascii_digit())
+        }));
+        // 表内的每一项都必须能被 `is_google_auth_env_var` 认出来，两者不得漂移。
+        assert!(
+            GOOGLE_AUTH_ENV_VARS
+                .iter()
+                .all(|name| { is_google_auth_env_var(name) })
+        );
     }
 
     #[test]

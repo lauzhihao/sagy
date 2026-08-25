@@ -47,6 +47,12 @@ const DOCUMENT_BACKUP_SUFFIX: &str = ".document.backup";
 const TOKEN_TOMBSTONE_SUFFIX: &str = ".token.tombstone";
 const DOCUMENT_TOMBSTONE_SUFFIX: &str = ".document.tombstone";
 const JOURNAL_SUFFIX: &str = ".journal";
+/// Quarantine artifacts stay inside the account directory so the state-root
+/// inventory keeps accepting them while nothing else in the store reads them.
+const QUARANTINE_PREFIX: &str = ".sagy-credential-quarantine.";
+const QUARANTINE_RECORD: &str = ".sagy-credential-quarantine.account.json";
+/// 隔离目标名冲突时最多追加到 `.<N>.` 序号，越界即 fail-closed。
+const QUARANTINE_MAX_SUFFIX: u32 = 16;
 const JOURNAL_VERSION: u32 = 2;
 const JOURNAL_MAX_BYTES: usize = 32 * 1024;
 
@@ -196,6 +202,19 @@ impl fmt::Debug for ReconcileToken {
             .field("txid", &self.inner.txid)
             .field("account_id", &self.inner.store.account_id)
             .finish()
+    }
+}
+
+impl StagedCredential {
+    /// A purge is the only transaction whose baseline, published layout and
+    /// after reference are all empty: it retires a legacy account that has no
+    /// credential material left to carry into v2.
+    fn is_purge(&self) -> bool {
+        self.deleting
+            && self.baseline.token.is_none()
+            && self.baseline.document.is_none()
+            && self.published.token.is_none()
+            && self.published.document.is_none()
     }
 }
 
@@ -1463,6 +1482,144 @@ impl CredentialStore {
         })
     }
 
+    /// Quarantine every live credential file of an account that cannot be
+    /// migrated, then record the caller's evidence document.
+    ///
+    /// 为什么是"改名隔离"而不是删除：迁移必须能把坏账号移出 v2 状态，但用户的
+    /// 原始凭据与 v1 账号记录是不可再生的数据，只能保留在账号目录里等人工处理。
+    ///
+    /// 返回本次真正改名产生的隔离文件名。改名是**非事务性**的：调用方所在的
+    /// 迁移事务如果随后回滚，这些文件不会被移回去，所以调用方必须拿着这份清单
+    /// 把已发生的磁盘变更如实告诉用户（AC-R12-1.1）。
+    pub(crate) fn quarantine_unmigratable(&self, evidence: &[u8]) -> StoreResult<Vec<String>> {
+        let capability = self.mutation_capability()?.clone();
+        capability
+            .ensure_account_dir()
+            .map_err(CredentialStoreError::io)?;
+        let _lock = self.acquire_lock()?;
+        let mut moved = Vec::new();
+        for filename in [TOKEN_FILENAME, CREDENTIALS_FILENAME] {
+            let source = capability
+                .locator(filename)
+                .map_err(CredentialStoreError::io)?;
+            if capability
+                .inspect(&source, true)
+                .map_err(CredentialStoreError::io)?
+                .is_none()
+            {
+                continue;
+            }
+            let destination = quarantine_destination(&capability, filename)?;
+            let destination_name = destination
+                .as_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(CredentialStoreError::InvalidInput {
+                    message: "quarantine destination is not a plain filename",
+                })?
+                .to_string();
+            capability
+                .move_file(&source, &destination)
+                .map_err(map_mutation_failure)?;
+            moved.push(destination_name);
+        }
+        let record = capability
+            .locator(QUARANTINE_RECORD)
+            .map_err(CredentialStoreError::io)?;
+        // 反复迁移同一份坏状态时保留最早一次的证据，不覆盖。
+        if capability
+            .inspect(&record, true)
+            .map_err(CredentialStoreError::io)?
+            .is_none()
+        {
+            write_evidence(&capability, &record, evidence)?;
+        }
+        Ok(moved)
+    }
+
+    /// Stage the retirement of a legacy account that has no live credential.
+    ///
+    /// 为什么需要这笔"空事务"：v2 迁移许可要求每个 v1 账号都提供一份 credential
+    /// journal proof，缺一个就整笔失败。坏账号必须也留下一笔可验证的事务，
+    /// 迁移才能在跳过它的同时提交（MIG-001）。
+    pub(crate) fn stage_purge(&self, txid: Uuid) -> StoreResult<PreparedCredentialTxn> {
+        let capability = self.mutation_capability()?.clone();
+        let lock = self.acquire_lock()?;
+        let baseline = self.read_layout()?;
+        if baseline.token.is_some() || baseline.document.is_some() {
+            return Err(CredentialStoreError::Conflict {
+                message: "credential purge requires an empty live credential layout",
+            });
+        }
+        let stage = capability
+            .locator(&format!("{STAGE_PREFIX}{txid}{STAGE_SUFFIX}"))
+            .map_err(CredentialStoreError::io)?;
+        let token_tombstone = self.tombstone_path(txid, CredentialSlot::Token);
+        let document_tombstone = self.tombstone_path(txid, CredentialSlot::Document);
+        let journal = self.journal_path(txid);
+        let empty = CredentialLayout {
+            token: None,
+            document: None,
+        };
+        let base_revision =
+            self.base_revision
+                .clone()
+                .ok_or(CredentialStoreError::InvalidInput {
+                    message: "credential mutation has no base state revision",
+                })?;
+        let before_ref = self.before_ref.clone();
+        let empty_digest = material_digest(&[]);
+        write_journal(
+            &capability,
+            &journal,
+            &CredentialJournal {
+                journal_version: JOURNAL_VERSION,
+                txid: txid.to_string(),
+                phase: "prepared".to_string(),
+                base_revision: JournalRevision::from_revision(&base_revision)?,
+                before_ref: before_ref.clone(),
+                after_ref: None,
+                before: journal_layout(&empty),
+                after: journal_layout(&empty),
+                stage: artifact_name(&stage)?,
+                stage_digest: empty_digest.clone(),
+                token_backup: None,
+                token_backup_digest: None,
+                document_backup: None,
+                document_backup_digest: None,
+                token_tombstone: artifact_name(&token_tombstone)?,
+                token_tombstone_digest: None,
+                document_tombstone: artifact_name(&document_tombstone)?,
+                document_tombstone_digest: None,
+            },
+        )?;
+        Ok(PreparedCredentialTxn {
+            inner: StagedCredential {
+                store: self.clone(),
+                lock,
+                txid,
+                target: capability
+                    .locator(target_filename(CredentialRefKind::OauthAccessToken))
+                    .map_err(CredentialStoreError::io)?,
+                stage,
+                kind: CredentialRefKind::OauthAccessToken,
+                fingerprint: String::new(),
+                material_digest: empty_digest,
+                baseline: empty.clone(),
+                published: empty,
+                deleting: true,
+                base_revision,
+                before_ref,
+                after_ref: None,
+                token_backup: None,
+                document_backup: None,
+                token_tombstone,
+                document_tombstone,
+                journal,
+            },
+        })
+    }
+
     /// Consume a prepared transaction and publish its complete target layout.
     pub(crate) fn publish(
         &self,
@@ -1476,7 +1633,10 @@ impl CredentialStore {
         ensure_layout_equal(&staged.baseline, &current)?;
         let journal = read_journal(capability, staged.journal())?;
         validate_journal(&staged, &journal)?;
-        self.validate_stage(&staged)?;
+        // 清退事务没有任何 stage 字节可校验：它既不写入也不移动凭据文件。
+        if !staged.is_purge() {
+            self.validate_stage(&staged)?;
+        }
 
         // Move the opposite live slot to a transaction-specific tombstone
         // before replacing the target.  An opposite credential is never
@@ -1491,9 +1651,11 @@ impl CredentialStore {
                     message: "credential deletion requires a single live slot",
                 });
             }
-            if let Err(failure) =
+            if let Err(failure) = if staged.is_purge() {
+                Ok(())
+            } else {
                 capability.move_file(&staged.target, staged.tombstone(published_slot))
-            {
+            } {
                 return Err(match failure {
                     crate::core::atomic_io::MutationFailure::NotApplied { source } => {
                         CredentialStoreError::not_applied(source)
@@ -2088,6 +2250,12 @@ impl CredentialStore {
         // recovery intentionally has no reference authority and can only
         // restore/rollback.
         let state_ref = proof.and_then(|proof| proof.credential_ref(&self.account_id));
+        // 账号目录不存在 = 没有 journal、没有 stage，也就没有任何可恢复的东西。
+        // 真实 v1 状态里凭据只内嵌在 state.json，accounts/ 可能整个都不存在；
+        // 让路径解析错误冒出去会让恢复（进而让每条命令）无条件失败。
+        if !account_dir_present(&self.state_dir, &self.account_id)? {
+            return Ok(());
+        }
         let capability = self.mutation_capability()?.clone();
         let artifacts = match capability.artifact_locators() {
             Ok(artifacts) => artifacts,
@@ -2113,12 +2281,14 @@ impl CredentialStore {
             .collect();
         if journals.is_empty() {
             let lock = self.acquire_lock()?;
-            let result = cleanup_orphan_updates(&capability);
+            let result = cleanup_orphan_updates(&capability)
+                .and_then(|()| cleanup_orphan_stages(&capability));
             drop(lock);
             return result;
         }
         let lock = self.acquire_lock()?;
         cleanup_orphan_updates(&capability)?;
+        cleanup_orphan_stages(&capability)?;
         for journal_locator in journals {
             let staged = self.rebuild_staged_from_journal(
                 &capability,
@@ -2237,6 +2407,11 @@ impl CredentialStore {
             .map_err(CredentialStoreError::reconcile)?;
         let published = layout_from_journal_after(self, capability, &journal, &stage)?;
         let baseline = layout_from_journal_before(self, capability, &journal)?;
+        // 两侧布局都为空 = 清退事务；它没有目标槽位，恢复时只需回放/清理 journal。
+        let purge = published.token.is_none()
+            && published.document.is_none()
+            && baseline.token.is_none()
+            && baseline.document.is_none();
         let kind = if published.token.is_some() {
             CredentialRefKind::OauthAccessToken
         } else if let Some(document) = &published.document {
@@ -2245,6 +2420,8 @@ impl CredentialStore {
             token.kind
         } else if let Some(document) = &baseline.document {
             document.kind
+        } else if purge && journal.after_ref.is_none() {
+            CredentialRefKind::OauthAccessToken
         } else {
             return Err(CredentialStoreError::Corrupt {
                 message: "credential journal has no credential transition slot",
@@ -2252,10 +2429,12 @@ impl CredentialStore {
         };
         let identity = published
             .slot(slot_for_kind(kind))
-            .or_else(|| baseline.slot(slot_for_kind(kind)))
-            .ok_or(CredentialStoreError::Corrupt {
+            .or_else(|| baseline.slot(slot_for_kind(kind)));
+        if identity.is_none() && !purge {
+            return Err(CredentialStoreError::Corrupt {
                 message: "credential journal target slot is missing",
-            })?;
+            });
+        }
         let staged = StagedCredential {
             store: self.clone(),
             lock,
@@ -2265,13 +2444,15 @@ impl CredentialStore {
                 .map_err(CredentialStoreError::reconcile)?,
             stage,
             kind,
-            fingerprint: identity.credential.fingerprint(),
-            material_digest: if journal.after_ref.is_some() {
-                identity.material_digest.clone()
-            } else {
+            fingerprint: identity
+                .map(|identity| identity.credential.fingerprint())
+                .unwrap_or_default(),
+            material_digest: match identity {
+                Some(identity) if journal.after_ref.is_some() => identity.material_digest.clone(),
                 // A delete stages the old bytes as bounded evidence; the
-                // journal's stage digest identifies those bytes.
-                journal.stage_digest.clone()
+                // journal's stage digest identifies those bytes.  A purge has
+                // no bytes at all and carries the empty digest.
+                _ => journal.stage_digest.clone(),
             },
             baseline,
             published,
@@ -2411,6 +2592,18 @@ impl StagedCredential {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MigrationPlan {
     pub entries: Vec<MigrationEntry>,
+    /// 无法迁移的账号。为什么保留而不是直接报错：只要有一个坏账号，
+    /// 旧实现就会让整笔 v1->v2 迁移失败，用户连 `sagy rm` 都用不了（MIG-001）。
+    pub skipped: Vec<MigrationSkip>,
+}
+
+/// One legacy account that carries no migratable credential material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationSkip {
+    pub account_id: String,
+    pub email: String,
+    /// ASCII-only reason shown to the user.
+    pub reason: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2451,10 +2644,37 @@ pub struct MigrationPlanner;
 impl MigrationPlanner {
     pub fn plan(state_dir: &Path, state: &State) -> StoreResult<MigrationPlan> {
         let mut entries = Vec::with_capacity(state.accounts.len());
+        let mut skipped = Vec::new();
         for account in &state.accounts {
-            entries.push(plan_account(state_dir, account)?);
+            match plan_account(state_dir, account) {
+                Ok(entry) => entries.push(entry),
+                // 只有"这份账号本身没有可迁移凭据"才降级为 skip；环境类错误
+                // （I/O、并发冲突）仍必须上抛，否则会把临时故障误判成数据损坏。
+                Err(error) if unmigratable_reason(&error).is_some() => {
+                    let reason = unmigratable_reason(&error).unwrap_or("unknown reason");
+                    skipped.push(MigrationSkip {
+                        account_id: account.id.clone(),
+                        email: account.email.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(MigrationPlan { entries })
+        Ok(MigrationPlan { entries, skipped })
+    }
+}
+
+/// Classify a planner error as "this account cannot be migrated" and return an
+/// ASCII reason, or `None` when the error is environmental and must abort.
+fn unmigratable_reason(error: &CredentialStoreError) -> Option<&'static str> {
+    match error {
+        CredentialStoreError::NotFound { .. } => Some("no credential material was found"),
+        CredentialStoreError::Corrupt { message } => Some(message),
+        CredentialStoreError::InvalidInput { message } => Some(message),
+        CredentialStoreError::Credential(_) => Some("credential material could not be parsed"),
+        CredentialStoreError::Mismatch { .. } => Some("stored credential does not match its state"),
+        _ => None,
     }
 }
 
@@ -2463,8 +2683,16 @@ fn plan_account(state_dir: &Path, account: &AccountRecord) -> StoreResult<Migrat
         message: "v1 state contains an unsafe account id",
     })?;
     let store = CredentialStore::new(state_dir, &account.id)?;
-    let raw = store.read_kind(CredentialRefKind::OauthAccessToken)?;
-    let document = store.read_document()?;
+    // 真实的 v1 布局里账号目录可能根本不存在（凭据只内嵌在 state.json 里），
+    // 此时把两个槽位都视为空，而不是让路径解析错误炸掉整笔迁移。
+    let (raw, document) = if account_dir_present(state_dir, &account.id)? {
+        (
+            store.read_kind(CredentialRefKind::OauthAccessToken)?,
+            store.read_document()?,
+        )
+    } else {
+        (None, None)
+    };
     let raw_original = raw.clone();
     let document_original = document.clone();
     let authorized = document
@@ -2582,6 +2810,64 @@ fn plan_account(state_dir: &Path, account: &AccountRecord) -> StoreResult<Migrat
         material_digest: digest,
         material,
     })
+}
+
+/// Pick a free quarantine filename for `filename`.
+///
+/// 为什么要唯一化：固定目标名一旦已存在（用户按提示手工把凭据恢复回
+/// `credentials.json` 后重跑），`move_file` 直接 "destination already exists"
+/// 硬失败，把恢复动作变成又一次故障。名字仍带 `QUARANTINE_PREFIX` 前缀，
+/// 只在冲突时追加一个有界序号，避免恶意目录让隔离无限循环。
+fn quarantine_destination(
+    capability: &AccountStoreCapability,
+    filename: &str,
+) -> StoreResult<SafeRelativePath> {
+    for index in 0..=QUARANTINE_MAX_SUFFIX {
+        let candidate = if index == 0 {
+            format!("{QUARANTINE_PREFIX}{filename}")
+        } else {
+            format!("{QUARANTINE_PREFIX}{index}.{filename}")
+        };
+        let locator = capability
+            .locator(&candidate)
+            .map_err(CredentialStoreError::io)?;
+        if capability
+            .inspect(&locator, true)
+            .map_err(CredentialStoreError::io)?
+            .is_none()
+        {
+            return Ok(locator);
+        }
+    }
+    // 只说 "names are exhausted" 的话，用户面对的是"每条命令都失败且不知道
+    // 动哪个文件"。必须指名道姓地给出目录与文件类别，才有可执行的下一步。
+    Err(CredentialStoreError::Conflict {
+        // 这些文件是仅存的凭据副本, 删掉就再也拿不回来了 -- 指引只能建议
+        // "移走归档", 不能建议删除。
+        message: "quarantine destination names are exhausted; move the existing \
+`.sagy-credential-quarantine.*` files under `<state dir>/accounts/<account id>/` to a \
+backup location outside the state directory, then rerun. Do not delete them: they are \
+the only remaining copies of those credentials",
+    })
+}
+
+/// Report whether `accounts/<id>` exists as a real directory.
+///
+/// 必须 fail-closed：裸 `is_dir()` 判断会把"这个位置是符号链接或普通文件"
+/// 这类异常静默降级成"目录不存在"，于是账号的两个凭据槽都被当成空的，
+/// 迁移/恢复照常继续，真实凭据被无声跳过。存在但不是目录属于环境异常，
+/// 必须上抛（`unmigratable_reason` 不会把它降级成 skip）。
+fn account_dir_present(state_dir: &Path, account_id: &str) -> StoreResult<bool> {
+    let path = state_dir.join("accounts").join(account_id);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(CredentialStoreError::io(anyhow!(
+            "account credential path is not a directory: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CredentialStoreError::io(error)),
+    }
 }
 
 fn nonempty_embedded(value: &Option<String>) -> Option<&str> {
@@ -3358,6 +3644,123 @@ fn update_journal(
         .map_err(map_mutation_failure)
 }
 
+/// Select the `*.stage` artifacts that no journal owns.
+///
+/// stage 文件先于 journal 落盘（见 `stage_exact`），所以在这个窗口崩溃会在账号目录
+/// 留下永不清理的明文凭据副本。持有账号锁时，"没有同 txid 的 journal" 就等价于
+/// "没有任何事务认领它"，此时删除是安全的；正在进行中的事务一定有 journal。
+fn orphan_stage_names(names: &[String]) -> Vec<String> {
+    let journals: std::collections::BTreeSet<&str> = names
+        .iter()
+        .filter_map(|name| {
+            name.strip_prefix(STAGE_PREFIX)
+                .and_then(|rest| rest.strip_suffix(JOURNAL_SUFFIX))
+        })
+        .collect();
+    names
+        .iter()
+        .filter(|name| {
+            name.strip_prefix(STAGE_PREFIX)
+                .and_then(|rest| rest.strip_suffix(STAGE_SUFFIX))
+                .is_some_and(|txid| {
+                    Uuid::parse_str(txid).is_ok_and(|parsed| parsed.to_string() == txid)
+                        && !journals.contains(txid)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Detach and delete an ownerless stage that is too large to be read back
+/// under the bounded-read limit.  Returns whether the stage was handled here.
+///
+/// 为什么不能裸 `remove`：`inspect` 与 `remove` 之间存在替换窗口，裸删有可能
+/// 删掉此刻已经换成别的内容的同名文件。超限文件读不回来，没有摘要可比，所以
+/// 改用"先改名独占、再复核、才删除"：
+///   1. 把它改名到一个本次运行新生成的 stage 名。该名字只有我们知道，
+///      改名成功即等价于"这个 inode 已经归我独占"。
+///   2. 复核它此刻**仍然**超限——超限就意味着它不可能是任何合法凭据工件
+///      （合法工件一律受 MAX_CREDENTIAL_FILE_BYTES 约束），这就是这条路径上
+///      可获得的"我认得它"的证据。
+///   3. 只有复核通过才删除。复核不通过说明我们改名的并不是刚才看到的那个
+///      超限文件，此时把它改回原名，交给下面按内容精确删除的常规路径。
+///
+/// 崩溃在第 1 步与第 3 步之间也没有残留风险：中转名同样是一个孤儿 stage，
+/// 下一次任意命令会重新走这条清理路径。
+fn discard_oversized_stage(
+    capability: &AccountStoreCapability,
+    locator: &SafeRelativePath,
+) -> StoreResult<bool> {
+    let Some(metadata) = capability
+        .inspect(locator, true)
+        .map_err(CredentialStoreError::reconcile)?
+    else {
+        return Ok(false);
+    };
+    if metadata.len() <= MAX_CREDENTIAL_FILE_BYTES as u64 {
+        return Ok(false);
+    }
+    let detached = capability
+        .locator(&format!("{STAGE_PREFIX}{}{STAGE_SUFFIX}", Uuid::new_v4()))
+        .map_err(CredentialStoreError::reconcile)?;
+    capability
+        .move_file(locator, &detached)
+        .map_err(map_mutation_failure)?;
+    let still_oversized = capability
+        .inspect(&detached, true)
+        .map_err(CredentialStoreError::reconcile)?
+        .is_some_and(|metadata| metadata.len() > MAX_CREDENTIAL_FILE_BYTES as u64);
+    if !still_oversized {
+        capability
+            .move_file(&detached, locator)
+            .map_err(map_mutation_failure)?;
+        return Ok(false);
+    }
+    capability.remove(&detached).map_err(map_mutation_failure)?;
+    Ok(true)
+}
+
+/// Remove the ownerless plaintext stage files left by a crash between the
+/// stage write and its journal write.
+fn cleanup_orphan_stages(capability: &AccountStoreCapability) -> StoreResult<()> {
+    let artifacts = capability
+        .artifact_locators()
+        .map_err(CredentialStoreError::reconcile)?;
+    let names: Vec<String> = artifacts
+        .iter()
+        .filter_map(|locator| {
+            locator
+                .as_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        })
+        .collect();
+    for name in orphan_stage_names(&names) {
+        let locator = capability
+            .locator(&name)
+            .map_err(CredentialStoreError::reconcile)?;
+        // 超过 bounded read 上限的孤儿 stage 不可能是合法凭据，但按原来的路径
+        // 走 `read_bounded` 会硬失败，进而让每条命令都失败——与"下一次任意命令
+        // 必须清理"的目标正好相反。删除仍然必须是"只删我认得的那个文件"，
+        // 而且失败必须上抛，不能 `let _ =` 吞掉（见 discard_oversized_stage）。
+        if discard_oversized_stage(capability, &locator)? {
+            continue;
+        }
+        // 没有 journal 就没有可比对的期望摘要；只按"当前内容"精确删除自己刚读到的
+        // 那份字节，避免与并发写入竞争。
+        let Some(bytes) = capability
+            .read_bounded(&locator, MAX_CREDENTIAL_FILE_BYTES)
+            .map_err(CredentialStoreError::reconcile)?
+        else {
+            continue;
+        };
+        remove_evidence_exact(capability, &locator, Some(&material_digest(&bytes)))
+            .map_err(map_remove_failure)?;
+    }
+    Ok(())
+}
+
 /// A failed journal replacement may leave a sibling `.update` artifact.  It
 /// is evidence, not a cache: remove it only when its bytes are exactly the
 /// durable journal bytes.  Any mismatch remains visible and is surfaced as a
@@ -3496,6 +3899,103 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// AC-R2-4.1: `accounts/<id>` 存在但不是目录，必须 fail-closed。
+    /// 旧实现用裸 `is_dir()` 返回 bool，把这种异常降级成"目录不存在"，
+    /// 于是两个凭据槽都被当成空的，账号被无声跳过。
+    #[test]
+    fn account_dir_present_fails_closed_on_a_non_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let accounts = temp.path().join("accounts");
+        fs::create_dir_all(&accounts).expect("accounts dir");
+        let account_id = "11111111-1111-4111-8111-111111111111";
+
+        // 不存在 -> false，不报错（真实 v1 布局里凭据可能只内嵌在 state.json）。
+        assert!(!account_dir_present(temp.path(), account_id).expect("absent account dir"));
+
+        // 普通文件 -> 硬错误，不得静默跳过。
+        fs::write(accounts.join(account_id), b"not-a-directory").expect("write file");
+        let error = account_dir_present(temp.path(), account_id)
+            .expect_err("a regular file must not be reported as an absent directory");
+        assert!(
+            unmigratable_reason(&error).is_none(),
+            "this is an environment fault and must not be downgraded to a per-account skip"
+        );
+
+        // 真目录 -> true。
+        fs::remove_file(accounts.join(account_id)).expect("remove file");
+        fs::create_dir(accounts.join(account_id)).expect("create dir");
+        assert!(account_dir_present(temp.path(), account_id).expect("present account dir"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_dir_present_fails_closed_on_a_symlinked_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let accounts = temp.path().join("accounts");
+        fs::create_dir_all(&accounts).expect("accounts dir");
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("target dir");
+        let account_id = "22222222-2222-4222-8222-222222222222";
+        std::os::unix::fs::symlink(&elsewhere, accounts.join(account_id)).expect("symlink");
+        assert!(account_dir_present(temp.path(), account_id).is_err());
+    }
+
+    #[test]
+    fn orphan_stage_selection_only_targets_journal_less_stages() {
+        let owned = "11111111-1111-4111-8111-111111111111";
+        let live = "22222222-2222-4222-8222-222222222222";
+        let names = vec![
+            format!("{STAGE_PREFIX}{owned}{STAGE_SUFFIX}"),
+            format!("{STAGE_PREFIX}{live}{STAGE_SUFFIX}"),
+            format!("{STAGE_PREFIX}{live}{JOURNAL_SUFFIX}"),
+            format!("{STAGE_PREFIX}{live}{TOKEN_BACKUP_SUFFIX}"),
+            format!("{STAGE_PREFIX}{owned}{DOCUMENT_BACKUP_SUFFIX}"),
+            format!("{STAGE_PREFIX}not-a-uuid{STAGE_SUFFIX}"),
+            CREDENTIALS_FILENAME.to_string(),
+            TOKEN_FILENAME.to_string(),
+            LOCK_FILENAME.to_string(),
+            "settings.json".to_string(),
+        ];
+        // AC-5.2: 只有"没有同 txid journal"的 stage 才是无主文件；
+        // 正在进行中的事务（有 journal）以及其它任何工件都不能被误删。
+        assert_eq!(
+            orphan_stage_names(&names),
+            vec![format!("{STAGE_PREFIX}{owned}{STAGE_SUFFIX}")]
+        );
+    }
+
+    #[test]
+    fn migration_plan_skips_an_account_without_credential_material() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("accounts").join("broken")).unwrap();
+        let mut good = AccountRecord {
+            id: "good".to_string(),
+            email: "good@example.test".to_string(),
+            account_type: AccountType::OAuth,
+            ..AccountRecord::default()
+        };
+        good.oauth_token = Some("live-token".to_string());
+        let broken = AccountRecord {
+            id: "broken".to_string(),
+            email: "broken@example.test".to_string(),
+            account_type: AccountType::OAuth,
+            ..AccountRecord::default()
+        };
+        let state = State {
+            version: 1,
+            accounts: vec![good, broken],
+            ..State::default()
+        };
+        let plan = MigrationPlanner::plan(temp.path(), &state).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].account_id, "good");
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].account_id, "broken");
+        assert_eq!(plan.skipped[0].email, "broken@example.test");
+        assert!(plan.skipped[0].reason.is_ascii());
+        assert!(!plan.skipped[0].reason.is_empty());
+    }
 
     #[test]
     fn pure_read_uses_fixed_slot_and_rejects_symlink() {
@@ -3684,6 +4184,27 @@ mod tests {
     }
 
     #[test]
+    fn purge_publishes_and_restores_without_touching_any_credential_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::test_mutable(temp.path(), "a-1").unwrap();
+        // 账号目录里一个凭据都没有：这正是"无法迁移"的账号形态。
+        let prepared = store.stage_purge(Uuid::new_v4()).unwrap();
+        assert!(prepared.inner.after_ref.is_none());
+        assert!(prepared.inner.is_purge());
+        let journal = prepared.inner.journal.clone();
+        let published = store.publish(prepared).unwrap();
+        let layout = store.read_layout().unwrap();
+        assert!(layout.token.is_none() && layout.document.is_none());
+
+        // 回滚路径必须是纯 no-op，不能因为缺少目标文件而报错。
+        store.restore(published).unwrap();
+        let capability = store.mutation_capability().unwrap();
+        assert!(capability.inspect(&journal, true).unwrap().is_none());
+        assert!(!store.account_dir().join(TOKEN_FILENAME).exists());
+        assert!(!store.account_dir().join(CREDENTIALS_FILENAME).exists());
+    }
+
+    #[test]
     fn current_exact_permit_rejects_dual_live_layout() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = CredentialStore::test_mutable(temp.path(), "a-1").unwrap();
@@ -3775,6 +4296,130 @@ mod tests {
                 .read_kind(CredentialRefKind::OauthAuthorizedUser)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// AC-R12-2.1: 超大孤儿 stage 仍然被清掉，且只清掉它自己——中转改名不得
+    /// 在账号目录里留下任何残留，正常大小的孤儿 stage 与实时凭据都不受影响。
+    #[test]
+    fn an_oversized_orphan_stage_is_discarded_without_residue() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::test_mutable(temp.path(), "a-1").unwrap();
+        let capability = store.capability.as_ref().unwrap();
+        capability.ensure_account_dir().unwrap();
+
+        // 一份真实的实时凭据，用来证明清理不会误伤。
+        let token = PortableCredential::oauth_access_token("live-token").unwrap();
+        let staged = store.stage(Uuid::new_v4(), &token).unwrap();
+        let published = store.publish(staged).unwrap();
+        store.cleanup_unlocked(&published.inner).unwrap();
+        drop(published);
+
+        let huge = format!("{STAGE_PREFIX}{}{STAGE_SUFFIX}", Uuid::new_v4());
+        fs::write(
+            store.account_dir().join(&huge),
+            vec![b'A'; MAX_CREDENTIAL_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let small = format!("{STAGE_PREFIX}{}{STAGE_SUFFIX}", Uuid::new_v4());
+        fs::write(store.account_dir().join(&small), b"small-orphan").unwrap();
+
+        cleanup_orphan_stages(capability).unwrap();
+
+        assert!(!store.account_dir().join(&huge).exists());
+        assert!(!store.account_dir().join(&small).exists());
+        let leftovers: Vec<String> = fs::read_dir(store.account_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(STAGE_SUFFIX))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the detach-then-delete path left residue: {leftovers:?}"
+        );
+        assert_eq!(
+            store
+                .read_kind(CredentialRefKind::OauthAccessToken)
+                .unwrap()
+                .unwrap()
+                .credential
+                .access_token(),
+            Some("live-token"),
+            "cleanup must never touch the live credential"
+        );
+    }
+
+    /// AC-R12-2.2: 超大孤儿 stage 删不掉时，错误必须上抛，不得 `let _ =` 吞掉
+    /// 后当作清理成功。
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_oversized_stage_removal_is_reported_not_swallowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::test_mutable(temp.path(), "a-1").unwrap();
+        let capability = store.capability.as_ref().unwrap();
+        capability.ensure_account_dir().unwrap();
+        let huge = format!("{STAGE_PREFIX}{}{STAGE_SUFFIX}", Uuid::new_v4());
+        fs::write(
+            store.account_dir().join(&huge),
+            vec![b'A'; MAX_CREDENTIAL_FILE_BYTES + 1],
+        )
+        .unwrap();
+
+        // 只读目录 -> rename/unlink 必然 EACCES。root 会绕过权限位，那种环境下
+        // 这条断言没有意义，直接跳过。
+        let original = fs::metadata(store.account_dir()).unwrap().permissions();
+        fs::set_permissions(store.account_dir(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = cleanup_orphan_stages(capability);
+        let still_there = store.account_dir().join(&huge).exists();
+        fs::set_permissions(store.account_dir(), original).unwrap();
+
+        if still_there {
+            assert!(
+                result.is_err(),
+                "an oversized orphan stage survived but cleanup reported success"
+            );
+        }
+    }
+
+    /// AC-R12-3.1: 隔离名耗尽时的错误必须给出可执行的下一步——清理哪个目录下
+    /// 的哪一类文件。
+    #[test]
+    fn exhausted_quarantine_names_name_the_directory_and_the_file_class() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CredentialStore::test_mutable(temp.path(), "a-1").unwrap();
+        let capability = store.capability.as_ref().unwrap();
+        capability.ensure_account_dir().unwrap();
+        fs::write(
+            store
+                .account_dir()
+                .join(format!("{QUARANTINE_PREFIX}{CREDENTIALS_FILENAME}")),
+            b"blocker",
+        )
+        .unwrap();
+        for index in 1..=QUARANTINE_MAX_SUFFIX {
+            fs::write(
+                store
+                    .account_dir()
+                    .join(format!("{QUARANTINE_PREFIX}{index}.{CREDENTIALS_FILENAME}")),
+                b"blocker",
+            )
+            .unwrap();
+        }
+
+        let error = quarantine_destination(capability, CREDENTIALS_FILENAME)
+            .expect_err("every quarantine name is taken");
+        let message = error.to_string();
+        assert!(
+            message.is_ascii(),
+            "console output must be ASCII: {message}"
+        );
+        assert!(
+            message.contains("accounts/<account id>/"),
+            "the error must name the directory to clean up: {message}"
+        );
+        assert!(
+            message.contains(".sagy-credential-quarantine.*"),
+            "the error must name the file class to clean up: {message}"
         );
     }
 

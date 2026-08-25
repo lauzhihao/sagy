@@ -2,11 +2,26 @@
 
 ## 当前发布状态
 
-2026-08-24 全库代码审查结论为 **BLOCKED**：已确认 Repo Sync command injection/路径越界、checksum fail-open、凭据同步失真、429 自动轮换不可达、state 并发丢更新等 P0/P1 问题。
+2026-08-24 的全库代码审查（基线 `584ec53`）所列的 P0/P1 —— Repo Sync command injection/路径越界、
+checksum fail-open、凭据同步失真、429 自动轮换不可达、state 并发丢更新 —— 均已在
+`ec18dfc` 之前关闭，并有代码或回归测试佐证。
 
-完整问题基线、证据和 release 解锁门禁见：
+2026-08-25 的重构后审计（基线 `ec18dfc`）又发现 3 个 P0、4 个 P1、10 个 P2 和一批 P3。
+这些条目**已于 2026-08-25 分四轮全部关闭**，复核提出的 6 个 blocker 与 15 个 major 也已全部修复。
 
-- [2026-08-24 全库代码审查报告](./reviews/2026-08-24-full-code-review.md)
+当前门禁与验收：
+
+```text
+cargo fmt --check                         CLEAN
+cargo clippy --all-targets -- -D warnings CLEAN
+cargo test --all-targets                  20 个二进制 / 476 个测试 / 0 失败
+backlog/verify/t*.sh                      7 个脚本 / 72 项断言 / 全部 PASS
+```
+
+完整的问题基线、修复过程、验收依据、已知残留见：
+
+- [2026-08-25 重构后全库审计报告](./reviews/2026-08-25-post-refactor-audit.md)（**当前基线，含修复与验收结论**）
+- [2026-08-24 全库代码审查报告](./reviews/2026-08-24-full-code-review.md)（历史，已关闭项的出处）
 
 ## 目录结构
 
@@ -16,15 +31,17 @@ backlog/
   reviews/           跨模块审查报告、发布阻断项与解锁门禁
   tasks/             第一版工单(叙述式, 面向人)
   tasks-v2/          第二版工单(指令式, 面向低成本执行者) + TEMPLATE.md
-  verify/            验收脚本。每个缺陷一个 bugs-NNN.sh, 输出 PASS/FAIL
+  tasks-v3/          第三版工单(2026-08-25 四轮修复, 每条 AC 要求 fail-before/pass-after)
+                     COMMON.md / T1-T9 / round2 R1-R9 / round3 R10-R12 / round4 R13
+  verify/            验收脚本。bugs-NNN.sh 是 tasks-v2 遗留, tNN-*.sh 是当前基线的判据
 ```
 
 ## 分工
 
-- **规格与验收**: 由强模型负责。产出 `tasks-v2/` 工单和 `verify/` 脚本，
+- **规格与验收**: 由强模型负责。产出 `tasks-v3/` 工单和验收标准，
   并在执行者报完成后复核 diff。
-- **执行与自检**: 由低成本模型负责。只做两件事——按工单改 `src/`，跑 `verify/bugs-NNN.sh`
-  直到 PASS。允许多轮迭代，这是成本模型的一部分，不是失败。
+- **执行与自检**: 由低成本模型负责。只做两件事——按工单改 `src/`，跑工单指定的回归测试
+  直到全绿。允许多轮迭代，这是成本模型的一部分，不是失败。
 
 ## 执行者铁律
 
@@ -38,7 +55,7 @@ backlog/
    ```
 5. 连续 3 轮自检仍 FAIL 就停下报告，不要继续猜。
 
-## 验收脚本约定
+## 验收脚本约定（tasks-v2 遗留）
 
 - 全部离线可判定：不依赖网络、不依赖真实凭据、不依赖宿主机已装什么。
 - 全部在沙箱内运行：`lib.sh` 会把 `HOME`、`SAGY_HOME`、`ANTIGRAVITY_CONFIG_DIR`、
@@ -48,7 +65,7 @@ backlog/
 一键跑全部：
 
 ```bash
-for s in 001 002 004 005 006 007 008 011 012 013; do
+for s in 001 002 004 005 006 007 008 011 012 013 014 015; do
   printf '%-10s ' "bugs-$s"; bash backlog/verify/bugs-$s.sh >/dev/null 2>&1 \
     && echo PASS || echo FAIL
 done
@@ -70,20 +87,31 @@ done
 
 ## 当前记分板
 
-对 ab04cd6 的验收结果（脚本判定，2026-08-20）：
+对四轮修复后代码的实测结果（脚本判定，2026-08-25）：
 
-| 编号 | 结果 | 说明 |
-| :--- | :--- | :--- |
-| 001 cargo test 污染凭据 | PASS | |
-| 002 过期 token 阻塞启动 | PASS | |
-| 004 凭据文件与目录权限 | **FAIL** | 文件已 0600，`accounts/` 目录仍 0755 |
-| 005 429 冷却不可达 | PASS | |
-| 006 探测无 TTL | PASS | |
-| 007 凭据进 URL | PASS | |
-| 008 自更新无校验 | PASS | |
-| 011 SSH host key | PASS | |
-| 012 死代码清理 | PASS | |
-| 013 删除模型别名 | **FAIL** | 新工单，尚未执行 |
+| 验收脚本 | 覆盖 | 修复前 | 修复后 |
+| :--- | :--- | :--- | :--- |
+| `t1-state-root.sh` | ROOT-001 / ROOT-002 / 旧权限迁移 | 6/18 | **PASS 18/18** |
+| `t2-migration.sh` | MIG-001 v1->v2 迁移逃生阀 | 2/6 | **PASS 6/6** |
+| `t4-repo-sync.sh` | SYNC-101 / pool 归一化 / 删除传播 | 4/13 | **PASS 14/14** |
+| `t6-offline.sh` | AVAIL-001 探测不可达仍可启动 | 1/5 | **PASS 5/5** |
+| `t7-cli.sh` | 死 flag / 真实 help / `-m` 等价 | 5/11 | **PASS 11/11** |
+| `t10-sync-commit.sh` | pull 协同提交的坏账号场景 | 5/8 | **PASS 8/8** |
+| `t11-first-run.sh` | HOME-002 首次接管既有凭据 | 2/10 | **PASS 10/10** |
+
+`bugs-*.sh`（tasks-v2 遗留）：001 / 004 / 007 / 012 PASS；
+002 / 005 / 006 / 008 / 011 / 013 / 014 / 015 FAIL，**全部经核实为脚本自身过期**，
+不是代码缺陷。逐条依据见审计报告的「验收依据」一节，要点：
+
+- 013 / 015 把探测端点指向不可达地址后 15/15、7/7 全 PASS —— 线上失败是因为脚本用伪造 JWT，
+  真实探测正确地拒绝了它。
+- 005 / 006 / 014 断言的 `last_synced_at` 字段在 v2 state 里已不存在；
+  `is_in_cooldown` 被当作"应删除的死代码"，但它现在是 `src/core/policy.rs:64` 的活代码。
+- 008 / 011 是纯 grep 断言，指向重构前的函数名与代码形状。
+- 002 的 fixture 信封已被 AUTH-005 的最小字段校验拒绝。
+
+这些脚本不再作为发布门禁单独采信；**结论以 `reviews/2026-08-25-post-refactor-audit.md`
+与 `verify/t*.sh` 为准**。
 
 已退役的验收脚本：
 
@@ -92,15 +120,26 @@ done
 
 ## 待执行工单
 
-| 工单 | 自检命令 |
-| :--- | :--- |
-| `tasks-v2/bugs-004a-secure-dir-permissions.md` | `bash backlog/verify/bugs-004.sh` |
-| `tasks-v2/bugs-013-drop-model-aliases.md` | `bash backlog/verify/bugs-013.sh` |
+无。`tasks-v3/` 的四轮工单（T1-T9、round2 R1-R9、round3 R10-R12、round4 R13）全部完成并验收。
+已知残留全部为 minor，列在审计报告的「已知残留」一节，需要时再单独开工单。
+
+自检命令统一为：
+
+```bash
+export ANTIGRAVITY_CONFIG_DIR=/tmp/sagy-canary
+export GEMINI_HOME=/tmp/sagy-canary
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+for s in t1-state-root t2-migration t4-repo-sync t6-offline t7-cli t10-sync-commit t11-first-run; do
+  printf '%-18s ' "$s"; bash backlog/verify/$s.sh 2>&1 | grep -E '^RESULT'
+done
+```
 
 ## 已决策事项
 
 - **不按模型分入口。** 不做 sclaude 那样的 opus/sonnet 式模型子入口。
-  `flash` / `pro` / `think` 三个别名二进制全部删除，只保留 `sagy` 与 `sagy-original`。
-- **默认模型固定为 `gemini-3.7-flash-high`。** 需要切换到 pro 或其它模型时，
+  历史上的三个别名二进制已全部删除，只保留 `sagy` 与 `sagy-original`。
+- **默认模型固定为 `gemini-3.7-flash-high`。** 需要切换到其它模型时，
   由用户在 agy 交互界面内自行操作，sagy 不介入。
 - **sagy 的职责边界**：账号选择与凭据切换，加上一个默认模型。不做模型编排。

@@ -3,7 +3,8 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::adapters::antigravity::account::MutationResult;
+use crate::adapters::antigravity::account::{MutationResult, ensure_import_kind_compatible};
+use crate::core::credential::CredentialKind;
 use crate::core::state::AccountRecord;
 use crate::core::state_store::StateSession;
 
@@ -75,6 +76,14 @@ impl super::AntigravityAdapter {
         match mode {
             LoginMode::OAuth { email_hint } => {
                 let email = email_hint.unwrap_or("antigravity-user@google.com");
+                // 跨类型冲突必须在提示粘贴 secret **之前**发现。原来的顺序是
+                // 先读完 token 再进 import 才检查，用户白粘一次不说，secret 也
+                // 已经进过终端和进程内存。检查是纯只读函数，可以安全前置。
+                ensure_import_kind_compatible(
+                    session.state(),
+                    email,
+                    CredentialKind::OAuthAccessToken,
+                )?;
                 println!("Paste your Antigravity OAuth Token (or Google Token):");
                 let token_input = rpassword::prompt_password("> ")?;
                 let token = validate_secret_input(&token_input)?;

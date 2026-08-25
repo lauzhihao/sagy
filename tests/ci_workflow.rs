@@ -1,12 +1,42 @@
 use std::fs;
 
+const CI_WORKFLOW: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/.github/workflows/ci.yml"
+));
+
+/// 校验 workflow 里的每一个 `uses:` 都固定到 40 位 commit SHA，
+/// 并在同一行保留人类可读的版本 tag 注释。
+fn assert_actions_are_sha_pinned(workflow: &str, label: &str) {
+    let mut pinned = 0;
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("- uses: ")
+            .or_else(|| trimmed.strip_prefix("uses: "))
+        else {
+            continue;
+        };
+        let reference = rest.split_whitespace().next().unwrap_or_default();
+        let Some((action, pin)) = reference.rsplit_once('@') else {
+            panic!("{label} action {reference:?} carries no version reference");
+        };
+        assert!(
+            pin.len() == 40 && pin.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{label} action {action:?} is pinned to {pin:?} instead of a 40 character commit SHA"
+        );
+        assert!(
+            rest.contains(" # "),
+            "{label} action {action:?} lost its human readable version tag comment"
+        );
+        pinned += 1;
+    }
+    assert!(pinned > 0, "{label} declares no third-party actions");
+}
+
 #[test]
 fn pull_request_and_main_quality_workflow_is_isolated_and_complete() {
-    let workflow = fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/.github/workflows/ci.yml"
-    ))
-    .expect("read CI workflow");
+    let workflow = CI_WORKFLOW;
 
     for required in [
         "pull_request:",
@@ -67,4 +97,76 @@ fn release_workflow_has_version_guard_minimal_permissions_and_single_quality_job
         1,
         "host clippy should run once outside the release target matrix"
     );
+    // AC-5.2：只有发布 job 允许写 contents，其余 job 继承顶层的只读权限。
+    let write_scopes = workflow
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.trim() == "contents: write")
+        .count();
+    assert_eq!(write_scopes, 1, "more than one job requests write access");
+    let declared_scopes = workflow
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.contains(": write") || line.contains(": admin"))
+        .count();
+    assert_eq!(
+        declared_scopes, 1,
+        "the publish job requests scopes beyond contents: write"
+    );
+}
+
+/// AC-2.1 / AC-R7-3.1：Windows 侧的 fail-closed harness 必须被 CI 真正执行，
+/// 而且它的失败必须能把 job 变红。
+///
+/// 本机没有 pwsh，harness 的行为无法在提交前执行验证，所以 CI 是**唯一**证据来源；
+/// 这条测试守住的就是"这条证据链没有断":
+/// 脚本被调用 -> 有真实二进制可用 -> 子进程退出码被显式转成 step 失败。
+#[test]
+fn windows_jobs_execute_the_powershell_checksum_harness() {
+    let release = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/release.yml"
+    ))
+    .expect("read release workflow");
+
+    for (label, workflow) in [("ci.yml", CI_WORKFLOW), ("release.yml", release.as_str())] {
+        assert!(
+            workflow
+                .contains("pwsh -NoProfile -ExecutionPolicy Bypass -File tests/p0_checksum.ps1"),
+            "{label} never executes tests/p0_checksum.ps1"
+        );
+        assert!(
+            workflow.contains("shell: pwsh"),
+            "{label} does not run the checksum harness through pwsh"
+        );
+        // harness 的断言是 throw，只体现在子进程退出码上；step 必须显式检查它，
+        // 否则 harness 失败时 job 仍然是绿的。
+        assert!(
+            workflow.contains("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"),
+            "{label} does not propagate the checksum harness exit code"
+        );
+        // harness 只有拿到真实 sagy.exe 才算完整覆盖；路径必须是绝对路径，
+        // 且必须有一个显式的构建步骤保证它存在。
+        assert!(
+            workflow.contains("SAGY_TEST_BINARY: ${{ github.workspace }}\\target\\debug\\sagy.exe"),
+            "{label} does not point SAGY_TEST_BINARY at an absolute built binary"
+        );
+        assert!(
+            workflow.contains("name: Build the sagy binary for the installer harness"),
+            "{label} does not build the binary the checksum harness needs"
+        );
+    }
+}
+
+/// AC-5.1：第三方 Action 一律按 commit SHA 固定。
+#[test]
+fn third_party_actions_are_pinned_to_commit_shas() {
+    let release = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/release.yml"
+    ))
+    .expect("read release workflow");
+
+    assert_actions_are_sha_pinned(CI_WORKFLOW, "ci.yml");
+    assert_actions_are_sha_pinned(&release, "release.yml");
 }

@@ -8,8 +8,10 @@
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::io;
@@ -32,6 +34,86 @@ use std::os::windows::io::AsRawHandle;
 #[link(name = "c")]
 unsafe extern "C" {
     fn geteuid() -> u32;
+}
+
+/// 等待超过这个时长仍拿不到 flock，就认为用户已经在"卡住"了，必须给出诊断。
+const LOCK_WAIT_NOTICE_DELAY: Duration = Duration::from_millis(750);
+/// 轮询间隔上限：等待期间不做忙等，最长一次睡这么久。
+const LOCK_WAIT_POLL_CAP: Duration = Duration::from_millis(50);
+/// 控制台输出必须是 ASCII。
+const LOCK_WAIT_NOTICE: &str = "[sagy] waiting for another sagy session to release a lock; this command will continue \
+automatically once that session finishes.";
+
+/// 提示在一个进程内至多打印一次：一条命令可能连续拿好几把锁，重复刷屏没有
+/// 任何新增信息。
+static LOCK_WAIT_NOTICE_EMITTED: AtomicBool = AtomicBool::new(false);
+
+fn emit_lock_wait_notice() {
+    if LOCK_WAIT_NOTICE_EMITTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut stderr = std::io::stderr().lock();
+    // 提示失败不能影响加锁本身的结果。
+    let _ = writeln!(stderr, "{LOCK_WAIT_NOTICE}");
+    let _ = stderr.flush();
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == fs2::lock_contended_error().kind() || error.kind() == ErrorKind::WouldBlock
+}
+
+/// 在 `delay` 之内轮询 `file` 的独占锁。
+///
+/// 返回 `Ok(true)` 表示锁已经被本调用持有；`Ok(false)` 表示到点仍未拿到，
+/// 此时 `announce` 已经被调用过恰好一次。
+///
+/// 为什么是轮询而不是"后台线程 + Condvar"：后台线程方案需要在主线程完成后
+/// 唤醒并 join，一旦唤醒发生在等待开始之前，通知就丢了，主线程会在**快路径上**
+/// 也被 join 拖满一整个阈值。这里没有任何跨线程通知，结构上不存在那条竞态。
+fn poll_exclusive_lock<A>(file: &File, delay: Duration, announce: &mut A) -> std::io::Result<bool>
+where
+    A: FnMut(),
+{
+    // 快路径：锁立刻可得时只多一次非阻塞系统调用，不睡、不起线程、不打印。
+    match file.try_lock_exclusive() {
+        Ok(()) => return Ok(true),
+        Err(error) if lock_is_contended(&error) => {}
+        Err(error) => return Err(error),
+    }
+    let deadline = Instant::now() + delay;
+    let mut backoff = Duration::from_millis(2);
+    while Instant::now() < deadline {
+        std::thread::sleep(backoff.min(LOCK_WAIT_POLL_CAP));
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(true),
+            Err(error) if lock_is_contended(&error) => {}
+            Err(error) => return Err(error),
+        }
+        backoff = backoff.saturating_mul(2);
+    }
+    announce();
+    Ok(false)
+}
+
+/// Acquire `file`'s exclusive lock, emitting one ASCII diagnostic when the
+/// wait exceeds `LOCK_WAIT_NOTICE_DELAY`.
+pub(crate) fn lock_exclusive_with_wait_notice(file: &File) -> std::io::Result<()> {
+    if poll_exclusive_lock(file, LOCK_WAIT_NOTICE_DELAY, &mut emit_lock_wait_notice)? {
+        return Ok(());
+    }
+    file.lock_exclusive()
+}
+
+/// Announce a pending lock wait for callers that acquire the lock themselves.
+///
+/// 上层有些调用点先拿到句柄、再自己 `lock_exclusive`（切号路径就是这样）。
+/// 这里只做一次非阻塞探测：锁立刻可得就原样放行（探测拿到的锁会立刻释放，
+/// 真正的持有仍由调用方完成）；确实被别的会话占着，才在阈值之后打印提示。
+pub(crate) fn announce_lock_wait_before_blocking(file: &File) {
+    if let Ok(true) = poll_exclusive_lock(file, LOCK_WAIT_NOTICE_DELAY, &mut emit_lock_wait_notice)
+    {
+        let _ = FileExt::unlock(file);
+    }
 }
 
 const MAX_LOCATOR_COMPONENT_BYTES: usize = 255;
@@ -524,8 +606,7 @@ impl ExternalDirectoryCapability {
             bail!("external directory identity changed before lock acquisition")
         }
         let lock_file = open_or_create_secure_file_normalized(&root, &expected.lock)?;
-        lock_file
-            .lock_exclusive()
+        lock_exclusive_with_wait_notice(&lock_file)
             .context("failed to acquire external directory lock")?;
 
         let current = Self::preflight_existing(&root, expected.lock.clone())?;
@@ -542,7 +623,7 @@ impl ExternalDirectoryCapability {
 
     fn from_claimed_root(root: OwnedStoreRoot, lock_locator: SafeRelativePath) -> Result<Self> {
         let lock = open_or_create_secure_file(&root, &lock_locator)?;
-        lock.lock_exclusive()
+        lock_exclusive_with_wait_notice(&lock)
             .context("failed to acquire external directory lock")?;
         root.verify_identity()
             .context("external directory identity changed after claim")?;
@@ -644,6 +725,13 @@ impl ExternalDirectoryCapability {
 pub(crate) enum TopLevelEntryKind {
     Directory,
     RegularFile,
+    /// Symlink, reparse point, device node or any other non-plain entry.
+    ///
+    /// 为什么保留而不是直接 bail：state root 同时是安装目录，里面必然混有与
+    /// sagy 无关的条目。把"存在一个奇怪条目"当成整个 root 不可用，会让产品在
+    /// 正常安装路径上直接不可用。这里只如实记录类型，由 schema 层决定
+    /// "sagy 自己纳管的名字必须是什么类型"，未纳管的名字一律忽略。
+    Other,
 }
 
 /// Bounded, metadata-only inventory item for one top-level root entry.
@@ -656,10 +744,13 @@ pub(crate) struct TopLevelInventoryEntry {
 
 /// Inspect a normalized root without creating, chmod'ing, recovering, or
 /// reading file contents. Every entry is checked through symlink metadata.
+///
+/// This layer classifies but never rejects individual entries: the state root
+/// doubles as the installation directory, so foreign entries are expected and
+/// only the schema layer knows which names sagy actually owns.
 pub(crate) fn inspect_top_level_inventory(
     root: &NormalizedStoreRoot,
     max_entries: usize,
-    max_file_size: u64,
 ) -> Result<Vec<TopLevelInventoryEntry>> {
     let metadata =
         inspect_component(root.as_path(), "normalized store root")?.ok_or_else(|| {
@@ -690,18 +781,17 @@ pub(crate) fn inspect_top_level_inventory(
         let locator = SafeRelativePath::new(Path::new(name_text))?;
         let metadata = fs::symlink_metadata(entry.path())
             .with_context(|| format!("failed to inspect store root entry: {}", name_text))?;
-        if is_link_or_reparse(&metadata) {
-            bail!("store root inventory contains a symlink or reparse point: {name_text}")
-        }
-        let (kind, size) = if metadata.is_dir() {
+        // 只分类不拒绝：symlink / 特殊文件 / 超大文件都可能是用户或安装器放在
+        // SAGY_HOME 里与 sagy 无关的东西。真正的安全判定发生在 schema 层，
+        // 那里知道哪些名字属于 sagy，并对它们强制类型与大小上限。
+        let (kind, size) = if is_link_or_reparse(&metadata) {
+            (TopLevelEntryKind::Other, 0)
+        } else if metadata.is_dir() {
             (TopLevelEntryKind::Directory, 0)
         } else if metadata.is_file() {
-            if metadata.len() > max_file_size {
-                bail!("store root entry exceeds {max_file_size} bytes: {name_text}")
-            }
             (TopLevelEntryKind::RegularFile, metadata.len())
         } else {
-            bail!("store root inventory contains a special file: {name_text}")
+            (TopLevelEntryKind::Other, 0)
         };
         inventory.push(TopLevelInventoryEntry {
             locator,
@@ -1141,9 +1231,10 @@ fn reject_protected_claim_path(path: &Path) -> Result<()> {
 
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut protected = Vec::<PathBuf>::new();
-    if let Ok(current) = std::env::current_dir() {
-        protected.push(fs::canonicalize(current).unwrap_or_default());
-    }
+    // 当前工作目录**不是**安全边界：把它列为 protected 没有任何安全收益，
+    // 只会让 `cd ~/.sagy && sagy list` 这种完全正常的用法随机失败，
+    // 且失败原因与真实问题毫无关系。真正要挡的是 $HOME / 系统临时目录 /
+    // 文件系统根这类"绝不该被整体纳管"的目录。
     if let Some(home) = home_dir() {
         protected.push(fs::canonicalize(home).unwrap_or_default());
     }
@@ -2623,5 +2714,133 @@ mod tests {
         let digest = DocumentDigest::from_bytes(b"document");
         let encoded = digest.to_hex();
         assert_eq!(DocumentDigest::from_hex(&encoded).unwrap(), digest);
+    }
+
+    // ---------------------------------------------------------------
+    // R1-5: 锁等待必须可诊断
+
+    /// 打开同一个锁文件的第二个句柄。flock 是按 open-file-description 计的,
+    /// 所以同一进程内的两个句柄之间也是真实互斥的。
+    fn open_lock_handle(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open lock handle")
+    }
+
+    /// AC-R1-5.2 / 5.3: 锁立刻可得时既不打印, 也不引入任何延迟。
+    #[test]
+    fn uncontended_lock_never_announces_and_never_waits() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("free.lock");
+        let file = open_lock_handle(&path);
+
+        let mut announced = 0usize;
+        let started = Instant::now();
+        let acquired = poll_exclusive_lock(&file, Duration::from_secs(30), &mut || announced += 1)
+            .expect("probe a free lock");
+        let elapsed = started.elapsed();
+
+        assert!(acquired, "a free lock was not acquired on the fast path");
+        assert_eq!(announced, 0, "a free lock announced a wait");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the fast path waited {elapsed:?}"
+        );
+        FileExt::unlock(&file).expect("release lock");
+    }
+
+    /// AC-R1-5.1 / 5.4: 另一个线程真的持有锁时, 等待超过阈值必须打印提示,
+    /// 而且提示打印之后仍然要真的把锁拿到手。
+    #[test]
+    fn contended_lock_announces_once_and_still_acquires() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("busy.lock");
+
+        let holder_path = path.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let holder = open_lock_handle(&holder_path);
+            FileExt::lock_exclusive(&holder).expect("hold the lock");
+            held_tx.send(()).expect("signal that the lock is held");
+            release_rx.recv().expect("wait for release");
+            FileExt::unlock(&holder).expect("release the lock");
+        });
+        held_rx.recv().expect("lock is held by the other thread");
+
+        let waiter = open_lock_handle(&path);
+        let mut announced = 0usize;
+        let acquired =
+            poll_exclusive_lock(&waiter, Duration::from_millis(120), &mut || announced += 1)
+                .expect("probe a held lock");
+        assert!(!acquired, "a held lock was reported as acquired");
+        assert_eq!(
+            announced, 1,
+            "a lock wait past the threshold did not announce"
+        );
+
+        // 提示打印之后必须真的把锁拿到手, 而不是把等待变成失败。
+        release_tx.send(()).expect("ask the holder to release");
+        holder.join().expect("holder thread");
+        lock_exclusive_with_wait_notice(&waiter).expect("acquire the released lock");
+        FileExt::unlock(&waiter).expect("release lock");
+    }
+
+    /// AC-R1-5.3: 阈值内让出锁的等待必须静默返回, 且不得把调用方多拖一个阈值。
+    #[test]
+    fn lock_released_within_the_threshold_is_acquired_without_a_notice() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("brief.lock");
+
+        let holder_path = path.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let holder = open_lock_handle(&holder_path);
+            FileExt::lock_exclusive(&holder).expect("hold the lock");
+            held_tx.send(()).expect("signal that the lock is held");
+            std::thread::sleep(Duration::from_millis(80));
+            FileExt::unlock(&holder).expect("release the lock");
+        });
+        held_rx.recv().expect("lock is held by the other thread");
+
+        let waiter = open_lock_handle(&path);
+        let mut announced = 0usize;
+        let started = Instant::now();
+        let acquired =
+            poll_exclusive_lock(&waiter, Duration::from_secs(10), &mut || announced += 1)
+                .expect("probe a briefly held lock");
+        let elapsed = started.elapsed();
+        holder.join().expect("holder thread");
+
+        assert!(acquired, "a released lock was not acquired");
+        assert_eq!(announced, 0, "a sub-threshold wait announced");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the waiter was parked for {elapsed:?} after the lock was released"
+        );
+        FileExt::unlock(&waiter).expect("release lock");
+    }
+
+    /// AC-R1-5.2: 探测式预告在快路径上必须把锁原样交还给调用方。
+    #[test]
+    fn announce_probe_leaves_the_lock_available_to_the_caller() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("probe.lock");
+        let file = open_lock_handle(&path);
+
+        announce_lock_wait_before_blocking(&file);
+
+        let other = open_lock_handle(&path);
+        FileExt::try_lock_exclusive(&other)
+            .expect("the probe kept a lock it was supposed to release");
+        FileExt::unlock(&other).expect("release lock");
     }
 }

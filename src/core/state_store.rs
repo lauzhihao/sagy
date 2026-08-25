@@ -44,6 +44,11 @@ const MAX_REPO_SYNC_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACCOUNT_FILES: usize = 32;
 const MAX_ACCOUNT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ACCOUNT_DIRECTORIES: usize = 4096;
+/// state root 同时是安装目录，顶层可能混有 bin/、用户笔记、编辑器残留等条目，
+/// 上限只用来挡住"把一个巨大的无关目录当成 state root"这种明显误用。
+const MAX_ROOT_INVENTORY_ENTRIES: usize = 4096;
+/// 损坏的 state 文档被改名隔离时使用的前缀，绝不删除用户数据。
+const CORRUPT_STATE_PREFIX: &str = "state.json.corrupt-";
 const CREDENTIAL_JOURNAL_MAX_BYTES: usize = 32 * 1024;
 const ACTIVE_HOME_JOURNAL_MAX_BYTES: usize = 64 * 1024;
 const ACTIVE_HOME_JOURNAL_PREFIX: &str = ".sagy-active-home-";
@@ -885,7 +890,19 @@ pub(crate) struct StateSession {
 
 impl StateSession {
     fn from_store(store: StateStore) -> Result<Self, StateStoreError> {
-        let read = store.read()?;
+        // 开 session 是"任何一条命令打开 state"的唯一入口，因此把两件恢复性动作
+        // 挂在这里，而不是挂在纯读的 `StateStore::read` 上：
+        //  1. 文档本身在 JSON 语法层坏掉时，把它改名隔离并给出恢复指引；
+        //  2. 收紧历史遗留的宽权限凭据（0644/0755 -> 0600/0700），fail-closed。
+        //
+        // 顺序不能反过来（R1-6.1）：只读校验必须先跑完。先 chmod 会对一批随后
+        // 就要被判非法的条目改权限，还会用一句笼统的权限错误顶掉
+        // `validate_accounts_dir` 更精确的文案。
+        let read = match store.read() {
+            Ok(read) => read,
+            Err(error) => return Err(quarantine_unreadable_document(&store, error)),
+        };
+        harden_state_root_permissions(&store.root).map_err(StateStoreError::Invalid)?;
         Ok(Self { store, read })
     }
 
@@ -1811,11 +1828,20 @@ impl<'a> LockedStateTxn<'a> {
         let mut next = state.clone();
         next.version = STATE_V2_VERSION;
         next.revision = revision_number;
-        if active_transition.is_none() {
+        if active_transition.is_none() || transitions.is_empty() {
             let before = self.snapshot()?;
-            if before.state.active_profile != next.active_profile {
+            if active_transition.is_none() && before.state.active_profile != next.active_profile {
                 return Err(StateStoreError::Invalid(anyhow!(
                     "active profile transition requires a sealed active-home journal proof"
+                )));
+            }
+            // 凭据引用与 active profile 同级: 没有一条 credential transition 的
+            // 普通提交绝不能改动 credential_refs, 否则调用方只要绕开
+            // commit_coordinated 就能删掉别人的账号引用而不留任何证明。
+            // 有 transition 时的逐条覆盖率校验在 validate_coordinated_proofs 里。
+            if transitions.is_empty() && before.state.credential_refs != next.credential_refs {
+                return Err(StateStoreError::Invalid(anyhow!(
+                    "credential reference transition requires a sealed credential journal proof"
                 )));
             }
         }
@@ -2755,6 +2781,15 @@ fn parse_snapshot(snapshot: &DocumentSnapshot) -> Result<StateRead> {
     }
 }
 
+/// v1 里的 `google_accounts` 占位账号：没有 oauth_token / api_key / refresh_token
+/// 中的任何一个，因此不可能承载凭据，也不可能被迁移。
+fn is_v1_placeholder_account(account: &AccountV1Wire) -> bool {
+    account.email.eq_ignore_ascii_case("google_accounts")
+        && account.oauth_token.is_none()
+        && account.api_key.is_none()
+        && account.refresh_token.is_none()
+}
+
 fn parse_v1(value: Value, digest: DocumentDigest) -> Result<StateRead> {
     let wire: StateV1Wire = serde_json::from_value(value).context("invalid v1 state document")?;
     let _ = wire.version;
@@ -2762,28 +2797,39 @@ fn parse_v1(value: Value, digest: DocumentDigest) -> Result<StateRead> {
         bail!("v1 state exceeds bounded collection limits");
     }
     let mut credential_refs = std::collections::BTreeMap::new();
-    let accounts = wire
-        .accounts
-        .into_iter()
-        .map(|account| {
-            let reference = derive_credential_ref(&account);
-            let migrated = migrate_v1_account(account);
-            if let Some(reference) = reference {
-                credential_refs.insert(migrated.id.clone(), reference);
-            }
-            migrated
-        })
-        .collect();
+    // 真实的 v1 state 里存在 email == "google_accounts" 且三个凭据字段全空的
+    // 占位账号。它没有任何可迁移的凭据，放进来只会在后续迁移里炸掉整笔迁移，
+    // 所以在生产读路径就丢弃，与 legacy `cleanup_invalid_legacy_accounts` 一致。
+    let mut dropped_ids: std::collections::BTreeSet<String> = Default::default();
+    let mut accounts = Vec::with_capacity(wire.accounts.len());
+    for account in wire.accounts {
+        if is_v1_placeholder_account(&account) {
+            dropped_ids.insert(account.id.clone());
+            continue;
+        }
+        let reference = derive_credential_ref(&account);
+        let migrated = migrate_v1_account(account);
+        if let Some(reference) = reference {
+            credential_refs.insert(migrated.id.clone(), reference);
+        }
+        accounts.push(migrated);
+    }
     let usage_cache = wire
         .usage_cache
         .into_iter()
+        .filter(|(id, _)| !dropped_ids.contains(id))
         .map(|(id, usage)| (id, migrate_v1_usage(usage)))
         .collect();
+    // 丢弃占位账号后，指向它的 current_account_id 会变成悬空引用，
+    // 必须一起清掉，否则 invariant 校验会把整份 state 判成非法。
+    let current_account_id = wire
+        .current_account_id
+        .filter(|id| !dropped_ids.contains(id));
     let state = State {
         version: STATE_VERSION,
         accounts,
         usage_cache,
-        current_account_id: wire.current_account_id,
+        current_account_id,
         revision: 0,
         active_profile: None,
         sync_watermarks: Default::default(),
@@ -2983,6 +3029,14 @@ fn encode_v2(state: &State) -> Result<Vec<u8>> {
         bail!("v2 encoder requires state version 2");
     }
     validate_state_invariants(state)?;
+    // 写入端必须和读取端用同一套上限，否则会写出一份自己读不回来的 state：
+    // 提交成功，下一次任何命令都直接失败。
+    if state.accounts.len() > MAX_ACCOUNTS
+        || state.usage_cache.len() > MAX_USAGE_ENTRIES
+        || state.sync_watermarks.len() > MAX_WATERMARKS
+    {
+        bail!("v2 state exceeds bounded collection limits");
+    }
     let accounts = state
         .accounts
         .iter()
@@ -3019,7 +3073,18 @@ fn encode_v2(state: &State) -> Result<Vec<u8>> {
         active_profile: state.active_profile.clone(),
         sync_watermarks: state.sync_watermarks.clone(),
     };
-    serde_json::to_vec_pretty(&wire).context("failed to encode v2 state")
+    let encoded = serde_json::to_vec_pretty(&wire).context("failed to encode v2 state")?;
+    ensure_document_within_reader_limit(&encoded)?;
+    Ok(encoded)
+}
+
+/// 读取端在 `parse_snapshot` 里按 MAX_STATE_BYTES 截断，写入端必须用同一个数，
+/// 否则会提交一份"写得进、读不回"的 state。
+fn ensure_document_within_reader_limit(encoded: &[u8]) -> Result<()> {
+    if encoded.len() > MAX_STATE_BYTES {
+        bail!("v2 state document exceeds {MAX_STATE_BYTES} bytes");
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
@@ -3116,7 +3181,7 @@ fn validate_readonly_root(
     root: &NormalizedStoreRoot,
     target: &SafeRelativePath,
 ) -> Result<(DocumentSnapshot, bool)> {
-    let inventory = inspect_top_level_inventory(root, 256, MAX_STATE_BYTES as u64)?;
+    let inventory = inspect_top_level_inventory(root, MAX_ROOT_INVENTORY_ENTRIES)?;
     let recovery = inspect_recovery_from_normalized(root, target)
         .map_err(|error| anyhow!(error.to_string()))?;
     if let RecoveryPreview::Conflict { live, base, target } = &recovery.recovery {
@@ -3228,6 +3293,11 @@ fn validate_inventory(
                 if entry.kind != TopLevelEntryKind::RegularFile {
                     bail!("state.json must be a regular file");
                 }
+                // 顶层 inventory 不再对陌生条目设大小上限，所以 sagy 自己纳管的
+                // state.json 必须在这里显式收边界。
+                if entry.size > MAX_STATE_BYTES as u64 {
+                    bail!("state.json exceeds {MAX_STATE_BYTES} bytes");
+                }
             }
             "accounts" => {
                 if entry.kind != TopLevelEntryKind::Directory {
@@ -3266,12 +3336,17 @@ fn validate_inventory(
                     bail!("atomic stage must be a regular file");
                 }
             }
-            _ if is_legacy_temp_name(name) => {
-                if entry.kind != TopLevelEntryKind::RegularFile {
-                    bail!("legacy temporary entry must be a regular file");
-                }
+            _ if is_legacy_temp_name(name) && entry.kind != TopLevelEntryKind::RegularFile => {
+                bail!("legacy temporary entry must be a regular file");
             }
-            _ => bail!("unknown state root entry: {name}"),
+            // 未知的顶层条目一律忽略：不纳管、不校验、不触碰。
+            //
+            // 为什么不是"把白名单再扩大一点"：SAGY_HOME 同时是安装目录，
+            // install.sh/install.ps1 必然在其中创建 bin/ 和 tmp/，用户也会往
+            // 里放自己的东西（notes.txt、.DS_Store、backup/）。任何固定白名单
+            // 都追不上真实目录，而一旦追不上，产品在正常安装路径上就直接不可用。
+            // sagy 自己管理的名字（上面各分支）仍然严格校验。
+            _ => {}
         }
     }
     if snapshot.bytes.is_some() {
@@ -3279,30 +3354,6 @@ fn validate_inventory(
             bail!("state snapshot exists but state.json is not in inventory");
         }
         parse_snapshot(snapshot)?;
-    } else {
-        for entry in inventory {
-            // A missing state document is still allowed to contain the
-            // account-relative credential journal/evidence tree.  This is the
-            // crash window where a new account was published before its first
-            // v2 state commit; recovery must be able to enumerate it rather
-            // than rejecting the root as an unrelated non-atomic directory.
-            if entry.locator.as_path() == Path::new("accounts") {
-                if entry.kind != TopLevelEntryKind::Directory {
-                    bail!("accounts must be a directory");
-                }
-                validate_accounts_dir(root.as_path())?;
-                continue;
-            }
-            if !matches!(
-                entry.artifact,
-                AdoptionArtifact::FixedLock
-                    | AdoptionArtifact::FixedJournal
-                    | AdoptionArtifact::DocumentStage(_)
-                    | AdoptionArtifact::JournalStage(_)
-            ) {
-                bail!("state-less root contains non-atomic entry");
-            }
-        }
     }
     if let Some(preflight) = preflight
         && matches!(preflight.recovery_preview, RecoveryPreview::Conflict { .. })
@@ -3310,6 +3361,221 @@ fn validate_inventory(
         bail!("state recovery journal conflicts with the live document");
     }
     Ok(())
+}
+
+/// Tighten pre-existing wide permissions under `accounts/` back to the modes
+/// sagy writes today (0700 for directories, 0600 for credential files).
+///
+/// 为什么放在这里：新写入的凭据早已是 0600，但 0.1 之前留下的 0644 文件不会
+/// 自己变紧。收紧必须 fail-closed —— 收不紧就不要继续用这份凭据。
+#[cfg(unix)]
+fn harden_state_root_permissions(root: &NormalizedStoreRoot) -> Result<()> {
+    let accounts = root.as_path().join("accounts");
+    let metadata = match fs::symlink_metadata(&accounts) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", accounts.display()));
+        }
+    };
+    if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        // 类型本身非法，交给 inventory 校验去报更精确的错误，这里不改任何权限。
+        return Ok(());
+    }
+    tighten_mode(&accounts, &metadata, 0o700)?;
+
+    let mut directories = 0usize;
+    for entry in fs::read_dir(&accounts)
+        .with_context(|| format!("failed to enumerate {}", accounts.display()))?
+    {
+        directories += 1;
+        if directories > MAX_ACCOUNT_DIRECTORIES {
+            bail!("too many account directories");
+        }
+        let entry = entry.with_context(|| format!("failed to enumerate {}", accounts.display()))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if is_link_or_reparse(&metadata) {
+            // 无法证明一个 symlink 背后的对象是不是本机凭据，也就无法证明收紧
+            // 生效，所以 fail-closed 而不是跳过。
+            bail!(
+                "cannot tighten permissions through a symlink: {}",
+                path.display()
+            );
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        tighten_mode(&path, &metadata, 0o700)?;
+
+        let mut files = 0usize;
+        for child in fs::read_dir(&path)
+            .with_context(|| format!("failed to enumerate {}", path.display()))?
+        {
+            files += 1;
+            if files > MAX_ACCOUNT_FILES {
+                bail!("too many files in account directory");
+            }
+            let child = child.with_context(|| format!("failed to enumerate {}", path.display()))?;
+            let child_path = child.path();
+            let child_metadata = fs::symlink_metadata(&child_path)
+                .with_context(|| format!("failed to inspect {}", child_path.display()))?;
+            if is_link_or_reparse(&child_metadata) {
+                bail!(
+                    "cannot tighten permissions through a symlink: {}",
+                    child_path.display()
+                );
+            }
+            if !child_metadata.is_file() {
+                continue;
+            }
+            tighten_mode(&child_path, &child_metadata, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_state_root_permissions(_root: &NormalizedStoreRoot) -> Result<()> {
+    // Windows ACL 无法用 std 的 mode 表达，权限由 create-new + 目录 ACL 保证。
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tighten_mode(path: &Path, metadata: &fs::Metadata, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current = metadata.permissions().mode();
+    let mut permissions = metadata.permissions();
+    tighten_mode_verified(
+        path,
+        current,
+        mode,
+        |desired| {
+            permissions.set_mode(desired);
+            fs::set_permissions(path, permissions.clone())
+                .with_context(|| format!("failed to tighten permissions for {}", path.display()))
+        },
+        || {
+            Ok(fs::symlink_metadata(path)
+                .with_context(|| format!("failed to re-inspect {}", path.display()))?
+                .permissions()
+                .mode())
+        },
+    )
+}
+
+/// chmod 之后必须复核实际生效的 mode。
+///
+/// 为什么把 chmod 与复核抽成两个注入点：非 root 进程在普通文件系统上无法让
+/// chmod 真的失败或被静默忽略，端到端根本走不到这条分支；把它做成可直接驱动的
+/// 形状，测试才能证明 "chmod 报错" 和 "chmod 静默无效" 两种情况都是 fail-closed。
+#[cfg(unix)]
+fn tighten_mode_verified<S, O>(
+    path: &Path,
+    current_mode: u32,
+    desired_mode: u32,
+    set_mode: S,
+    observe_mode: O,
+) -> Result<()>
+where
+    S: FnOnce(u32) -> Result<()>,
+    O: FnOnce() -> Result<u32>,
+{
+    if current_mode & 0o7777 == desired_mode {
+        return Ok(());
+    }
+    set_mode(desired_mode)?;
+    // 有些文件系统会静默忽略 chmod。收紧无法被验证时必须 fail-closed，
+    // 而不是假装凭据已经安全并继续使用。
+    let observed = observe_mode()? & 0o7777;
+    if observed != desired_mode {
+        bail!(
+            "failed to tighten permissions for {}: mode is still {:o}",
+            path.display(),
+            observed
+        );
+    }
+    Ok(())
+}
+
+/// Preserve an unreadable state document by renaming it aside and returning an
+/// error that tells the user exactly where it went and what to do next.
+///
+/// 为什么改名而不是删除：损坏的 state 里仍然有用户的账号元数据，静默删除等于
+/// 丢数据。改名后下一次命令从空 state 起步，用户随时可以回去捞。
+fn quarantine_unreadable_document(store: &StateStore, error: StateStoreError) -> StateStoreError {
+    // 大到读取端不敢读的文档同样属于"读得出来的坏"：不隔离，但必须给指引。
+    if let Some(hint) = oversized_state_hint(store) {
+        return hint;
+    }
+    let Some(bytes) =
+        read_normalized_relative_file_bounded(&store.root, &store.target, MAX_STATE_BYTES)
+            .ok()
+            .flatten()
+    else {
+        return error;
+    };
+    if document_is_syntactically_valid(&bytes) {
+        // 只有 JSON 语法层坏掉（截断、非法字节、重复键、尾随垃圾）的文档才没有
+        // 人工修复的余地。语义校验失败——版本号更高、revision 非法、集合超上限、
+        // invariant 违规——都是读得出来、能人工修的完好文档；一旦被改名，用户下一条
+        // 命令就会提交一份全新的空 state，旧文档永久变成孤儿。所以原样上抛，
+        // 不改名、不移动。
+        return error;
+    }
+
+    let source = store.root.as_path().join(STATE_TARGET);
+    match fs::symlink_metadata(&source) {
+        Ok(metadata) if !is_link_or_reparse(&metadata) && metadata.is_file() => {}
+        _ => return error,
+    }
+    let quarantine_name = format!("{CORRUPT_STATE_PREFIX}{}", uuid::Uuid::new_v4());
+    let destination = store.root.as_path().join(&quarantine_name);
+    if let Err(rename_error) = fs::rename(&source, &destination) {
+        return StateStoreError::Invalid(anyhow!(
+            "state.json cannot be parsed and could not be moved aside ({rename_error}). \
+             Move {} somewhere safe by hand, then re-run the command.",
+            source.display()
+        ));
+    }
+    StateStoreError::Invalid(anyhow!(
+        "state.json could not be parsed and was preserved as {quarantine_name} in {}. \
+         Nothing was deleted. Re-run the command to start from an empty state, then run \
+         `sagy import-known` to re-register local accounts.",
+        store.root.as_path().display()
+    ))
+}
+
+/// 只判定"JSON 语法层是否完好"，不做任何 schema / 语义判断。
+///
+/// 隔离（改名）会让旧文档在下一条命令后永久变成孤儿，所以它的打击面必须
+/// 严格收在"人工也修不回来"的这一类失败上。
+fn document_is_syntactically_valid(bytes: &[u8]) -> bool {
+    strict_json_value(bytes).is_ok()
+}
+
+/// state.json 超过读取上限时，读取端在 inventory 阶段就拒绝，用户只会拿到一句
+/// 没有恢复指引的裸错误。这条入口按上面的规则同样不隔离，但必须给出与隔离路径
+/// 一致的、可操作的下一步。
+fn oversized_state_hint(store: &StateStore) -> Option<StateStoreError> {
+    let path = store.root.as_path().join(STATE_TARGET);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return None;
+    }
+    if metadata.len() <= MAX_STATE_BYTES as u64 {
+        return None;
+    }
+    Some(StateStoreError::Invalid(anyhow!(
+        "state.json is {} bytes, above the {MAX_STATE_BYTES} byte limit sagy will read. \
+         Nothing was moved or deleted. Move {} somewhere safe by hand, then re-run the \
+         command to start from an empty state and run `sagy import-known` to re-register \
+         local accounts.",
+        metadata.len(),
+        path.display()
+    )))
 }
 
 fn validate_accounts_dir(root: &Path) -> Result<()> {
@@ -3474,6 +3740,133 @@ mod tests {
             credential_refs,
             ..Default::default()
         }
+    }
+
+    /// AC-5.1: 写入端必须和读取端用同一套上限。
+    #[test]
+    fn v2_encoder_rejects_collections_the_reader_cannot_accept() {
+        let mut state = v2_state();
+        let template = state.accounts[0].clone();
+        let credential_ref = ref_for(CredentialRefKind::OauthAccessToken);
+        for index in 0..MAX_ACCOUNTS {
+            let id = format!("acc-overflow-{index}");
+            state.accounts.push(AccountRecord {
+                id: id.clone(),
+                ..template.clone()
+            });
+            state.credential_refs.insert(id, credential_ref.clone());
+        }
+        assert!(state.accounts.len() > MAX_ACCOUNTS);
+
+        let error = encode_v2(&state).unwrap_err().to_string();
+        assert!(
+            error.contains("bounded collection limits"),
+            "unexpected encoder error: {error}"
+        );
+    }
+
+    /// AC-R1-2.1: 一份**通过全部 invariant 与集合上限**、但编码后超过读取端
+    /// MAX_STATE_BYTES 的 state 必须被写入端拒绝。
+    ///
+    /// 为什么可构造：`validate_text` 每个字段放行 16KB，`MAX_ACCOUNTS` 放行 4096
+    /// 个账号，两者相乘远大于 16MB。所以"集合上限已经覆盖了大小上限"并不成立，
+    /// 大小守卫必须是 encode_v2 里一条独立的、真的会被走到的分支。
+    #[test]
+    fn v2_encoder_rejects_a_valid_state_whose_document_exceeds_the_reader_limit() {
+        const EMAIL_BYTES: usize = 16 * 1024;
+        let mut state = v2_state();
+        state.accounts.clear();
+        state.credential_refs.clear();
+        let credential_ref = ref_for(CredentialRefKind::OauthAccessToken);
+        let email = "e".repeat(EMAIL_BYTES);
+        let accounts = MAX_STATE_BYTES / EMAIL_BYTES + 64;
+        assert!(accounts < MAX_ACCOUNTS);
+        for index in 0..accounts {
+            let id = format!("acc-bulk-{index}");
+            state.accounts.push(AccountRecord {
+                id: id.clone(),
+                email: email.clone(),
+                ..Default::default()
+            });
+            state.credential_refs.insert(id, credential_ref.clone());
+        }
+        // 前置条件：这份 state 的语义完全合法，唯一的问题就是编码后太大。
+        validate_state_invariants(&state).expect("bulk state must stay semantically valid");
+
+        let error = encode_v2(&state)
+            .expect_err("an oversized document must not be encodable")
+            .to_string();
+        assert!(
+            error.contains("exceeds"),
+            "unexpected encoder error: {error}"
+        );
+    }
+
+    /// AC-R1-3.1: chmod 之后的复核必须 fail-closed。
+    ///
+    /// 为什么不能端到端：非 root 进程在普通文件系统上既没法让 `chmod` 报错，
+    /// 也没法让它"返回成功但不生效"，这条分支跑不到。所以把 chmod 与复核抽成
+    /// 两个注入点，测试直接驱动 `tighten_mode_verified` 的这两种失败。
+    #[cfg(unix)]
+    #[test]
+    fn tighten_mode_bails_when_chmod_silently_did_not_apply() {
+        let path = Path::new("/tmp/sagy-tighten-probe/credentials.json");
+        let mut applied = 0usize;
+        let error = tighten_mode_verified(
+            path,
+            0o644,
+            0o600,
+            |desired| {
+                assert_eq!(desired, 0o600);
+                applied += 1;
+                Ok(())
+            },
+            // 文件系统静默忽略了 chmod：复核看到的还是旧 mode。
+            || Ok(0o644),
+        )
+        .expect_err("an ineffective chmod must fail closed")
+        .to_string();
+        assert_eq!(applied, 1, "chmod was not attempted");
+        assert!(
+            error.contains("mode is still 644"),
+            "unexpected tighten error: {error}"
+        );
+    }
+
+    /// AC-R1-3.1: chmod 自身报错时同样必须上抛，不能吞掉。
+    #[cfg(unix)]
+    #[test]
+    fn tighten_mode_propagates_a_failing_chmod() {
+        let path = Path::new("/tmp/sagy-tighten-probe/credentials.json");
+        let error = tighten_mode_verified(
+            path,
+            0o644,
+            0o600,
+            |_| bail!("simulated chmod failure"),
+            // 复核本身会说"权限已经是 0600"，所以只有 chmod 的错误被上抛才会失败。
+            || Ok(0o600),
+        )
+        .expect_err("a failing chmod must fail closed")
+        .to_string();
+        assert!(
+            error.contains("simulated chmod failure"),
+            "unexpected tighten error: {error}"
+        );
+    }
+
+    /// 已经足够紧的 mode 不得触发任何 chmod。
+    #[cfg(unix)]
+    #[test]
+    fn tighten_mode_skips_files_that_are_already_tight() {
+        let path = Path::new("/tmp/sagy-tighten-probe/credentials.json");
+        tighten_mode_verified(
+            path,
+            0o600,
+            0o600,
+            |_| panic!("an already tight file must not be chmod-ed"),
+            || panic!("an already tight file must not be re-inspected"),
+        )
+        .expect("an already tight file is accepted");
     }
 
     #[test]
@@ -4565,17 +4958,29 @@ mod tests {
                 let proof = credentials
                     .journal_proof(&published)
                     .map_err(|error| StateStoreError::Invalid(anyhow::Error::new(error)))?;
-                let mut candidate = transaction.snapshot()?.state;
-                candidate.accounts.push(AccountRecord {
+                let mut with_reference = transaction.snapshot()?.state;
+                with_reference.accounts.push(AccountRecord {
                     id: "new-account".to_string(),
                     email: "new@example.com".to_string(),
                     account_type: AccountType::OAuth,
                     ..Default::default()
                 });
-                candidate.credential_refs.insert(
+                with_reference.credential_refs.insert(
                     "new-account".to_string(),
                     proof.after_ref().cloned().unwrap(),
                 );
+                // R10-1.2: 普通提交连"改动 credential_refs"这一步都不允许, 引用
+                // 变更必须带着 credential journal proof 走协调提交。
+                let rejected = transaction
+                    .commit_exact_receipt(&with_reference)
+                    .expect_err("an ordinary commit must not move a credential reference");
+                assert!(
+                    format!("{rejected}").contains("sealed credential journal proof"),
+                    "unexpected rejection: {rejected}"
+                );
+                // 引用不变的普通提交仍然可以成功, 但它的 receipt 依旧不携带任何
+                // credential transition, 所以 finalize 必须失败。
+                let candidate = transaction.snapshot()?.state;
                 let receipt = transaction.commit_exact_receipt(&candidate)?;
                 assert!(receipt.credential_transition("new-account").is_none());
                 let error = credentials.finalize(published, &receipt).unwrap_err();
@@ -4838,13 +5243,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_root_rejected_before_lock() {
+    fn unknown_root_entry_is_ignored_without_creating_artifacts() {
+        // 语义变更（ROOT-001）：陌生的顶层条目不再让 read 失败。SAGY_HOME 同时是
+        // 安装目录，`bin/`、笔记、编辑器残留都会出现在这里。保留的不变量是：
+        // 纯读依然不在 root 里创建任何 sagy 自己的产物。
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("state");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("marker"), b"x").unwrap();
         let store = StateStore::open(&root).unwrap();
-        assert!(store.read().is_err());
+        let read = store.read().unwrap();
+        assert_eq!(read.migration, MigrationStatus::Missing);
+        assert!(read.state.accounts.is_empty());
+        assert_eq!(fs::read(root.join("marker")).unwrap(), b"x");
         assert!(!fs::read_dir(root).unwrap().any(|entry| {
             entry
                 .unwrap()

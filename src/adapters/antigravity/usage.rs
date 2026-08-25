@@ -29,7 +29,6 @@ use crate::core::state::{
     AccountRecord, AccountType, CredentialRef, CredentialRefKind, STATE_V2_VERSION, State,
 };
 
-pub const PROBE_TTL_SECS: i64 = 300;
 pub const PROBE_TIMEOUT_SECS: u64 = 3;
 
 const API_PROBE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -117,17 +116,6 @@ enum LoadedCredential {
     Vertex(PortableCredential),
 }
 
-impl LoadedCredential {
-    #[allow(dead_code)]
-    fn subject(&self) -> ProbeSubject {
-        match self {
-            Self::OAuth { subject, .. } => *subject,
-            Self::ApiKey(_) => ProbeSubject::ApiKey,
-            Self::Vertex(_) => ProbeSubject::Vertex,
-        }
-    }
-}
-
 impl super::AntigravityAdapter {
     pub fn refresh_account_usage(
         &self,
@@ -156,10 +144,6 @@ impl super::AntigravityAdapter {
         );
     }
 
-    pub fn mark_rate_limited(&self, state: &mut State, account_id: &str) {
-        self.mark_rate_limited_at(state, account_id, current_unix_seconds());
-    }
-
     fn refresh_account_usage_at(
         &self,
         state_dir: &Path,
@@ -180,6 +164,9 @@ impl super::AntigravityAdapter {
         if usage.plan.is_none() {
             usage.plan.clone_from(&account.plan);
         }
+        // 先归一化再决策：时钟前跳留下的无效 cooldown 必须在这里被清除并写回，
+        // 否则它会留在 state 里，每次读取都重建一个新窗口（永久 cooldown）。
+        let usage = usage.normalized(now);
 
         // An active cooldown is authoritative. `force` only bypasses the
         // normal cache TTL and can never make an HTTP request during a
@@ -222,6 +209,7 @@ impl super::AntigravityAdapter {
                     if usage.plan.is_none() {
                         usage.plan.clone_from(&account.plan);
                     }
+                    let mut usage = usage.normalized(now);
                     if matches!(probe_decision(&usage, now, force), ProbeDecision::Probe) {
                         usage = observe_and_reduce(&context, account, &usage, now, &config);
                     }
@@ -243,19 +231,6 @@ impl super::AntigravityAdapter {
             if !id.is_empty() {
                 state.usage_cache.insert(id, usage);
             }
-        }
-    }
-
-    fn mark_rate_limited_at(&self, state: &mut State, account_id: &str, now: i64) {
-        if let Some(usage) = state.usage_cache.get_mut(account_id) {
-            *usage = reduce_usage(
-                usage,
-                ProbeOutcome::Http429 {
-                    subject: ProbeSubject::ApiKey,
-                    retry_after_secs: None,
-                },
-                now,
-            );
         }
     }
 }
@@ -489,6 +464,11 @@ fn classify_response(mut response: Response, subject: ProbeSubject) -> ProbeResu
             ProbeSubject::Vertex => ProbeOutcome::Http401Vertex,
         });
     }
+    if status_code == 400 {
+        // Google 对失效的 API key 的既定响应就是 400。落进 OtherTransient 会被
+        // 当成暂时性故障，用户永远看不到"需要重新登录"。
+        return ProbeResult::outcome(ProbeOutcome::Http400 { subject });
+    }
     if status_code == 403 {
         return ProbeResult::outcome(ProbeOutcome::Http403 { subject });
     }
@@ -506,7 +486,13 @@ fn classify_response(mut response: Response, subject: ProbeSubject) -> ProbeResu
         });
     }
     if !status.is_success() {
-        return ProbeResult::outcome(ProbeOutcome::OtherTransient);
+        // 3xx/404/407 等既不是关于凭据的结论，也不是源站 5xx：公司代理、强制
+        // 门户和错误路由就长这样。归到 OtherTransient 会被当成服务端故障，
+        // 本地凭据完全有效的账号在代理故障下仍然启动不了 (AVAIL-001)。
+        return ProbeResult::outcome(ProbeOutcome::HttpUnexpected {
+            subject,
+            status: status_code,
+        });
     }
 
     let body = match read_bounded_body(&mut response) {
@@ -641,7 +627,8 @@ fn extract_jwt_exp(jwt: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::health::{HealthErrorKind, HealthStatus};
+    use crate::core::health::{Cooldown, HealthErrorKind, HealthStatus};
+    use crate::core::policy;
     use crate::core::state::{CredentialRef, STATE_V2_VERSION};
     use serde_json::json;
     use std::fs;
@@ -709,11 +696,18 @@ mod tests {
             .collect::<Vec<_>>();
         listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            // 30s 上限只为兜底回收线程；短上限在并行测试负载下会让服务器
+            // 提前退出，把 200 用例变成随机的连接被拒。
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         request_count.fetch_add(1, Ordering::SeqCst);
+                        // macOS 上 accept 出来的 socket 会继承 listener 的
+                        // O_NONBLOCK：不切回阻塞模式，read_request 会在请求字节
+                        // 到达前就返回 WouldBlock，服务器随即带着未读数据关闭连接
+                        // 并发出 RST，客户端看到的是随机的 "connection reset"。
+                        let _ = stream.set_nonblocking(false);
                         let _ = read_request(&mut stream);
                         let mut response = format!(
                             "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -740,6 +734,55 @@ mod tests {
         (address, requests)
     }
 
+    /// One row of the probe status matrix.  Transport failures are produced
+    /// locally (a closed port, a server that never answers) so the matrix is
+    /// decidable without any real network.
+    enum MatrixEndpoint {
+        Status(u16, Option<&'static str>),
+        Timeout,
+        Unreachable,
+    }
+
+    impl MatrixEndpoint {
+        fn label(&self) -> String {
+            match self {
+                Self::Status(status, _) => status.to_string(),
+                Self::Timeout => "timeout".to_string(),
+                Self::Unreachable => "network".to_string(),
+            }
+        }
+
+        fn build(&self) -> ProbeConfig {
+            match self {
+                Self::Status(status, retry_after) => {
+                    let headers: Vec<(&str, &str)> = retry_after
+                        .map(|value| vec![("Retry-After", value)])
+                        .unwrap_or_default();
+                    let body = if *status == 200 { "{}" } else { "" };
+                    let (endpoint, _) = mock_server(*status, &headers, body);
+                    config(&endpoint)
+                }
+                Self::Timeout => {
+                    // 接受连接但从不响应：客户端只能超时。
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+                    std::thread::spawn(move || {
+                        if let Ok((_stream, _)) = listener.accept() {
+                            std::thread::sleep(Duration::from_millis(300));
+                        }
+                    });
+                    ProbeConfig::test_endpoint(&endpoint, Duration::from_millis(20))
+                }
+                Self::Unreachable => {
+                    // 固定的 discard 端口：本机上不会有人监听，连接必定被拒绝。
+                    // 不能用"先绑再释放"的临时端口——它可能被并行用例的 mock
+                    // server 抢去，导致请求被投递到别的用例。
+                    config("http://127.0.0.1:9")
+                }
+            }
+        }
+    }
+
     fn read_request(stream: &mut TcpStream) -> io::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -753,7 +796,9 @@ mod tests {
     }
 
     fn config(address: &str) -> ProbeConfig {
-        ProbeConfig::test_endpoint(address, Duration::from_millis(100))
+        // 期待收到响应的用例必须给足超时：100ms 在并行测试负载下会随机变成
+        // Timeout，把 401/403 等断言变成随机的 TransientFailure。
+        ProbeConfig::test_endpoint(address, Duration::from_secs(10))
     }
 
     #[test]
@@ -879,30 +924,57 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
+    /// AC-2.3: the durable status matrix must cover every HTTP and transport
+    /// branch a probe can observe, including the 400 Google returns for an
+    /// invalidated API key.
     #[test]
-    fn response_matrix_maps_401_403_429_5xx_and_quota() {
-        let cases = [
-            (200, None, HealthStatus::Ready, None),
-            (401, None, HealthStatus::AuthInvalid, None),
-            (403, None, HealthStatus::PermissionDenied, None),
-            (429, Some("60"), HealthStatus::RateLimited, None),
-            (500, None, HealthStatus::TransientFailure, None),
+    fn response_matrix_covers_200_400_401_403_429_500_timeout_and_network() {
+        let cases: [(MatrixEndpoint, HealthStatus, Option<HealthErrorKind>); 8] = [
+            (MatrixEndpoint::Status(200, None), HealthStatus::Ready, None),
+            (
+                MatrixEndpoint::Status(400, None),
+                HealthStatus::InvalidCredential,
+                Some(HealthErrorKind::InvalidCredential),
+            ),
+            (
+                MatrixEndpoint::Status(401, None),
+                HealthStatus::AuthInvalid,
+                Some(HealthErrorKind::Unauthorized),
+            ),
+            (
+                MatrixEndpoint::Status(403, None),
+                HealthStatus::PermissionDenied,
+                Some(HealthErrorKind::PermissionDenied),
+            ),
+            (
+                MatrixEndpoint::Status(429, Some("60")),
+                HealthStatus::RateLimited,
+                Some(HealthErrorKind::RateLimited),
+            ),
+            (
+                MatrixEndpoint::Status(500, None),
+                HealthStatus::TransientFailure,
+                Some(HealthErrorKind::ServerFailure),
+            ),
+            (
+                MatrixEndpoint::Timeout,
+                HealthStatus::TransientFailure,
+                Some(HealthErrorKind::Timeout),
+            ),
+            (
+                MatrixEndpoint::Unreachable,
+                HealthStatus::TransientFailure,
+                Some(HealthErrorKind::Network),
+            ),
         ];
-        for (status, retry_after, expected, expected_quota) in cases {
+
+        for (endpoint, expected, expected_error) in cases {
+            let label = endpoint.label();
             let temp = tempfile::tempdir().unwrap();
             let acc = account("matrix", AccountType::ApiKey);
             let credential = PortableCredential::api_key("secret").unwrap();
             let mut state = v2_state(&temp, &acc, &credential, br#"{"api_key":"secret"}"#);
-            let endpoint = if let Some(value) = retry_after {
-                mock_server(
-                    status,
-                    &[("Retry-After", value)],
-                    if status == 200 { "{}" } else { "" },
-                )
-                .0
-            } else {
-                mock_server(status, &[], if status == 200 { "{}" } else { "" }).0
-            };
+            let probe_config = endpoint.build();
             let adapter = super::super::AntigravityAdapter;
             let usage = adapter.refresh_account_usage_at(
                 temp.path(),
@@ -910,14 +982,101 @@ mod tests {
                 &acc,
                 true,
                 100,
-                &config(&endpoint),
+                &probe_config,
             );
-            assert_eq!(usage.health, expected, "status {status}");
-            assert_eq!(usage.remaining_quota_percent, expected_quota);
-            if status == 429 {
+            assert_eq!(usage.health, expected, "case {label}");
+            assert_eq!(usage.last_error, expected_error, "case {label}");
+            assert_eq!(usage.remaining_quota_percent, None, "case {label}");
+            if label == "429" {
                 assert_eq!(usage.cooldown.unwrap().until, 160);
+            } else {
+                assert_eq!(usage.cooldown, None, "case {label}");
             }
         }
+    }
+
+    /// AC-3.1 / AC-3.2: a cooldown recorded with a future `started_at` is clock
+    /// skew, not evidence.  It must be dropped from durable state and must not
+    /// suppress the next probe, with or without `--force` (`sagy refresh`).
+    #[test]
+    fn future_cooldown_is_purged_and_the_account_is_reprobed() {
+        for force in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let acc = account("skewed", AccountType::ApiKey);
+            let credential = PortableCredential::api_key("secret").unwrap();
+            let mut state = v2_state(&temp, &acc, &credential, br#"{"api_key":"secret"}"#);
+            state.usage_cache.insert(
+                acc.id.clone(),
+                UsageSnapshot {
+                    health: HealthStatus::RateLimited,
+                    cooldown: Some(Cooldown {
+                        started_at: 10_000,
+                        until: 11_000,
+                        last_evidence_at: 10_000,
+                    }),
+                    last_probe_at: Some(100),
+                    last_rate_limit_at: Some(100),
+                    last_error: Some(HealthErrorKind::RateLimited),
+                    ..Default::default()
+                },
+            );
+            let (endpoint, requests) = mock_server(200, &[], "{}");
+            let adapter = super::super::AntigravityAdapter;
+            let usage = adapter.refresh_account_usage_at(
+                temp.path(),
+                &mut state,
+                &acc,
+                force,
+                100,
+                &config(&endpoint),
+            );
+            assert_eq!(usage.health, HealthStatus::Ready, "force={force}");
+            assert_eq!(usage.cooldown, None, "force={force}");
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "force={force}");
+            assert_eq!(
+                state.usage_cache.get(&acc.id).unwrap().cooldown,
+                None,
+                "the invalid cooldown must be purged from durable state"
+            );
+        }
+    }
+
+    /// AC-3.3: an ordinary, unexpired cooldown must survive untouched.
+    #[test]
+    fn valid_cooldown_is_never_cleared_by_the_skew_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let acc = account("cooling", AccountType::ApiKey);
+        let credential = PortableCredential::api_key("secret").unwrap();
+        let mut state = v2_state(&temp, &acc, &credential, br#"{"api_key":"secret"}"#);
+        let cooldown = Cooldown {
+            started_at: 90,
+            until: 400,
+            last_evidence_at: 90,
+        };
+        state.usage_cache.insert(
+            acc.id.clone(),
+            UsageSnapshot {
+                health: HealthStatus::RateLimited,
+                cooldown: Some(cooldown),
+                last_probe_at: Some(90),
+                last_rate_limit_at: Some(90),
+                last_error: Some(HealthErrorKind::RateLimited),
+                ..Default::default()
+            },
+        );
+        let (endpoint, requests) = mock_server(200, &[], "{}");
+        let adapter = super::super::AntigravityAdapter;
+        let usage = adapter.refresh_account_usage_at(
+            temp.path(),
+            &mut state,
+            &acc,
+            true,
+            100,
+            &config(&endpoint),
+        );
+        assert_eq!(usage.health, HealthStatus::RateLimited);
+        assert_eq!(usage.cooldown, Some(cooldown));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1034,28 +1193,143 @@ mod tests {
         assert_eq!(usage.cooldown.unwrap().until, 400);
     }
 
+    /// AC-R6-1.1 / AC-R6-1.2 / AC-R6-1.3：从注入的 HTTP 状态码一路走到可选性
+    /// 结论。代理 / 网关故障最常见的 302、404、407、502、503 必须让本地校验
+    /// 通过的账号仍然可被选中启动；400 / 401 / 403 是服务端对凭据的明确拒绝，
+    /// 不得被这条兜底放宽。
+    #[test]
+    fn gateway_statuses_stay_selectable_while_credential_rejections_do_not() {
+        // 期望的 last_error 一并钉住：3xx/404/407 来自中间层，5xx 来自网关或
+        // 源站，两者都不是凭据结论，但用户看到的诊断必须区分得开。
+        let cases: [(u16, bool, HealthStatus, HealthErrorKind); 8] = [
+            (
+                302,
+                true,
+                HealthStatus::TransientFailure,
+                HealthErrorKind::Gateway,
+            ),
+            (
+                404,
+                true,
+                HealthStatus::TransientFailure,
+                HealthErrorKind::Gateway,
+            ),
+            (
+                407,
+                true,
+                HealthStatus::TransientFailure,
+                HealthErrorKind::Gateway,
+            ),
+            (
+                502,
+                true,
+                HealthStatus::TransientFailure,
+                HealthErrorKind::ServerFailure,
+            ),
+            (
+                503,
+                true,
+                HealthStatus::TransientFailure,
+                HealthErrorKind::ServerFailure,
+            ),
+            (
+                400,
+                false,
+                HealthStatus::InvalidCredential,
+                HealthErrorKind::InvalidCredential,
+            ),
+            (
+                401,
+                false,
+                HealthStatus::AuthInvalid,
+                HealthErrorKind::Unauthorized,
+            ),
+            (
+                403,
+                false,
+                HealthStatus::PermissionDenied,
+                HealthErrorKind::PermissionDenied,
+            ),
+        ];
+        for (status, selectable, expected_health, expected_error) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let acc = account("gateway", AccountType::ApiKey);
+            let credential = PortableCredential::api_key("secret").unwrap();
+            let mut state = v2_state(&temp, &acc, &credential, br#"{"api_key":"secret"}"#);
+            let endpoint = mock_server(status, &[], "").0;
+            let adapter = super::super::AntigravityAdapter;
+            let usage = adapter.refresh_account_usage_at(
+                temp.path(),
+                &mut state,
+                &acc,
+                true,
+                100,
+                &config(&endpoint),
+            );
+            assert_eq!(usage.health, expected_health, "status {status}");
+            assert_eq!(usage.last_error, Some(expected_error), "status {status}");
+            let reference = state.credential_refs.get(&acc.id).cloned().unwrap();
+            let tier = policy::eligibility(&acc, Some(&reference), Some(&usage), true, 100);
+            assert_eq!(
+                tier != policy::Eligibility::Ineligible,
+                selectable,
+                "status {status} produced {tier:?} from health {:?}/{:?}",
+                usage.health,
+                usage.last_error
+            );
+
+            // 端到端的"可被选中启动"：选择器本身也必须给出同样的结论。
+            let validated = std::collections::BTreeSet::from([acc.id.clone()]);
+            let selected = policy::select_best_account_with_validation(
+                &state,
+                &state.accounts,
+                &validated,
+                100,
+            );
+            assert_eq!(
+                selected.is_some(),
+                selectable,
+                "status {status} selection disagreed with eligibility"
+            );
+        }
+    }
+
+    /// AC-R6-3.1：从"探测返回 400"出发，一路到 `sagy list` 打印的状态列。
+    /// `sagy list` 的状态列就是 `render_account_table` 的输出（cli/mod.rs 里
+    /// `print_account_table` 只是把它 println 出去），所以这里覆盖的是同一条链路。
+    #[test]
+    fn a_probe_400_is_rendered_as_relogin_required_in_the_account_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let acc = account("rejected", AccountType::ApiKey);
+        let credential = PortableCredential::api_key("secret").unwrap();
+        let mut state = v2_state(&temp, &acc, &credential, br#"{"api_key":"secret"}"#);
+        let endpoint = mock_server(400, &[], "").0;
+        let adapter = super::super::AntigravityAdapter;
+        adapter.refresh_account_usage_at(
+            temp.path(),
+            &mut state,
+            &acc,
+            true,
+            100,
+            &config(&endpoint),
+        );
+
+        let rendered = adapter.render_account_table(&state, None);
+        assert!(
+            rendered.contains("Relogin Required"),
+            "a 400 must reach the user as a relogin prompt: {rendered}"
+        );
+        assert!(
+            !rendered.contains("probe unreachable"),
+            "a 400 is a server verdict, not an unreachable probe channel: {rendered}"
+        );
+        assert!(rendered.is_ascii(), "{rendered}");
+    }
+
     #[test]
     fn extract_jwt_exp_rejects_malformed_shape() {
         let fake_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3ODcxOTk5OTksImVtYWlsIjoidGVzdEBnb29nbGUuY29tIn0.fake_signature";
         assert_eq!(extract_jwt_exp(fake_jwt), None);
         assert_eq!(extract_jwt_exp("invalid_jwt_format"), None);
-    }
-
-    #[test]
-    fn test_mark_rate_limited() {
-        let mut state = State::default();
-        let acc_id = "test-acc-usage";
-        state.usage_cache.insert(
-            acc_id.to_string(),
-            UsageSnapshot {
-                health: HealthStatus::Ready,
-                ..Default::default()
-            },
-        );
-        let adapter = super::super::AntigravityAdapter;
-        adapter.mark_rate_limited_at(&mut state, acc_id, 100);
-        let usage = state.usage_cache.get(acc_id).unwrap();
-        assert_eq!(usage.health, HealthStatus::RateLimited);
-        assert!(usage.cooldown.is_some());
     }
 }

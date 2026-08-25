@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,12 +6,12 @@ use anyhow::{Context, Result, bail};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::core::state::State;
-
 const DEFAULT_STATE_BASENAME: &str = "sagy";
 const STATE_DIR_ENV: &str = "SAGY_HOME";
 const REPO_SYNC_CONFIG_FILENAME: &str = "repo-sync.json";
 const TMP_DIR_NAME: &str = "tmp";
+/// 凭据文件的固定权限：必须在写入内容之前生效，不能先 rename 再 chmod。
+const SECRET_FILE_MODE: u32 = 0o600;
 
 pub fn resolve_state_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = override_dir {
@@ -28,10 +27,6 @@ pub fn resolve_state_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
 
 pub fn tmp_dir(state_dir: &Path) -> PathBuf {
     state_dir.join(TMP_DIR_NAME)
-}
-
-pub fn accounts_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("accounts")
 }
 
 fn configured_state_dir_from_env() -> Option<PathBuf> {
@@ -59,91 +54,33 @@ pub struct RepoSyncConfig {
     pub last_repo: Option<String>,
 }
 
-pub fn create_secure_dir_all(path: &Path) -> Result<()> {
+pub(crate) fn create_secure_dir_all(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
         if current.as_os_str().is_empty() || current.exists() {
             continue;
         }
-        fs::create_dir(&current)
-            .with_context(|| format!("failed to create directory {}", current.display()))?;
+        // 目录必须"创建时就是 0700"。先 create_dir 再 chmod 会留下一个
+        // 其它用户可进入的窗口，凭据正是在这个窗口里被写进去的。
+        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = fs::metadata(&current).with_context(|| {
-                format!("failed to inspect created directory {}", current.display())
-            })?;
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o700);
-            fs::set_permissions(&current, perms).with_context(|| {
-                format!(
-                    "failed to restrict directory permissions for {}",
-                    current.display()
-                )
-            })?;
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        builder
+            .create(&current)
+            .with_context(|| format!("failed to create directory {}", current.display()))?;
     }
     Ok(())
 }
 
-pub fn load_state(state_dir: &Path) -> Result<State> {
-    let state_dir_metadata = match fs::symlink_metadata(state_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to inspect state directory {}", state_dir.display())
-            });
-        }
-    };
-    if state_dir_metadata.file_type().is_symlink() {
-        bail!("state directory cannot be a symlink");
-    }
-    if !state_dir_metadata.is_dir() {
-        bail!("state path is not a directory");
-    }
-
-    let state_file = state_dir.join("state.json");
-    let state_file_metadata = match fs::symlink_metadata(&state_file) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(State::default());
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect state file {}", state_file.display()));
-        }
-    };
-    if state_file_metadata.file_type().is_symlink() {
-        bail!("state file cannot be a symlink");
-    }
-    if !state_file_metadata.is_file() {
-        bail!("state path is not a regular file");
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = state_file_metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            let mut perms = state_file_metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = fs::set_permissions(&state_file, perms);
-        }
-    }
-
-    let contents = fs::read_to_string(&state_file)
-        .with_context(|| format!("failed to read {}", state_file.display()))?;
-    let mut state: State = serde_json::from_str(&contents)
-        .with_context(|| format!("invalid state file: {}", state_file.display()))?;
-    cleanup_invalid_legacy_accounts(&mut state);
-    validate_state_before_normalization(state_dir, &state)?;
-    normalize_state_account_paths(state_dir, &mut state);
-    Ok(state)
-}
-
-pub fn write_file_atomically(target: &Path, content: &[u8]) -> Result<()> {
+fn write_file_atomically_with_mode(
+    target: &Path,
+    content: &[u8],
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
+) -> Result<()> {
     if let Some(parent) = target.parent() {
         create_secure_dir_all(parent)?;
     }
@@ -162,7 +99,17 @@ pub fn write_file_atomically(target: &Path, content: &[u8]) -> Result<()> {
 
     {
         use std::io::Write;
-        let mut file = fs::File::create(&temp_path)
+        // 需要限权时，权限必须在**写入内容之前**就生效：先 rename 再 chmod 会留
+        // 下一个其它用户可读明文凭据的窗口。
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut file = options
+            .open(&temp_path)
             .with_context(|| format!("failed to create temporary file {}", temp_path.display()))?;
         file.write_all(content)
             .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
@@ -182,7 +129,7 @@ pub fn write_file_atomically(target: &Path, content: &[u8]) -> Result<()> {
 }
 
 pub fn write_secret_file(target: &Path, content: &[u8]) -> Result<()> {
-    write_file_atomically(target, content)?;
+    write_file_atomically_with_mode(target, content, SECRET_FILE_MODE)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -198,12 +145,6 @@ pub fn write_secret_file(target: &Path, content: &[u8]) -> Result<()> {
         })?;
     }
     Ok(())
-}
-
-pub fn save_state(state_dir: &Path, state: &State) -> Result<()> {
-    let target = state_dir.join("state.json");
-    let contents = serde_json::to_string_pretty(state).context("failed to serialize state")?;
-    write_secret_file(&target, contents.as_bytes())
 }
 
 pub fn load_repo_sync_config(state_dir: &Path) -> Result<RepoSyncConfig> {
@@ -284,13 +225,6 @@ fn restrict_repo_sync_directory(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_exists(path: &Path, label: &str) -> Result<()> {
-    if !path.exists() {
-        bail!("{label} does not exist: {}", path.display());
-    }
-    Ok(())
-}
-
 pub fn expand_user_path(path: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
     if path_str == "~" {
@@ -305,164 +239,38 @@ pub fn expand_user_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn cleanup_invalid_legacy_accounts(state: &mut State) {
-    let mut dropped_ids = Vec::new();
-    state.accounts.retain(|account| {
-        let is_bogus_google_accounts = account.email.eq_ignore_ascii_case("google_accounts")
-            && account.oauth_token.is_none()
-            && account.api_key.is_none()
-            && account.refresh_token.is_none();
-        if is_bogus_google_accounts {
-            dropped_ids.push(account.id.clone());
-        }
-        !is_bogus_google_accounts
-    });
-    for id in &dropped_ids {
-        state.usage_cache.remove(id);
-        if state.current_account_id.as_deref() == Some(id.as_str()) {
-            state.current_account_id = None;
-        }
-    }
-}
-
-fn normalize_state_account_paths(state_dir: &Path, state: &mut State) {
-    let accounts_root = accounts_dir(state_dir);
-    for account in &mut state.accounts {
-        let account_root = accounts_root.join(&account.id);
-        let token_file = account_root.join("antigravity-oauth-token");
-        let creds_file = account_root.join("credentials.json");
-
-        if let Some(token) = &account.oauth_token {
-            if !token_file.exists() {
-                let _ = write_secret_file(&token_file, token.as_bytes());
-            }
-            account.auth_path = token_file.to_string_lossy().into_owned();
-        } else if let Some(api_key) = &account.api_key {
-            if !creds_file.exists() {
-                let creds_json = serde_json::json!({
-                    "api_key": api_key,
-                    "email": account.email,
-                    "project_id": account.project_id,
-                });
-                let _ = write_secret_file(
-                    &creds_file,
-                    serde_json::to_string_pretty(&creds_json)
-                        .unwrap_or_default()
-                        .as_bytes(),
-                );
-            }
-            account.auth_path = creds_file.to_string_lossy().into_owned();
-        } else if token_file.exists() {
-            account.auth_path = token_file.to_string_lossy().into_owned();
-        } else {
-            account.auth_path = creds_file.to_string_lossy().into_owned();
-        }
-
-        let expected_config_path = account_root.join("settings.json");
-        if expected_config_path.exists() {
-            account.config_path = Some(expected_config_path.to_string_lossy().into_owned());
-        }
-    }
-}
-
-fn validate_state_before_normalization(state_dir: &Path, state: &State) -> Result<()> {
-    let mut account_ids = HashSet::with_capacity(state.accounts.len());
-    for account in &state.accounts {
-        crate::adapters::antigravity::paths::validate_account_id(&account.id)
-            .context("state contains an invalid account id")?;
-        if !account_ids.insert(account.id.as_str()) {
-            bail!("state contains duplicate account ids");
-        }
-    }
-
-    if let Some(current_account_id) = state.current_account_id.as_deref() {
-        crate::adapters::antigravity::paths::validate_account_id(current_account_id)
-            .context("state contains an invalid current account id")?;
-        if !account_ids.contains(current_account_id) {
-            bail!("state current account does not exist");
-        }
-    }
-
-    for account_id in state.usage_cache.keys() {
-        crate::adapters::antigravity::paths::validate_account_id(account_id)
-            .context("state contains an invalid usage cache account id")?;
-        if !account_ids.contains(account_id.as_str()) {
-            bail!("state usage cache refers to a missing account");
-        }
-    }
-
-    for account_id in &account_ids {
-        crate::adapters::antigravity::paths::account_dir_checked(state_dir, account_id)
-            .context("state account path is outside the state directory")?;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::state::{AccountRecord, AccountType};
 
+    /// legacy `write_file_atomically` 已删除，`write_secret_file` 是唯一的
+    /// 原子写入口：内容必须落盘、重复写必须整体替换、权限必须在写入前生效。
     #[test]
-    fn test_token_account_paths_persist_across_load_state() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let state_dir = temp_dir.path();
-
-        let mut state = State::default();
-        let acc_id = "test-token-acc-123";
-        let acc_root = accounts_dir(state_dir).join(acc_id);
-        fs::create_dir_all(&acc_root).expect("create acc dir");
-        let token_path = acc_root.join("antigravity-oauth-token");
-        fs::write(&token_path, "sample_jwt_token_12345").expect("write token");
-
-        let record = AccountRecord {
-            id: acc_id.to_string(),
-            email: "user@example.com".to_string(),
-            account_type: AccountType::OAuth,
-            oauth_token: Some("sample_jwt_token_12345".to_string()),
-            auth_path: token_path.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-        state.accounts.push(record);
-        save_state(state_dir, &state).expect("save state");
-
-        // Reload state
-        let loaded = load_state(state_dir).expect("load state");
-        assert_eq!(loaded.accounts.len(), 1);
-        let loaded_acc = &loaded.accounts[0];
-        assert_eq!(loaded_acc.id, acc_id);
-        assert_eq!(loaded_acc.auth_path, token_path.to_string_lossy().as_ref());
-        assert!(Path::new(&loaded_acc.auth_path).exists());
-    }
-
-    #[test]
-    fn test_cleanup_invalid_legacy_google_accounts() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let state_dir = temp_dir.path();
-
-        let mut state = State::default();
-        state.accounts.push(AccountRecord {
-            id: "fake-ga-id".to_string(),
-            email: "google_accounts".to_string(),
-            account_type: AccountType::OAuth,
-            ..Default::default()
-        });
-        save_state(state_dir, &state).expect("save state");
-
-        let loaded = load_state(state_dir).expect("load state");
-        assert_eq!(loaded.accounts.len(), 0);
-    }
-
-    #[test]
-    fn test_write_file_atomically_concurrent() {
+    fn secret_file_write_is_atomic_and_replaceable() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let target_file = temp_dir.path().join("sub").join("atomic.txt");
-        let content = b"hello atomic world";
-        write_file_atomically(&target_file, content).expect("atomic write");
+        write_secret_file(&target_file, b"first").expect("first atomic write");
+        write_secret_file(&target_file, b"second").expect("repeated atomic write");
 
-        assert!(target_file.exists());
-        assert_eq!(fs::read(&target_file).expect("read"), content);
+        assert_eq!(fs::read(&target_file).expect("read"), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&target_file)
+                    .expect("inspect secret file")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                SECRET_FILE_MODE
+            );
+        }
+        let leftovers = fs::read_dir(target_file.parent().expect("parent"))
+            .expect("enumerate parent")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "atomic write left a temporary file behind");
     }
 
     #[test]

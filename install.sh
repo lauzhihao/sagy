@@ -11,9 +11,45 @@ ORIGINAL_WRAPPER_PATH="${INSTALL_BIN}/sagy-original"
 VERSION="${SAGY_VERSION:-}"
 CURL_CONNECT_TIMEOUT="${SAGY_CURL_CONNECT_TIMEOUT:-10}"
 CURL_MAX_TIME="${SAGY_CURL_MAX_TIME:-120}"
+WORK_DIR=""
+
+# 下载体积上限（字节）。超时只能挡住"慢"，挡不住"大"，因此每条下载都必须显式限量，
+# 超限一律 fail-closed，绝不落盘后再处理。
+# - metadata: GitHub releases/latest 的 JSON 实测在 10KB 量级，1MiB 留出百倍余量。
+# - sums: SHA256SUMS.txt 每行约 100 字节，一次 release 至多十几个 asset，64KiB 绰绰有余。
+# - archive: 当前 release job 产出的最大归档在 10MB 量级，128MiB 用于防止无界下载撑爆磁盘。
+readonly MAX_METADATA_BYTES=1048576
+readonly MAX_SUMS_BYTES=65536
+readonly MAX_ARCHIVE_BYTES=134217728
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+cleanup_workspace() {
+  if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
+    rm -rf -- "${WORK_DIR}"
+  fi
+}
+
+# INT/TERM 如果只清理不重抛，脚本会带着一个"已经被删掉的工作目录"继续往下跑，
+# 后续步骤会以千奇百怪的方式失败，而调用方拿到的退出码也不再是"被信号中断"。
+# 因此清理完必须把该信号恢复成默认处置并打回自己，让父进程看到真实的终止原因。
+on_signal() {
+  local signal="$1"
+  cleanup_workspace
+  trap - EXIT "${signal}"
+  kill -s "${signal}" "$$"
+}
+
+# 每次安装使用独立的一次性工作目录：固定目录里的残留（旧二进制、旧清单）
+# 会让后续安装的完整性守卫 fail-open，把上一个版本当成新版本装上。
+setup_workspace() {
+  mkdir -p "${TMP_ROOT}"
+  WORK_DIR="$(mktemp -d "${TMP_ROOT}/install.XXXXXX")"
+  trap cleanup_workspace EXIT
+  trap 'on_signal INT' INT
+  trap 'on_signal TERM' TERM
 }
 
 validate_release_component() {
@@ -72,14 +108,26 @@ show_requirements() {
 }
 
 download_file() {
-  local url="$1" output="$2" status
-  status="$(curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" \
-    -w '%{http_code}' "${url}" -o "${output}")" || {
+  local url="$1" output="$2" limit="$3" metrics status size
+  metrics="$(curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" \
+    --max-filesize "${limit}" -w '%{http_code} %{size_download}' "${url}" -o "${output}")" || {
     echo "Download failed: ${url}" >&2
     return 1
   }
+  status="${metrics%% *}"
+  size="${metrics##* }"
   if [[ ! "${status}" =~ ^2[0-9]{2}$ ]]; then
     echo "Download returned HTTP ${status:-unknown}: ${url}" >&2
+    return 1
+  fi
+  # curl 的 --max-filesize 只在服务端声明 Content-Length 时提前中止，
+  # 因此这里必须再按实际收到的字节数复核一次。
+  if [[ ! "${size}" =~ ^[0-9]+$ ]]; then
+    echo "Download did not report a transferred byte count: ${url}" >&2
+    return 1
+  fi
+  if (( size > limit )); then
+    echo "Download exceeded the ${limit} byte limit (${size} bytes): ${url}" >&2
     return 1
   fi
 }
@@ -188,56 +236,59 @@ resolve_version() {
     return 0
   fi
 
-  local api_url
+  local api_url metadata_path resolved
   api_url="https://api.github.com/repos/${REPO}/releases/latest"
-  VERSION="$(
-    curl -fsSL --connect-timeout "${CURL_CONNECT_TIMEOUT}" --max-time "${CURL_MAX_TIME}" "${api_url}" \
-      | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
+  metadata_path="${WORK_DIR}/release-latest.json"
+  download_file "${api_url}" "${metadata_path}" "${MAX_METADATA_BYTES}" || exit 1
+  resolved="$(
+    sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "${metadata_path}" \
       | head -n 1
   )"
-  if [[ -z "${VERSION}" ]]; then
+  if [[ -z "${resolved}" ]]; then
     echo "Failed to resolve latest release tag from ${api_url}" >&2
     exit 1
   fi
-  validate_release_component "${VERSION}" "release version"
-  echo "${VERSION}"
+  validate_release_component "${resolved}" "release version"
+  echo "${resolved}"
 }
 
 download_and_install() {
-  local version target asset url tmp_dir cleanup_dir archive_path extracted_path
+  local version target asset url archive_path extracted_path extract_dir
   version="$1"
   target="$2"
   asset="sagy-${version}-${target}.tar.gz"
   validate_release_component "${version}" "release version"
   validate_release_component "${asset}" "release asset name"
   url="https://github.com/${REPO}/releases/download/${version}/${asset}"
-  mkdir -p "${TMP_ROOT}"
-  tmp_dir="$(mktemp -d "${TMP_ROOT}/install.XXXXXX")"
-  cleanup_dir="${tmp_dir}"
-  trap 'rm -rf -- "'"${cleanup_dir}"'"' EXIT
-  archive_path="${tmp_dir}/${asset}"
+  archive_path="${WORK_DIR}/${asset}"
 
   echo "Downloading ${url}"
-  download_file "${url}" "${archive_path}"
+  download_file "${url}" "${archive_path}" "${MAX_ARCHIVE_BYTES}"
 
   local sums_url sums_path
   sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.txt"
-  sums_path="${tmp_dir}/SHA256SUMS.txt"
+  sums_path="${WORK_DIR}/SHA256SUMS.txt"
   echo "Verifying SHA256 checksum..."
-  download_file "${sums_url}" "${sums_path}"
+  download_file "${sums_url}" "${sums_path}" "${MAX_SUMS_BYTES}"
   verify_checksum "${sums_path}" "${archive_path}" "${asset}"
 
-  mkdir -p "${INSTALL_BIN}"
-  tar -xzf "${archive_path}" -C "${tmp_dir}"
-  extracted_path="${tmp_dir}/sagy"
+  # 解压到本次安装专属的空目录，任何残留都不可能被误当成本次归档的产物。
+  extract_dir="${WORK_DIR}/extract"
+  mkdir -p "${extract_dir}"
+  tar -xzf "${archive_path}" -C "${extract_dir}"
+  extracted_path="${extract_dir}/sagy"
   if [[ -L "${extracted_path}" || ! -f "${extracted_path}" ]]; then
     echo "Release archive did not contain a top-level sagy binary." >&2
     exit 1
   fi
 
+  mkdir -p "${INSTALL_BIN}"
   install -m 0755 "${extracted_path}" "${WRAPPER_PATH}"
 }
 
+# sagy-original resolution order: AGY_BIN -> ~/.gemini/antigravity-cli/bin/agy -> PATH agy.
+# 供应商自带的安装位置优先于 PATH，因为 PATH 上的 agy 可能是别的 wrapper 或别名，
+# 会造成回环调用；install.ps1 必须保持同一顺序。
 install_original_wrapper() {
   cat > "${ORIGINAL_WRAPPER_PATH}" <<'EOF'
 #!/usr/bin/env bash
@@ -267,12 +318,20 @@ remove_legacy_aliases() {
   done
 }
 
+# 安装后动作不得吞掉失败：把子命令的输出原样转给用户，并让脚本退出码如实反映结果。
 post_install_import() {
-  if [[ -d "${HOME}/.gemini" ]]; then
-    if "${WRAPPER_PATH}" import-known >/dev/null 2>&1; then
-      echo "Imported current Antigravity credentials into sagy state."
-    fi
+  local import_log status=0
+  if [[ ! -d "${HOME}/.gemini" ]]; then
+    return 0
   fi
+  import_log="${WORK_DIR}/import-known.log"
+  "${WRAPPER_PATH}" import-known >"${import_log}" 2>&1 || status=$?
+  if [[ "${status}" -ne 0 ]]; then
+    echo "Install failed: '${WRAPPER_PATH} import-known' exited with status ${status}." >&2
+    cat "${import_log}" >&2
+    return 1
+  fi
+  echo "Imported current Antigravity credentials into sagy state."
 }
 
 print_next_steps() {
@@ -289,6 +348,7 @@ print_next_steps() {
 
 validate_configuration
 show_requirements
+setup_workspace
 TARGET="$(detect_target)"
 VERSION="$(resolve_version)"
 download_and_install "${VERSION}" "${TARGET}"

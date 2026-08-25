@@ -70,12 +70,15 @@ impl<T> MutationResult<T> {
 
 /// active-home adoption 必须显式选择。首次 profile 遇到 unmanaged fixed slot
 /// 时，普通账户切换保持 fail-closed。
+///
+/// - `Strict`：只接受空 active home 或与 State before profile 完全一致的现场。
+/// - `Adopt`：CLI 默认。磁盘上的凭据**就是**目标账号那一份（逐字节一致）时直接
+///   接管；只要不一致就自动降级回 `Strict`，绝不覆盖。
+/// - `Takeover`：`--takeover` 显式 opt-in，覆盖前把原文件留成同目录备份。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActiveHomeAdoption {
     Strict,
-    #[allow(dead_code)]
     Adopt,
-    #[allow(dead_code)]
     Takeover,
 }
 
@@ -180,17 +183,7 @@ impl super::AntigravityAdapter {
         if email.is_empty() {
             bail!("credential email cannot be empty")
         }
-        let mut document = serde_json::Map::new();
-        document.insert("api_key".to_string(), Value::String(api_key.to_string()));
-        document.insert("email".to_string(), Value::String(email.to_string()));
-        if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
-            document.insert(
-                "project_id".to_string(),
-                Value::String(project_id.to_string()),
-            );
-        }
-        let credential = PortableCredential::api_key_document(Value::Object(document))
-            .map_err(anyhow::Error::new)?;
+        let credential = api_key_credential(api_key, project_id)?;
         let material = credential_material(&credential)?;
         run_credential_import(
             state_dir,
@@ -277,17 +270,7 @@ impl super::AntigravityAdapter {
         if email.is_empty() {
             bail!("credential email cannot be empty")
         }
-        let mut document = serde_json::Map::new();
-        document.insert("api_key".to_string(), Value::String(api_key.to_string()));
-        document.insert("email".to_string(), Value::String(email.to_string()));
-        if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
-            document.insert(
-                "project_id".to_string(),
-                Value::String(project_id.to_string()),
-            );
-        }
-        let credential = PortableCredential::api_key_document(Value::Object(document))
-            .map_err(anyhow::Error::new)?;
+        let credential = api_key_credential(api_key, project_id)?;
         let material = credential_material(&credential)?;
         run_credential_import_session(
             state_dir,
@@ -1193,6 +1176,22 @@ fn merge_oauth_import(
     }
 }
 
+/// Report whether the account's stored credential is an API key with exactly
+/// this secret.
+///
+/// 只看磁盘上真实的 `api_key` 值，不看指纹：旧版本把 `email` / `project_id`
+/// 一起写进了凭据文档，指纹因此跨版本改变。读失败（缺文件、类型不符、损坏）
+/// 一律当作"不匹配"，绝不因为一个无关账号的坏凭据阻断本次导入。
+fn stored_api_key_matches(state_dir: &Path, account_id: &str, api_key: &str) -> bool {
+    let Ok(store) = CredentialStore::new(state_dir, account_id) else {
+        return false;
+    };
+    matches!(
+        store.read_kind(CredentialRefKind::ApiKey),
+        Ok(Some(stored)) if stored.credential.api_key_value() == Some(api_key)
+    )
+}
+
 #[derive(Clone, Copy)]
 enum ImportMatch {
     IdentityOrEmail,
@@ -1363,23 +1362,49 @@ fn run_legacy_migration_session(
     if disk.recovery_pending {
         bail!("state recovery is pending; recover before legacy migration")
     }
-    session
+    let mut reported = Vec::new();
+    // 隔离改名发生在事务的 staging 阶段，而且是非事务性的：事务回滚不会把它移
+    // 回去。必须在闭包外面留一份"已经真的改了名"的清单，回滚时告诉用户
+    // （AC-R12-1.1）。
+    let mut quarantined: Vec<QuarantinedFiles> = Vec::new();
+    let outcome = session
         .with_locked_exact(|transaction| {
             let base = transaction.snapshot()?.state;
-            let mut planned = credential_store::MigrationPlanner::plan(state_dir, &base)
-                .map_err(anyhow::Error::new)?
-                .entries;
+            let plan = credential_store::MigrationPlanner::plan(state_dir, &base)
+                .map_err(anyhow::Error::new)?;
+            let mut planned = plan.entries;
+            let skipped = plan.skipped;
             planned.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+            reported.clone_from(&skipped);
 
-            let mut staged = Vec::with_capacity(planned.len());
+            let mut staged = Vec::with_capacity(planned.len() + skipped.len());
             for entry in planned {
                 let permit = transaction
                     .credential_mutation_permit(&entry.account_id)
                     .map_err(anyhow::Error::new)?;
                 let (store, prepared) =
                     prepare_credential_with_permit(permit, &entry.credential, entry.material())?;
-                staged.push((entry.account_id, entry.credential_ref, store, prepared));
+                staged.push((
+                    entry.account_id,
+                    Some(entry.credential_ref),
+                    store,
+                    prepared,
+                ));
             }
+            for skip in &skipped {
+                let permit = transaction
+                    .credential_mutation_permit(&skip.account_id)
+                    .map_err(anyhow::Error::new)?;
+                let (store, prepared, moved) = purge_unmigratable_account(permit, &base, skip)?;
+                if !moved.is_empty() {
+                    quarantined.push(QuarantinedFiles {
+                        account_id: skip.account_id.clone(),
+                        files: moved,
+                    });
+                }
+                staged.push((skip.account_id.clone(), None, store, prepared));
+            }
+            staged.sort_by(|left, right| left.0.cmp(&right.0));
 
             let mut published = Vec::with_capacity(staged.len());
             for (account_id, reference, store, prepared) in staged {
@@ -1410,11 +1435,16 @@ fn run_legacy_migration_session(
             candidate.active_profile = None;
             candidate.credential_refs.clear();
             for proof in &proofs {
-                candidate.credential_refs.insert(
-                    proof.account_id().to_string(),
-                    proof.credential_ref().clone(),
-                );
+                if let Some(reference) = proof.after_ref() {
+                    candidate
+                        .credential_refs
+                        .insert(proof.account_id().to_string(), reference.clone());
+                }
             }
+            // 被跳过的账号在 v2 里没有凭据引用，必须一并从账号表和用量缓存移除，
+            // 否则 encode_v2 会因为缺 credential_ref 而拒绝写出。原始数据已经隔离
+            // 到 accounts/<id>/ 的 quarantine 文件里，不随之销毁。
+            retain_migratable_accounts(&mut candidate, &skipped);
             let permit = transaction.migration_commit_permit(proofs)?;
             let receipt = match transaction.commit_migration(&candidate, permit) {
                 Ok(receipt) => receipt,
@@ -1444,7 +1474,143 @@ fn run_legacy_migration_session(
                 })
             }
         })
-        .map_err(anyhow::Error::new)
+        .map_err(anyhow::Error::new);
+    // 提示必须在事务外打印：事务内打印会在回滚时留下与最终结果矛盾的输出。
+    // 同理，只有事务真的提交成功才可以报告跳过——整笔回滚时数据仍是 v1，
+    // 打印 "was skipped / 原始数据已保留" 与实际结果矛盾。
+    match outcome {
+        Ok(value) => {
+            report_migration_skips(&reported);
+            Ok(value)
+        }
+        // 回滚了，但隔离改名已经落盘且不会被撤销。以前这条路径什么都不说，
+        // 用户只看到一个与文件系统状态无关的错误。
+        Err(error) => Err(annotate_rollback_quarantine(error, &quarantined)),
+    }
+}
+
+/// One account's already-performed quarantine renames.
+struct QuarantinedFiles {
+    account_id: String,
+    files: Vec<String>,
+}
+
+/// Attach the quarantine renames that a rolled-back migration left on disk.
+///
+/// 为什么选"让它可见"而不是"撤销"：撤销要再做一次同样非事务性的反向改名，
+/// 反向改名自身失败时磁盘会停在"既不是隔离前也不是隔离后"的第三种状态，比
+/// 如实报告更糟。隔离只改名、不销毁数据，v1 state 仍然完整，因此可见即足够。
+fn annotate_rollback_quarantine(
+    error: anyhow::Error,
+    quarantined: &[QuarantinedFiles],
+) -> anyhow::Error {
+    let paths: Vec<String> = quarantined
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .files
+                .iter()
+                .map(move |name| format!("accounts/{}/{}", entry.account_id, name))
+        })
+        .collect();
+    if paths.is_empty() {
+        return error;
+    }
+    error.context(format!(
+        "legacy migration rolled back and the state is still v1, but {} credential file(s) \
+had already been moved aside and were NOT moved back: {}. Nothing was deleted; move them \
+back by hand or leave them in place, then rerun.",
+        paths.len(),
+        paths.join(", ")
+    ))
+}
+
+/// Print one ASCII notice per account that legacy migration could not carry
+/// into v2, plus an actionable hint for what the user can do next.
+fn report_migration_skips(skipped: &[credential_store::MigrationSkip]) {
+    for skip in skipped {
+        eprintln!(
+            "warning: legacy account {} (id {}) was skipped during v1 migration: {}",
+            ascii_console(&skip.email),
+            skip.account_id,
+            ascii_console(&skip.reason)
+        );
+        eprintln!(
+            "warning: its original data is preserved under accounts/{}/ with the \
+'.sagy-credential-quarantine.' prefix; nothing was deleted",
+            skip.account_id
+        );
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "warning: {} legacy account(s) were skipped. Register a working credential with \
+`sagy add`, or re-import a quarantined credential with `sagy import-auth <file>`.",
+            skipped.len()
+        );
+    }
+}
+
+/// Drop the accounts that migration could not carry, together with their usage
+/// cache entries, so the v2 document stays internally consistent.
+fn retain_migratable_accounts(state: &mut State, skipped: &[credential_store::MigrationSkip]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let dropped: std::collections::BTreeSet<&str> = skipped
+        .iter()
+        .map(|skip| skip.account_id.as_str())
+        .collect();
+    state
+        .accounts
+        .retain(|account| !dropped.contains(account.id.as_str()));
+    state
+        .usage_cache
+        .retain(|account_id, _| !dropped.contains(account_id.as_str()));
+    if state
+        .current_account_id
+        .as_deref()
+        .is_some_and(|current| dropped.contains(current))
+    {
+        state.current_account_id = None;
+        state.active_profile = None;
+    }
+}
+
+/// Isolate an unmigratable legacy account and stage the empty transaction that
+/// retires it.
+fn purge_unmigratable_account(
+    permit: crate::core::state_store::CredentialMutationPermit,
+    base: &State,
+    skip: &credential_store::MigrationSkip,
+) -> Result<(
+    CredentialStore,
+    credential_store::PreparedCredentialTxn,
+    Vec<String>,
+)> {
+    let store = CredentialStore::from_permit(permit).map_err(anyhow::Error::new)?;
+    let evidence = quarantine_evidence(base, skip)?;
+    let moved = store
+        .quarantine_unmigratable(&evidence)
+        .map_err(anyhow::Error::new)?;
+    let prepared = store
+        .stage_purge(Uuid::new_v4())
+        .map_err(anyhow::Error::new)?;
+    Ok((store, prepared, moved))
+}
+
+/// Serialize the untouched v1 account record plus the skip reason.
+fn quarantine_evidence(base: &State, skip: &credential_store::MigrationSkip) -> Result<Vec<u8>> {
+    let record = base
+        .accounts
+        .iter()
+        .find(|account| account.id == skip.account_id)
+        .ok_or_else(|| anyhow!("skipped account is not part of the legacy state"))?;
+    let document = serde_json::json!({
+        "quarantined_from": "sagy-v1-state",
+        "reason": skip.reason,
+        "account": record,
+    });
+    serde_json::to_vec_pretty(&document).context("failed to encode quarantine evidence")
 }
 
 /// Coordinate one credential mutation with the exact StateStore transaction.
@@ -1502,13 +1668,27 @@ fn run_credential_import_session(
         disk.migration,
         MigrationStatus::Missing | MigrationStatus::LegacyV1
     );
-    session
+    // 冲突检测必须在写任何东西之前完成，这样交互式录入也能在读取 secret 之前
+    // 用同一个函数拦下来（见 `ensure_import_kind_compatible`）。
+    if matches!(matching, ImportMatch::IdentityOrEmail) {
+        ensure_import_kind_compatible(&disk.state, email, incoming.kind())?;
+    }
+    let mut reported = Vec::new();
+    // 与 legacy 迁移同理：隔离改名不在事务内，回滚不会撤销它（AC-R12-1.1）。
+    let mut quarantined: Vec<QuarantinedFiles> = Vec::new();
+    let outcome = session
         .with_locked_exact(|transaction| {
             let transaction_state = transaction.snapshot().map_err(anyhow::Error::new)?;
             let mut base = transaction_state.state;
             base.version = base.version.max(1);
 
             let incoming_fingerprint = incoming.fingerprint();
+            // 升级前写出的 API key 文档还带着 `email` / `project_id`，指纹与现在
+            // 只含 `api_key` 的文档不同。ApiKey 导入按 IdentityOnly 只比指纹，
+            // 于是升级后重跑同一条 `sagy add --api-key` 会新建第二个账号、写出
+            // 第二份明文 key，policy 再把它们当两个候选调度。这里按磁盘上真实的
+            // api_key 值兜底匹配，跨版本仍然复用同一个账号。
+            let incoming_api_key = incoming.api_key_value().map(ToString::to_string);
             let existing = base.accounts.iter().find(|account| match matching {
                 ImportMatch::IdentityOnly => {
                     account.identity_fingerprint.as_deref() == Some(incoming_fingerprint.as_str())
@@ -1516,6 +1696,9 @@ fn run_credential_import_session(
                             .credential_refs
                             .get(&account.id)
                             .is_some_and(|reference| reference.fingerprint == incoming_fingerprint)
+                        || incoming_api_key.as_deref().is_some_and(|api_key| {
+                            stored_api_key_matches(state_dir, &account.id, api_key)
+                        })
                 }
                 ImportMatch::IdentityOrEmail => {
                     account.identity_fingerprint.as_deref() == Some(incoming_fingerprint.as_str())
@@ -1562,10 +1745,13 @@ fn run_credential_import_session(
             }
 
             let mut work = Vec::<(String, PortableCredential, Vec<u8>, CredentialRef)>::new();
+            let mut skipped = Vec::new();
             if migration {
-                let mut planned = credential_store::MigrationPlanner::plan(state_dir, &base)
-                    .map_err(anyhow::Error::new)?
-                    .entries;
+                let plan = credential_store::MigrationPlanner::plan(state_dir, &base)
+                    .map_err(anyhow::Error::new)?;
+                let mut planned = plan.entries;
+                skipped = plan.skipped;
+                skipped.retain(|skip| skip.account_id != account_id);
                 planned.sort_by(|left, right| left.account_id.cmp(&right.account_id));
                 for entry in planned {
                     if entry.account_id == account_id {
@@ -1580,6 +1766,7 @@ fn run_credential_import_session(
                     ));
                 }
             }
+            reported.clone_from(&skipped);
             let target_ref = CredentialRef {
                 kind: credential_ref_kind_for(&credential),
                 fingerprint: credential.fingerprint(),
@@ -1592,15 +1779,29 @@ fn run_credential_import_session(
             ));
             work.sort_by(|left, right| left.0.cmp(&right.0));
 
-            let mut staged = Vec::with_capacity(work.len());
+            let mut staged = Vec::with_capacity(work.len() + skipped.len());
             for (id, credential, material, reference) in work {
                 let permit = transaction
                     .credential_mutation_permit(&id)
                     .map_err(anyhow::Error::new)?;
                 let (store, stage) =
                     prepare_credential_with_permit(permit, &credential, &material)?;
-                staged.push((id, reference, store, stage));
+                staged.push((id, Some(reference), store, stage));
             }
+            for skip in &skipped {
+                let permit = transaction
+                    .credential_mutation_permit(&skip.account_id)
+                    .map_err(anyhow::Error::new)?;
+                let (store, stage, moved) = purge_unmigratable_account(permit, &base, skip)?;
+                if !moved.is_empty() {
+                    quarantined.push(QuarantinedFiles {
+                        account_id: skip.account_id.clone(),
+                        files: moved,
+                    });
+                }
+                staged.push((skip.account_id.clone(), None, store, stage));
+            }
+            staged.sort_by(|left, right| left.0.cmp(&right.0));
 
             let mut published = Vec::with_capacity(staged.len());
             for (id, reference, store, prepared) in staged {
@@ -1632,10 +1833,11 @@ fn run_credential_import_session(
             upsert_account(&mut candidate, record.clone(), now);
             if migration {
                 for proof in &proofs {
-                    candidate.credential_refs.insert(
-                        proof.account_id().to_string(),
-                        proof.credential_ref().clone(),
-                    );
+                    if let Some(reference) = proof.after_ref() {
+                        candidate
+                            .credential_refs
+                            .insert(proof.account_id().to_string(), reference.clone());
+                    }
                 }
             }
             candidate
@@ -1644,6 +1846,7 @@ fn run_credential_import_session(
             if migration {
                 candidate.current_account_id = None;
                 candidate.active_profile = None;
+                retain_migratable_accounts(&mut candidate, &skipped);
             }
 
             let receipt = if migration {
@@ -1687,13 +1890,116 @@ fn run_credential_import_session(
                 })
             }
         })
-        .map_err(anyhow::Error::new)
+        .map_err(anyhow::Error::new);
+    // 与 legacy 迁移同理：回滚后不得报告"已跳过并保留"，但已经发生的隔离改名
+    // 必须如实告诉用户。
+    match outcome {
+        Ok(value) => {
+            report_migration_skips(&reported);
+            Ok(value)
+        }
+        Err(error) => Err(annotate_rollback_quarantine(error, &quarantined)),
+    }
+}
+
+/// Reject an import that would replace an account's credential with a
+/// different credential family.
+///
+/// 这个检查是纯函数且只读 state：交互式录入路径可以在 prompt secret 之前调用它，
+/// 用户不必先把 token 粘贴完才发现自己撞了一个 API key 账号。
+pub fn ensure_import_kind_compatible(
+    state: &State,
+    email: &str,
+    incoming: CredentialKind,
+) -> Result<()> {
+    let email = email.trim();
+    let Some(existing) = state
+        .accounts
+        .iter()
+        .find(|account| account.email.eq_ignore_ascii_case(email))
+    else {
+        return Ok(());
+    };
+    let incoming_type = account_type_for(incoming);
+    if existing.account_type == incoming_type {
+        return Ok(());
+    }
+    // v1 state 里的 email 完全由用户控制，直接内插会破坏项目的 console
+    // ASCII-only 约束，也可能夹带控制字符污染终端。
+    let existing_email = ascii_console(&existing.email);
+    bail!(
+        "account '{}' (id {}) already holds a {} credential and cannot be replaced by a {} \
+credential. Remove it first with `sagy rm {}`, or import this credential under a different \
+--email.",
+        existing_email,
+        existing.id,
+        existing.account_type.as_str(),
+        incoming_type.as_str(),
+        existing_email
+    )
+}
+
+/// Fold an arbitrary user-controlled string into printable ASCII.
+///
+/// 为什么需要它：账号 email 来自用户（v1 state 或 `--email`），而项目要求
+/// 控制台输出必须是纯 ASCII。非 ASCII 字符与控制字符一律转成 `\u{...}`
+/// 转义，既保持 ASCII 又不丢信息。
+///
+/// 这是全项目**唯一**的控制台转义出口：任何要把用户提供的字符串打到 stdout /
+/// stderr 的地方都必须先过它（AC-R12-4.1），CLI 层通过 `crate::cli` 复用。
+pub(crate) fn ascii_console(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut rendered = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_graphic() || character == ' ' {
+            rendered.push(character);
+        } else {
+            let _ = write!(rendered, "\\u{{{:04x}}}", character as u32);
+        }
+    }
+    rendered
+}
+
+/// Build the API-key credential from the key material alone.
+///
+/// 为什么不再把 `email` / `project_id` 写进凭据文档：它们会进入 fingerprint，
+/// 于是同一把 key 换个 `--email` 或 `--project-id` 就变成第二个账号、第二份明文
+/// 副本，而 policy 会把它们当两个候选调度。`--project-id` 对 API key 账号在启动
+/// 时本来就是 no-op（launcher 对 ApiKey 不导出 GOOGLE_CLOUD_PROJECT），
+/// 所以这里显式告警并忽略，而不是让它静默参与去重指纹。
+fn api_key_credential(api_key: &str, project_id: Option<&str>) -> Result<PortableCredential> {
+    if let Some(warning) = api_key_project_id_warning(project_id) {
+        eprintln!("{warning}");
+    }
+    PortableCredential::api_key(api_key).map_err(anyhow::Error::new)
+}
+
+/// Return the ASCII warning for a `--project-id` that an API-key account
+/// cannot use, or `None` when no project id was supplied.
+pub fn api_key_project_id_warning(project_id: Option<&str>) -> Option<String> {
+    let project_id = project_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(format!(
+        "warning: --project-id '{project_id}' is ignored for API-key accounts; the API key is \
+the complete authentication input. Use an OAuth or Vertex account if you need a project id."
+    ))
+}
+
+const fn account_type_for(kind: CredentialKind) -> AccountType {
+    match kind {
+        CredentialKind::OAuthAccessToken | CredentialKind::OAuthAuthorizedUser => {
+            AccountType::OAuth
+        }
+        CredentialKind::ApiKey => AccountType::ApiKey,
+        CredentialKind::VertexServiceAccount => AccountType::Vertex,
+    }
 }
 
 fn restore_published_transactions(
     staged: Vec<(
         String,
-        CredentialRef,
+        Option<CredentialRef>,
         CredentialStore,
         credential_store::PublishedCredentialTxn,
     )>,
@@ -1826,6 +2132,73 @@ fn upsert_account(state: &mut State, record: AccountRecord, now: i64) {
 mod tests {
     use super::*;
     use crate::adapters::antigravity::account::credential_store::MigrationPlanner;
+
+    fn account_of(email: &str, account_type: AccountType) -> AccountRecord {
+        AccountRecord {
+            id: "acc-1".to_string(),
+            email: email.to_string(),
+            account_type,
+            ..AccountRecord::default()
+        }
+    }
+
+    #[test]
+    fn cross_kind_email_conflict_names_the_conflict_and_the_next_step() {
+        let state = State {
+            version: 2,
+            accounts: vec![account_of("user@example.test", AccountType::ApiKey)],
+            ..State::default()
+        };
+        // AC-4.2: 这个检查是纯读，交互式录入可以在 prompt secret 之前调用它。
+        let error = ensure_import_kind_compatible(
+            &state,
+            "user@example.test",
+            CredentialKind::OAuthAccessToken,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("user@example.test"), "{error}");
+        assert!(error.contains("acc-1"), "{error}");
+        assert!(error.contains("api_key"), "{error}");
+        assert!(error.contains("sagy rm user@example.test"), "{error}");
+        assert!(error.is_ascii(), "{error}");
+
+        assert!(
+            ensure_import_kind_compatible(&state, "user@example.test", CredentialKind::ApiKey)
+                .is_ok()
+        );
+        assert!(
+            ensure_import_kind_compatible(
+                &state,
+                "other@example.test",
+                CredentialKind::OAuthAccessToken
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn api_key_credential_ignores_email_and_project_id() {
+        // AC-2/AC-3: 同一把 key 无论配什么 email / project-id，凭据材料与指纹都必须相同。
+        let plain = api_key_credential("shared-key", None).unwrap();
+        let with_project = api_key_credential("shared-key", Some("proj-a")).unwrap();
+        assert_eq!(plain, with_project);
+        assert_eq!(plain.fingerprint(), with_project.fingerprint());
+        assert_eq!(
+            credential_material(&plain).unwrap(),
+            credential_material(&with_project).unwrap()
+        );
+        assert!(plain.native_document().unwrap().get("email").is_none());
+        assert!(plain.native_document().unwrap().get("project_id").is_none());
+
+        let warning = api_key_project_id_warning(Some("proj-a")).expect("warning");
+        assert!(warning.is_ascii(), "{warning}");
+        assert!(warning.contains("proj-a"), "{warning}");
+        assert!(warning.contains("ignored"), "{warning}");
+        assert!(api_key_project_id_warning(None).is_none());
+        assert!(api_key_project_id_warning(Some("  ")).is_none());
+    }
+
     use crate::core::state::{CredentialRefKind, State};
     use crate::core::state_store::RevisionGeneration;
     use fs2::FileExt;
@@ -2284,6 +2657,98 @@ mod tests {
         );
     }
 
+    /// AC-R12-1.1 / AC-R12-1.2: 隔离改名已经发生、迁移事务却整笔回滚时，
+    /// 用户必须能看到磁盘上到底动了哪些文件。
+    ///
+    /// 构造方式：两个都无法迁移的账号。第一个正常隔离（credentials.json 被改
+    /// 名），第二个把 17 个隔离候选名全部占满，于是 `quarantine_destination`
+    /// 抛 Conflict，整笔迁移回滚——第一个账号的改名不会被撤销。
+    #[test]
+    fn a_rolled_back_migration_reports_the_quarantine_renames_it_left_on_disk() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        for account_id in ["broken-a", "broken-b"] {
+            let account_dir = state_dir.join("accounts").join(account_id);
+            fs::create_dir_all(&account_dir).expect("create legacy account directory");
+            // account_type 是 oauth，但文件里是 api key -> 迁移只能跳过 + 隔离。
+            fs::write(
+                account_dir.join("credentials.json"),
+                br#"{"api_key":"wrong-kind-key"}"#,
+            )
+            .expect("write legacy credential");
+        }
+        // 把 broken-b 的隔离候选名占满。
+        let blocked = state_dir.join("accounts").join("broken-b");
+        fs::write(
+            blocked.join(".sagy-credential-quarantine.credentials.json"),
+            b"an-earlier-attempt",
+        )
+        .expect("write blocker");
+        for index in 1..=16 {
+            fs::write(
+                blocked.join(format!(
+                    ".sagy-credential-quarantine.{index}.credentials.json"
+                )),
+                b"an-earlier-attempt",
+            )
+            .expect("write blocker");
+        }
+        fs::write(
+            state_dir.join("state.json"),
+            br#"{"version":1,"accounts":[{"id":"broken-a","email":"a@example.test","account_type":"oauth"},{"id":"broken-b","email":"b@example.test","account_type":"oauth"}],"usage_cache":{},"current_account_id":null}"#,
+        )
+        .expect("write legacy state");
+
+        let adapter = crate::adapters::antigravity::AntigravityAdapter;
+        let mut session = StateSession::open(&state_dir).expect("open legacy session");
+        let error = adapter
+            .migrate_legacy_state_transaction(&state_dir, &mut session)
+            .expect_err("an unquarantinable account must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.is_ascii(),
+            "console output must be ASCII: {message}"
+        );
+
+        // 改名真的发生了，而且没有被撤销——所以它必须出现在错误里。
+        let moved = state_dir
+            .join("accounts")
+            .join("broken-a")
+            .join(".sagy-credential-quarantine.credentials.json");
+        assert!(moved.is_file(), "broken-a was not quarantined at all");
+        assert!(
+            !state_dir
+                .join("accounts")
+                .join("broken-a")
+                .join("credentials.json")
+                .exists(),
+            "the quarantine rename did not happen, so this test proves nothing"
+        );
+        assert!(
+            message.contains("accounts/broken-a/.sagy-credential-quarantine.credentials.json"),
+            "a rolled-back migration hid the quarantine rename it left behind: {message}"
+        );
+        assert!(
+            message.contains("rolled back"),
+            "the notice must say the migration rolled back: {message}"
+        );
+
+        // 事务确实回滚了：磁盘上还是 v1。
+        let disk: Value = serde_json::from_slice(
+            &fs::read(state_dir.join("state.json")).expect("read state after rollback"),
+        )
+        .expect("parse state after rollback");
+        assert_eq!(disk["version"], serde_json::json!(1));
+    }
+
+    /// 没有发生任何隔离改名时，错误必须原样透传，不得凭空多出一段提示。
+    #[test]
+    fn a_rollback_without_quarantine_leaves_the_error_untouched() {
+        let error = anyhow!("original failure");
+        let annotated = annotate_rollback_quarantine(error, &[]);
+        assert_eq!(format!("{annotated:#}"), "original failure");
+    }
+
     #[test]
     fn import_rejects_blank_ambiguous_and_incomplete_credentials() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2360,7 +2825,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(MigrationPlanner::plan(&state_dir, &state).is_err());
+        // 语义未放宽：孤立 refresh token 仍然不会被当作可用凭据迁移。变化在于它现在
+        // 被记录成 skip 而不是让整笔迁移失败，否则一个坏账号会锁死所有命令。
+        let plan = MigrationPlanner::plan(&state_dir, &state).expect("plan must not abort");
+        assert!(plan.entries.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].account_id, "a-1");
+        assert!(plan.skipped[0].reason.is_ascii());
+        assert!(!plan.skipped[0].reason.is_empty());
         assert!(!state_dir.exists());
     }
 

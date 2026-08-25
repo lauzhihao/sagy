@@ -14,20 +14,20 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use fs2::FileExt;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::atomic_io::{
     DocumentDigest, MutationFailure, NormalizedStoreRoot, OwnedStoreRoot, RootIdentity,
-    SafeRelativePath, TopLevelEntryKind, TopLevelInventoryEntry, create_new_secure_file,
-    ensure_owned_relative_directory, enumerate_owned_relative_directory,
-    enumerate_owned_relative_directory_if_present, inspect_normalized_relative_file,
-    inspect_owned_relative_file, inspect_top_level_inventory, normalized_root_identity,
-    open_or_create_secure_file, open_or_create_secure_file_normalized,
-    read_normalized_relative_file_bounded, read_owned_relative_file_bounded, remove_file,
-    replace_same_dir, sync_file, sync_parent_dir, validate_nonempty_root_for_adoption,
+    SafeRelativePath, TopLevelEntryKind, TopLevelInventoryEntry,
+    announce_lock_wait_before_blocking, create_new_secure_file, ensure_owned_relative_directory,
+    enumerate_owned_relative_directory, enumerate_owned_relative_directory_if_present,
+    inspect_normalized_relative_file, inspect_owned_relative_file, inspect_top_level_inventory,
+    lock_exclusive_with_wait_notice, normalized_root_identity, open_or_create_secure_file,
+    open_or_create_secure_file_normalized, read_normalized_relative_file_bounded,
+    read_owned_relative_file_bounded, remove_file, replace_same_dir, sync_file, sync_parent_dir,
+    validate_nonempty_root_for_adoption,
 };
 const JOURNAL_VERSION: u32 = 1;
 const MAX_JOURNAL_BYTES: usize = 32 * 1024;
@@ -502,7 +502,12 @@ impl AccountStoreCapability {
     }
 
     pub(crate) fn open_or_create_lock(&self, locator: &SafeRelativePath) -> Result<File> {
-        open_or_create_secure_file(&self.root, locator)
+        let file = open_or_create_secure_file(&self.root, locator)?;
+        // 调用方拿到句柄后立刻会 `lock_exclusive` 并可能无限期阻塞（切号路径的
+        // credential / active-home 两把锁都在这里）。在那之前预告一次等待，
+        // 否则用户看到的就是一条完全静默挂起的命令。
+        announce_lock_wait_before_blocking(&file);
+        Ok(file)
     }
 
     pub(crate) fn replace(
@@ -691,12 +696,8 @@ impl AtomicStore {
         let root_identity = adoption_root_identity(root)?;
         validate_nonempty_root_for_adoption(root).map_err(AtomicStoreError::io)?;
         let (lock, journal) = derive_store_locators(&target).map_err(AtomicStoreError::io)?;
-        let raw_inventory = inspect_top_level_inventory(
-            root,
-            MAX_ADOPTION_INVENTORY_ENTRIES,
-            MAX_ADOPTION_FILE_BYTES,
-        )
-        .map_err(AtomicStoreError::io)?;
+        let raw_inventory = inspect_top_level_inventory(root, MAX_ADOPTION_INVENTORY_ENTRIES)
+            .map_err(AtomicStoreError::io)?;
         let bytes = read_normalized_relative_file_bounded(root, &target, MAX_ADOPTION_TARGET_BYTES)
             .map_err(AtomicStoreError::io)?;
         let snapshot = DocumentSnapshot {
@@ -775,7 +776,7 @@ impl AtomicStore {
 
         let lock_file =
             open_or_create_secure_file_normalized(&root, &lock).map_err(AtomicStoreError::io)?;
-        lock_file.lock_exclusive().map_err(|error| {
+        lock_exclusive_with_wait_notice(&lock_file).map_err(|error| {
             AtomicStoreError::io(anyhow!(error).context("failed to acquire adoption lock"))
         })?;
 
@@ -948,7 +949,7 @@ impl AtomicStore {
                 "lock file is not a regular file"
             )));
         }
-        file.lock_exclusive().map_err(|error| {
+        lock_exclusive_with_wait_notice(&file).map_err(|error| {
             AtomicStoreError::io(anyhow!(error).context("failed to acquire exclusive store lock"))
         })?;
         Ok(file)
@@ -2194,18 +2195,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_inventory_is_rejected_without_root_chmod() {
+    fn foreign_symlink_is_classified_as_other_without_root_chmod() {
+        // 语义变更（ROOT-001）：顶层的陌生 symlink 不再让整个 root 不可用。
+        // 这一层只如实分类为 `Other`，由 schema 层决定"sagy 纳管的名字必须是
+        // 什么类型"。本测试保留的不变量是：preflight 依然不 chmod root，
+        // 也不把 symlink 当成可清理的 stage 证据。
         let (_temp, root_path, normalized, target) = populated_root();
         fs::set_permissions(&root_path, fs::Permissions::from_mode(0o755)).unwrap();
         let victim = root_path.parent().unwrap().join("victim");
         fs::write(&victim, b"victim").unwrap();
         symlink(&victim, root_path.join("link-entry")).unwrap();
-        let error = AtomicStore::preflight_existing(&normalized, target).unwrap_err();
-        assert!(matches!(error, AtomicStoreError::Io { .. }));
+        let preflight = AtomicStore::preflight_existing(&normalized, target).unwrap();
+        let entry = preflight
+            .inventory
+            .iter()
+            .find(|entry| entry.locator.as_path() == Path::new("link-entry"))
+            .expect("foreign symlink is inventoried");
+        assert_eq!(entry.kind, TopLevelEntryKind::Other);
+        assert_eq!(entry.artifact, AdoptionArtifact::Ordinary);
+        assert!(preflight.orphan_stages.is_empty());
         assert_eq!(
             fs::metadata(root_path).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_stage_name_is_never_treated_as_removable_evidence() {
+        // 陌生条目被忽略后，唯一危险是"名字长得像 sagy 自己的 stage 的 symlink"
+        // 被当成孤儿 stage 删除。这条不变量必须继续成立。
+        let (_temp, root_path, normalized, target) = populated_root();
+        let victim = root_path.parent().unwrap().join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        let stage_name = format!(".sagy-{}.staged", Uuid::new_v4());
+        symlink(&victim, root_path.join(&stage_name)).unwrap();
+        let preflight = AtomicStore::preflight_existing(&normalized, target).unwrap();
+        assert!(preflight.orphan_stages.is_empty());
+        assert!(victim.exists());
     }
 
     #[test]

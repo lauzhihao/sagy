@@ -7,34 +7,45 @@ use crate::core::state::{
 };
 
 /// The only result used by account selection. The ordering is intentional:
-/// a successfully probed credential wins over one that needs a refresh, and
-/// both win over a locally verified but unprobed credential.
+/// a successfully probed credential wins over one that needs a refresh, both
+/// win over a locally verified but unprobed credential, and all of them win
+/// over a credential that could only be verified locally because the probe
+/// channel was unreachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eligibility {
     Primary,
     Secondary,
     Fallback,
+    Degraded,
     Ineligible,
 }
 
 impl Eligibility {
     fn rank(self) -> Option<i64> {
         match self {
-            Self::Primary => Some(3),
-            Self::Secondary => Some(2),
-            Self::Fallback => Some(1),
+            Self::Primary => Some(4),
+            Self::Secondary => Some(3),
+            Self::Fallback => Some(2),
+            Self::Degraded => Some(1),
             Self::Ineligible => None,
         }
     }
 }
 
-/// Decide whether one account can be selected.
+/// Decide whether one account can be selected.  This is the single definition
+/// of account selectability in the code base.
 ///
 /// `None` is deliberately accepted for the credential reference so callers
 /// handling v1 or partially migrated state can fail closed instead of
 /// inventing a credential kind. A missing usage snapshot is treated as
 /// `Unverified`; that path is selectable only after the caller has validated
 /// the local credential.
+///
+/// 一次探测失败只要没有带回"服务端对凭据的结论"（timeout / DNS / 连接被拒 /
+/// 代理 407 / 网关 502、503 / 强制门户的 302、404），就只说明探测通道不可用，
+/// 本地校验通过的凭据必须仍然可选，否则 sagy 会在凭据完全有效的情况下拒绝
+/// 启动 agy（AVAIL-001）。而服务端明确拒绝（400/401/403、无效凭据）不享受
+/// 这个兜底。
 pub fn eligibility(
     account: &AccountRecord,
     credential_ref: Option<&CredentialRef>,
@@ -62,6 +73,11 @@ pub fn eligibility(
             Eligibility::Secondary
         }
         HealthStatus::Unverified if local_credential_validated => Eligibility::Fallback,
+        HealthStatus::TransientFailure
+            if local_credential_validated && usage.probe_channel_unreachable() =>
+        {
+            Eligibility::Degraded
+        }
         HealthStatus::RefreshRequired
         | HealthStatus::Unverified
         | HealthStatus::RateLimited
@@ -144,7 +160,15 @@ pub fn select_best_account_with_validation<'a>(
         })
         .collect();
 
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
+    // 排序必须与账号在 state 中的排列顺序无关：先按分数（等级已计入分数），
+    // 同分再按 account id 升序。否则断网时"选哪个账号"会随 state 写入顺序漂移，
+    // 无法测试也无法向用户解释。
+    candidates.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
     candidates
         .into_iter()
         .next()
@@ -185,7 +209,7 @@ fn score_account(account: &AccountRecord, usage: &UsageSnapshot, now: i64, tier:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::health::Cooldown;
+    use crate::core::health::{Cooldown, HealthErrorKind};
 
     const FP: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -384,6 +408,144 @@ mod tests {
         assert!(Eligibility::Primary.rank() > Eligibility::Secondary.rank());
         assert!(Eligibility::Secondary.rank() > Eligibility::Fallback.rank());
         assert_eq!(Eligibility::Ineligible.rank(), None);
+    }
+
+    fn transport_failure(kind: HealthErrorKind) -> UsageSnapshot {
+        UsageSnapshot {
+            health: HealthStatus::TransientFailure,
+            last_error: Some(kind),
+            last_probe_at: Some(900),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transport_failure_falls_back_to_local_validation_but_rejection_does_not() {
+        let now = 1_000;
+        let account = account(AccountType::ApiKey);
+        let reference = reference(CredentialRefKind::ApiKey);
+
+        // Gateway / ServerFailure 也属于"没拿到凭据结论"：代理 407、网关 502
+        // 与断网一样不该让本地校验通过的账号无法启动。
+        for kind in [
+            HealthErrorKind::Timeout,
+            HealthErrorKind::Network,
+            HealthErrorKind::Gateway,
+            HealthErrorKind::ServerFailure,
+        ] {
+            assert_eq!(
+                eligibility(
+                    &account,
+                    Some(&reference),
+                    Some(&transport_failure(kind)),
+                    true,
+                    now
+                ),
+                Eligibility::Degraded
+            );
+            assert_ne!(
+                eligibility(
+                    &account,
+                    Some(&reference),
+                    Some(&transport_failure(kind)),
+                    true,
+                    now
+                ),
+                Eligibility::Ineligible,
+                "a locally valid credential must survive an unreachable probe channel"
+            );
+            assert_eq!(
+                eligibility(
+                    &account,
+                    Some(&reference),
+                    Some(&transport_failure(kind)),
+                    false,
+                    now
+                ),
+                Eligibility::Ineligible,
+                "an unvalidated credential must still fail closed"
+            );
+        }
+
+        // 兜底的默认分类（从未被任何探测产生）仍然 fail closed。
+        assert_eq!(
+            eligibility(
+                &account,
+                Some(&reference),
+                Some(&transport_failure(HealthErrorKind::Unknown)),
+                true,
+                now
+            ),
+            Eligibility::Ineligible
+        );
+
+        for health in [
+            HealthStatus::AuthInvalid,
+            HealthStatus::PermissionDenied,
+            HealthStatus::InvalidCredential,
+        ] {
+            assert_eq!(
+                eligibility(&account, Some(&reference), Some(&usage(health)), true, now),
+                Eligibility::Ineligible
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_never_outranks_a_probed_or_unverified_candidate() {
+        let now = 1_000;
+        let account = account(AccountType::ApiKey);
+        let reference = reference(CredentialRefKind::ApiKey);
+        let degraded = eligibility(
+            &account,
+            Some(&reference),
+            Some(&transport_failure(HealthErrorKind::Network)),
+            true,
+            now,
+        );
+        let fallback = eligibility(&account, Some(&reference), None, true, now);
+        assert_eq!(fallback, Eligibility::Fallback);
+        assert!(degraded.rank() < fallback.rank());
+        assert!(degraded.rank().is_some());
+    }
+
+    #[test]
+    fn selection_order_is_independent_of_account_vector_order() {
+        let ids = ["b", "a", "c"];
+        let mut selected = Vec::new();
+        for rotation in 0..ids.len() {
+            let mut ordered = ids.to_vec();
+            ordered.rotate_left(rotation);
+            let mut state = State::default();
+            let mut validated = BTreeSet::new();
+            for id in ordered {
+                state.accounts.push(AccountRecord {
+                    id: id.to_string(),
+                    email: format!("{id}@example.test"),
+                    account_type: AccountType::ApiKey,
+                    ..Default::default()
+                });
+                state
+                    .credential_refs
+                    .insert(id.to_string(), reference(CredentialRefKind::ApiKey));
+                state
+                    .usage_cache
+                    .insert(id.to_string(), transport_failure(HealthErrorKind::Network));
+                validated.insert(id.to_string());
+            }
+            selected.push(
+                select_best_account_with_validation(&state, &state.accounts, &validated, 1_000)
+                    .map(|(account, _)| account.id.clone()),
+            );
+        }
+        assert_eq!(
+            selected,
+            vec![
+                Some("a".to_string()),
+                Some("a".to_string()),
+                Some("a".to_string())
+            ]
+        );
     }
 
     #[test]

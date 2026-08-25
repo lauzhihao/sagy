@@ -6,7 +6,9 @@
 //! restored or finalized. Journal records contain only validated locators and
 //! digests; credential bytes never enter the journal.
 
+use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -44,6 +46,13 @@ const TOMBSTONE_TOKEN_SUFFIX: &str = ".token.tombstone";
 const TOMBSTONE_DOCUMENT_SUFFIX: &str = ".document.tombstone";
 const RECOVERY_TOKEN_SUFFIX: &str = ".token.recovery";
 const RECOVERY_DOCUMENT_SUFFIX: &str = ".document.recovery";
+/// takeover 把被替换掉的原凭据留在同目录下的这个后缀里。
+///
+/// 为什么不删：takeover 的前提就是"这份凭据 sagy 不认识"，它很可能是用户手上
+/// 唯一的一份。finalize 时销毁等于用一条 sagy 命令抹掉用户的数据。
+const BACKUP_INFIX: &str = ".sagy-backup-";
+/// 孤儿 stage 清理时单个目录的枚举上限；超过就放弃清理而不是无界扫描。
+const MAX_SWEEP_ENTRIES: usize = 4096;
 
 #[derive(Debug)]
 pub(crate) enum ActiveHomeError {
@@ -280,7 +289,7 @@ impl ActiveHomeStore {
         } else {
             (second, first)
         };
-        Ok(Self {
+        let store = Self {
             account_id,
             account_capability,
             _account_lock: account_lock,
@@ -291,7 +300,11 @@ impl ActiveHomeStore {
             token_root,
             document_root,
             scope_id: expected_scope,
-        })
+        };
+        // 两个 home root 的 fixed lock 和 State 锁都已在手，此刻磁盘上不存在
+        // 其它进程的在途事务，是清理孤儿 stage 明文的唯一安全时机。
+        store.sweep_orphan_stages()?;
+        Ok(store)
     }
 
     /// Strict mode permits only an empty profile or an exact State-advertised
@@ -304,6 +317,10 @@ impl ActiveHomeStore {
         self.prepare_inner(txid, AdoptionMode::Strict)
     }
 
+    /// Adopt 是"如果磁盘上躺着的就是本次目标账号的凭据，就直接接管"。
+    ///
+    /// 它**不是**放开覆盖：只要磁盘内容与目标不是逐字节一致，`prepare_inner`
+    /// 会把它降级回 Strict，照样 fail-closed。
     pub(crate) fn prepare_adopt(
         self,
         txid: Uuid,
@@ -326,12 +343,30 @@ impl ActiveHomeStore {
         let baseline = self.read_layout()?;
         self.validate_before_layout(&baseline, mode)?;
         let target_layout = self.target_layout()?;
+        // Adopt 的 publish 会整段跳过搬文件（磁盘上已经是目标内容）。因此
+        // Adopt 只在"State 里还没有 active profile、磁盘上已有凭据、且这份
+        // 凭据与目标逐字节一致"这一种情形下才成立；其余一律降级回 Strict，
+        // 否则普通账号切换会静默漏写凭据。
+        let effective_mode = match mode {
+            AdoptionMode::Adopt
+                if self.before_profile.is_none()
+                    && !baseline.is_absent()
+                    && baseline.managed_layout() == target_layout.managed_layout()
+                    && self.target_profile.as_ref().is_some_and(|profile| {
+                        profile.managed_layout == baseline.managed_layout()
+                    }) =>
+            {
+                AdoptionMode::Adopt
+            }
+            AdoptionMode::Adopt => AdoptionMode::Strict,
+            other => other,
+        };
         let mut inner = ActiveHomeTxn {
             store: self,
             txid,
             baseline,
             target_layout,
-            mode,
+            mode: effective_mode,
             phase: JournalPhase::Prepared,
         };
 
@@ -339,14 +374,75 @@ impl ActiveHomeStore {
             validate_first_profile_layout(
                 &inner.baseline,
                 inner.store.target_profile.as_ref(),
-                mode,
+                effective_mode,
             )?;
-            if mode == AdoptionMode::Adopt {
-                inner.mode = AdoptionMode::Adopt;
-            }
         }
         inner.stage(txid)?;
         Ok(PreparedActiveHomeTxn { inner })
+    }
+
+    fn root_for(&self, slot: HomeSlot) -> &HomeRoot {
+        match slot {
+            HomeSlot::Token => &self.token_root,
+            HomeSlot::Document => &self.document_root,
+        }
+    }
+
+    /// 删除两个 home root 下无主的 `.stage` 文件。
+    ///
+    /// stage 里是完整的凭据明文，`stage()` 先写 stage 再写 journal，崩在中间就留下
+    /// 一个永远不会被 recovery 扫到的孤儿。判定"无主"只看 journal：任何仍有 journal
+    /// 的 txid 都属于进行中的事务，一概不碰。tombstone / recovery 里可能是用户唯一
+    /// 的凭据副本，永远不在清理范围内。
+    fn sweep_orphan_stages(&self) -> Result<()> {
+        let Some(live) = self.pending_journal_txids()? else {
+            return Ok(());
+        };
+        for slot in [HomeSlot::Token, HomeSlot::Document] {
+            let capability = &self.root_for(slot).capability;
+            let Some(names) = orphan_stage_names(capability.root_path(), &live)? else {
+                continue;
+            };
+            for name in names {
+                // remove 自己会 sync 父目录，删除即持久。
+                let locator = SafeRelativePath::new(Path::new(&name))?;
+                remove_artifact(capability, &locator)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 收集所有账号目录下仍然存在的 active-home journal txid。
+    ///
+    /// 这里只做只读枚举来构造"保护名单"，删除仍然走 capability 的 no-follow 路径；
+    /// 枚举不到（目录缺失或超出上限）时返回 None，调用方直接跳过清理，宁可留下孤儿
+    /// 也不能在证据不全时删文件。
+    fn pending_journal_txids(&self) -> Result<Option<BTreeSet<Uuid>>> {
+        let probe = self.account_capability.locator(ACCOUNT_LOCK_FILENAME)?;
+        let Some(accounts_relative) = probe.as_path().parent().and_then(Path::parent) else {
+            return Ok(None);
+        };
+        let accounts_dir = self.account_capability.root_path().join(accounts_relative);
+        let Some(entries) = bounded_dir_entries(&accounts_dir)? else {
+            return Ok(None);
+        };
+        let mut txids = BTreeSet::new();
+        for entry in entries {
+            // accounts/ 下混进来的非目录条目不是本模块的事，跳过即可，不能让它把
+            // 整条命令变成硬失败。
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Some(names) = bounded_dir_entries(&entry.path())? else {
+                return Ok(None);
+            };
+            for name in names {
+                if let Some(txid) = journal_txid(&name.file_name().to_string_lossy()) {
+                    txids.insert(txid);
+                }
+            }
+        }
+        Ok(Some(txids))
     }
 
     fn read_layout(&self) -> Result<HomeLayoutBytes> {
@@ -381,7 +477,10 @@ impl ActiveHomeStore {
             return Ok(());
         }
         if mode != AdoptionMode::Takeover {
-            bail!("active-home live layout differs from State before profile");
+            bail!(
+                "active-home {TOKEN_FILENAME} / {DOCUMENT_FILENAME} changed outside sagy and no longer match the State before profile; {}",
+                takeover_hint()
+            );
         }
         // A takeover is an explicit, journaled adoption of the observed
         // fixed-slot baseline.  `read_layout` has already rejected symlink,
@@ -474,9 +573,22 @@ fn validate_first_profile_layout(
         AdoptionMode::Adopt if target_matches => Ok(()),
         AdoptionMode::Takeover => Ok(()),
         _ => bail!(
-            "active-home has unmanaged or mismatched fixed slots; explicit adopt/takeover is required"
+            "active-home already holds {TOKEN_FILENAME} / {DOCUMENT_FILENAME} that do not belong to any sagy-managed account; {}",
+            takeover_hint()
         ),
     }
+}
+
+/// active home 里躺着一份 sagy 不认识的凭据时，用户唯一可执行的下一步。
+///
+/// 必须自带一条真的能敲的命令：HOME-002 的直接成因就是错误信息要求用户
+/// "explicit adopt/takeover"，而 CLI 根本没有提供这个入口。
+fn takeover_hint() -> String {
+    format!(
+        "sagy will not overwrite them silently; back them up yourself, or run 'sagy launch --takeover' \
+         (the same flag exists on 'sagy auto', 'sagy use', 'sagy login' and 'sagy add') to move each \
+         existing file aside to '<name>{BACKUP_INFIX}<txid>' in the same directory and then take over"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -509,6 +621,8 @@ struct ActiveHomeTxn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JournalPhase {
     Prepared,
+    /// publish 已经开始搬动用户真实凭据，但尚未全部就位。
+    Publishing,
     Published,
 }
 
@@ -598,7 +712,7 @@ impl ActiveHomeTxn {
     }
 
     fn artifact_name(&self, _slot: HomeSlot, suffix: &'static str) -> Result<SafeRelativePath> {
-        SafeRelativePath::new(Path::new(&format!("{JOURNAL_PREFIX}{}{suffix}", self.txid)))
+        journal_artifact(self.txid, suffix)
     }
 
     fn stage(&mut self, _txid: Uuid) -> Result<()> {
@@ -656,6 +770,11 @@ impl ActiveHomeTxn {
             }
         }
         if self.mode != AdoptionMode::Adopt {
+            // 先落 publishing 相位再动用户的真实凭据：崩溃点一旦落在 tombstone 与
+            // stage move 之间，journal 必须已经告诉恢复方"文件可能已经被搬走"，
+            // 否则 prepared 相位会被误读成"磁盘未被改动"。
+            self.phase = JournalPhase::Publishing;
+            self.write_journal(JournalPhase::Publishing)?;
             for slot in [HomeSlot::Token, HomeSlot::Document] {
                 if self.slot_baseline(slot).bytes.is_some() {
                     let target = SafeRelativePath::new(Path::new(slot.filename()))?;
@@ -686,6 +805,38 @@ impl ActiveHomeTxn {
         self.write_journal(JournalPhase::Published)
     }
 
+    /// 恢复一次没有写出 `published` 的 publish。
+    ///
+    /// 崩溃可能落在 tombstone 与 stage move 之间的任何一点，此时 live layout 已经
+    /// 不再等于 baseline，直接 cleanup 必然 bail 并把真实凭据永久留在 tombstone 里
+    /// （HOME-001）。只有在磁盘上完全看不到 publish 痕迹时才走无副作用的 cleanup，
+    /// 其余一律交给 restore：它会把 tombstone 移回原位，是唯一能收敛中间态的路径。
+    fn recover_incomplete_publish(&self) -> Result<()> {
+        if self.publish_left_no_trace()? {
+            return self.cleanup_prepared_inner();
+        }
+        self.restore_inner()
+    }
+
+    fn publish_left_no_trace(&self) -> Result<bool> {
+        for slot in [HomeSlot::Token, HomeSlot::Document] {
+            if self.tombstone_exists(slot)? {
+                return Ok(false);
+            }
+        }
+        let live = self.store.read_layout()?;
+        Ok(live.managed_layout() == self.baseline.managed_layout())
+    }
+
+    fn tombstone_exists(&self, slot: HomeSlot) -> Result<bool> {
+        let tombstone = self.artifact_name(slot, slot.tombstone_suffix())?;
+        Ok(self
+            .root_for(slot)
+            .capability
+            .inspect(&tombstone, true)?
+            .is_some())
+    }
+
     fn cleanup_prepared_inner(&self) -> Result<()> {
         let live = self.store.read_layout()?;
         if live.managed_layout() != self.baseline.managed_layout() {
@@ -701,10 +852,11 @@ impl ActiveHomeTxn {
     fn restore_inner(&self) -> Result<()> {
         let live = self.store.read_layout()?;
         for slot in [HomeSlot::Token, HomeSlot::Document] {
-            if !slot_digest_matches(
+            if !slot_state_is_explained(
                 self.slot_baseline(slot),
                 self.slot_target(slot),
                 self.slot_from_layout(&live, slot),
+                self.tombstone_exists(slot)?,
             ) {
                 bail!("active-home restore observed an unknown live digest");
             }
@@ -780,10 +932,45 @@ impl ActiveHomeTxn {
             let tombstone = self.artifact_name(slot, slot.tombstone_suffix())?;
             let recovery = self.artifact_name(slot, slot.recovery_suffix())?;
             remove_artifact(&self.root_for(slot).capability, &stage)?;
-            remove_artifact(&self.root_for(slot).capability, &tombstone)?;
+            // takeover 覆盖掉的是 sagy 不认识的凭据，finalize 不能销毁它，
+            // 只能把 tombstone 改名成用户可见、可自行恢复的备份。
+            if self.mode == AdoptionMode::Takeover {
+                self.preserve_takeover_backup(slot, &tombstone)?;
+            } else {
+                remove_artifact(&self.root_for(slot).capability, &tombstone)?;
+            }
             remove_artifact(&self.root_for(slot).capability, &recovery)?;
         }
         self.cleanup_journal()
+    }
+
+    /// 把一次 takeover 的 tombstone 迁移成同目录下的持久备份。
+    ///
+    /// 备份名带 txid，永远不会覆盖上一次 takeover 留下的备份。
+    fn preserve_takeover_backup(&self, slot: HomeSlot, tombstone: &SafeRelativePath) -> Result<()> {
+        let capability = &self.root_for(slot).capability;
+        if capability.inspect(tombstone, true)?.is_none() {
+            return Ok(());
+        }
+        let backup = SafeRelativePath::new(Path::new(&format!(
+            "{}{BACKUP_INFIX}{}",
+            slot.filename(),
+            self.txid
+        )))?;
+        capability.move_file(tombstone, &backup).map_err(|error| {
+            anyhow!(error).context("failed to preserve active-home takeover backup")
+        })?;
+        capability.sync_parent(&backup)?;
+        // 与 `--insecure-host-key` 同一形状: 逃生口真正生效的那一刻必须出声,
+        // 并告诉用户被替换掉的凭据备份到了哪个文件名, 否则用户无从恢复。
+        // 写失败不影响事务本身, 因此不传播错误。
+        let _ = writeln!(
+            std::io::stderr(),
+            "[sagy] WARNING: --takeover replaced an active-home credential that sagy does not \
+manage. The previous file was kept as {}",
+            backup.to_slash_string().unwrap_or_default()
+        );
+        Ok(())
     }
 
     fn cleanup_journal(&self) -> Result<()> {
@@ -827,6 +1014,7 @@ impl ActiveHomeTxn {
     fn journal_value(&self, phase: JournalPhase) -> Result<Value> {
         let phase = match phase {
             JournalPhase::Prepared => "prepared",
+            JournalPhase::Publishing => "publishing",
             JournalPhase::Published => "published",
         };
         let mut object = Map::new();
@@ -969,6 +1157,83 @@ fn committed_revision_follows_base(base: &Revision, committed: &Revision) -> boo
     }
 }
 
+/// 枚举一个目录的条目。目录缺失或条目数超出上限时返回 None：调用方只用这个结果
+/// 决定"能不能删"，证据不完整时必须放弃删除而不是按空目录处理。
+fn bounded_dir_entries(directory: &Path) -> Result<Option<Vec<std::fs::DirEntry>>> {
+    let reader = match fs::read_dir(directory) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(
+                anyhow!(error).context(format!("failed to enumerate {}", directory.display()))
+            );
+        }
+    };
+    let mut entries = Vec::new();
+    for entry in reader {
+        let entry = entry.context("failed to enumerate directory entry")?;
+        if entries.len() >= MAX_SWEEP_ENTRIES {
+            return Ok(None);
+        }
+        entries.push(entry);
+    }
+    Ok(Some(entries))
+}
+
+fn journal_txid(name: &str) -> Option<Uuid> {
+    parse_artifact_txid(name, JOURNAL_SUFFIX)
+}
+
+fn parse_artifact_txid(name: &str, suffix: &str) -> Option<Uuid> {
+    let raw = name.strip_prefix(JOURNAL_PREFIX)?.strip_suffix(suffix)?;
+    let txid = Uuid::parse_str(raw).ok()?;
+    (txid.to_string() == raw).then_some(txid)
+}
+
+/// 返回一个 home root 下所有不属于 `live` 中任何 txid 的 stage 文件名。
+fn orphan_stage_names(root: &Path, live: &BTreeSet<Uuid>) -> Result<Option<Vec<String>>> {
+    let Some(entries) = bounded_dir_entries(root)? else {
+        return Ok(None);
+    };
+    let mut orphans = Vec::new();
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(txid) = [STAGE_TOKEN_SUFFIX, STAGE_DOCUMENT_SUFFIX]
+            .into_iter()
+            .find_map(|suffix| parse_artifact_txid(name, suffix))
+        else {
+            continue;
+        };
+        if live.contains(&txid) {
+            continue;
+        }
+        // symlink / 目录不是本模块写出来的 stage，交给 capability 之前先排除，
+        // 免得一个陌生同名条目把整条命令变成硬失败。用 DirEntry::file_type 而不是
+        // 再 stat 一次路径：Unix 上它通常直接复用 readdir 的 d_type，把 read_dir 与
+        // 类型判定之间的 TOCTOU 窗口缩到最小。
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            // 条目在枚举之后消失是恢复路径上的正常竞态（另一个 sagy 进程刚刚完成
+            // 同一个事务）。清理是尽力而为的卫生动作，绝不能因为一个已经不存在的
+            // 文件把每条 sagy 命令都变成 rc=1——那正是本模块要消灭的死锁形态。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow!(error).context(format!("failed to inspect {name}")));
+            }
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        orphans.push(name.to_string());
+    }
+    Ok(Some(orphans))
+}
+
+fn journal_artifact(txid: Uuid, suffix: &str) -> Result<SafeRelativePath> {
+    SafeRelativePath::new(Path::new(&format!("{JOURNAL_PREFIX}{txid}{suffix}")))
+}
+
 fn remove_artifact(root: &ExternalDirectoryCapability, locator: &SafeRelativePath) -> Result<()> {
     root.remove(locator)
         .map(|_| ())
@@ -978,6 +1243,21 @@ fn remove_artifact(root: &ExternalDirectoryCapability, locator: &SafeRelativePat
 fn slot_digest_matches(baseline: &SlotBytes, target: &SlotBytes, actual: &SlotBytes) -> bool {
     actual.digest.as_ref() == baseline.digest.as_ref()
         || actual.digest.as_ref() == target.digest.as_ref()
+}
+
+/// 判断一个 slot 的现场状态是否能被本次事务解释。
+///
+/// publish 先把 baseline move 成 tombstone、再把 stage move 到位，中间窗口里目标
+/// 文件本来就不存在。tombstone 在场就是"baseline 字节完好地躺在旁边"的证据，此时
+/// 目标缺失属于事务自己造成的中间态，不能按第三方改写处理。除此之外仍然只接受
+/// baseline / target 两个已知 digest。
+fn slot_state_is_explained(
+    baseline: &SlotBytes,
+    target: &SlotBytes,
+    actual: &SlotBytes,
+    tombstone_exists: bool,
+) -> bool {
+    slot_digest_matches(baseline, target, actual) || (tombstone_exists && actual.digest.is_none())
 }
 
 fn layout_slot(layout: &HomeLayoutBytes, slot: HomeSlot) -> &SlotBytes {
@@ -1009,6 +1289,18 @@ fn layout_value(profile: &Option<ActiveProfile>) -> Value {
         .unwrap_or_else(|| {
             serde_json::to_value(ManagedLayout::default()).expect("layout serializable")
         })
+}
+
+/// journal 里记下来的 mode 字符串还原成 `AdoptionMode`。
+///
+/// 恢复路径必须尊重原事务的 mode: takeover 事务的 finalize 要保留备份,
+/// 其余模式才删 tombstone。未知取值一律按最严格的 `Strict` 处理。
+fn journal_adoption_mode(mode: &str) -> AdoptionMode {
+    match mode {
+        "takeover" => AdoptionMode::Takeover,
+        "adopt" => AdoptionMode::Adopt,
+        _ => AdoptionMode::Strict,
+    }
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
@@ -1081,27 +1373,43 @@ pub(crate) fn recover_pending(
     )
     .map_err(|error| anyhow!(error))?;
     validate_recovery_journal_shape(object, &recovery_proof)?;
-    if phase == "prepared" {
+    // `prepared` 与 `publishing` 都表示 State 还停在 before profile，一律回滚。
+    // 旧二进制只会写 `prepared`，但它的崩溃窗口同样可能已经搬走真实凭据，所以两个
+    // 相位都必须按磁盘证据路由，而不是假定 prepared 等于"磁盘未动"。
+    if phase == "prepared" || phase == "publishing" {
         let txn = ActiveHomeTxn {
             store,
             txid,
             baseline: before_layout,
             target_layout: after_layout,
+            // prepared/publishing 一律按非 adopt 处理：adopt 事务的 baseline 与
+            // target 字节必然相同且 publish 不碰磁盘，读 journal 的 mode 与固定
+            // Strict 在这条分支上不可能产生不同结果，固定值让恢复语义更窄。
             mode: AdoptionMode::Strict,
             phase: JournalPhase::Prepared,
         };
-        txn.cleanup_prepared_inner()?;
+        txn.recover_incomplete_publish()?;
         return Ok(ActiveHomeRecoveryState::RolledBack);
     }
     if phase != "published" {
-        bail!("active-home recovery requires a prepared or published journal");
+        bail!("active-home recovery requires a prepared, publishing, or published journal");
     }
     let live = store.read_layout()?;
     for slot in [HomeSlot::Token, HomeSlot::Document] {
-        if !slot_digest_matches(
+        // restore 自己也有 target->recovery / tombstone->target 两步窗口，崩在中间
+        // 同样会看到目标缺失但 tombstone 在场，这里必须和 restore 用同一套判据，
+        // 否则恢复成功一半的事务会把 CLI 永久锁死。
+        let tombstone = journal_artifact(txid, slot.tombstone_suffix())?;
+        let tombstone_exists = store
+            .root_for(slot)
+            .capability
+            .inspect(&tombstone, true)?
+            .is_some();
+        if !slot_state_is_explained(
             layout_slot(&before_layout, slot),
             layout_slot(&after_layout, slot),
             layout_slot(&live, slot),
+            tombstone_exists,
         ) {
             bail!("active-home live digest is unknown; refusing recovery");
         }
@@ -1143,12 +1451,16 @@ pub(crate) fn recover_pending(
                         _ => 0,
                     })
             {
+                // 必须用 journal 里记下来的真实 mode, 不能硬编码。takeover 事务
+                // 在 State 提交之后、finalize 之前崩溃时, 硬编码 Adopt 会让
+                // finalize_inner 走进删除 tombstone 的分支, 把用户那份被替换掉的
+                // 陌生凭据永久销毁 —— 而它可能是用户手上仅存的一份。
                 let txn = ActiveHomeTxn {
                     store,
                     txid,
                     baseline: before_layout.clone(),
                     target_layout: after_layout.clone(),
-                    mode: AdoptionMode::Adopt,
+                    mode: journal_adoption_mode(recovery_proof.adoption_mode()),
                     phase: JournalPhase::Published,
                 };
                 txn.finalize_inner()?;
@@ -1400,7 +1712,7 @@ fn validate_recovery_journal_shape(
     }
     if !matches!(
         object.get("phase").and_then(Value::as_str),
-        Some("prepared") | Some("published")
+        Some("prepared") | Some("publishing") | Some("published")
     ) {
         bail!("active-home recovery journal phase is invalid");
     }
@@ -1537,6 +1849,24 @@ mod tests {
 
     fn digest() -> String {
         "a".repeat(64)
+    }
+
+    /// 恢复路径必须按 journal 记下来的 mode 前滚。硬编码 `Adopt` 会让 takeover
+    /// 事务在崩溃后走进删除 tombstone 的分支, 销毁用户仅存的那份陌生凭据。
+    #[test]
+    fn journal_mode_round_trips_and_unknown_values_fail_closed() {
+        for mode in [
+            AdoptionMode::Strict,
+            AdoptionMode::Adopt,
+            AdoptionMode::Takeover,
+        ] {
+            assert_eq!(journal_adoption_mode(mode.as_str()), mode);
+        }
+        // 未知/损坏取值按最严格的 Strict 处理, 不得被当成 takeover 而跳过清理,
+        // 也不得被当成 adopt 而跳过搬运。
+        for unknown in ["", "TAKEOVER", "adopt ", "unknown"] {
+            assert_eq!(journal_adoption_mode(unknown), AdoptionMode::Strict);
+        }
     }
 
     fn account_type(target: ActiveHomeTarget) -> AccountType {
@@ -2492,6 +2822,311 @@ mod tests {
                 .join("account-b")
                 .join(format!("{JOURNAL_PREFIX}{txid}{JOURNAL_SUFFIX}"))
                 .exists()
+        );
+    }
+
+    /// AC-3.2 的调用点版本：sweep 跑在生产入口 `ActiveHomeStore::open` 上时，
+    /// 只删无主 stage，仍有 journal 的在途事务文件一个都不能少。
+    ///
+    /// 与下面那个纯函数用例的区别是：这里走的是真实的 journal 扫描 + capability
+    /// 删除路径，而不是把一份手工构造的 `live` 集合喂给 `orphan_stage_names`。
+    /// 注意不能用 CLI 端到端来断言这条性质——任何留在 accounts/ 下的 journal 都会
+    /// 在同一条命令里被 recovery 认领并连同 stage 一起清掉，"还在"这个断言在命令
+    /// 结束时必然为假。所以观察点只能停在 open() 之后。
+    #[test]
+    fn store_open_sweep_keeps_the_stage_of_an_in_flight_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let account_b_root = state_root.join("accounts").join("account-b");
+        fs::create_dir_all(state_root.join("accounts").join("account-a")).unwrap();
+        fs::create_dir_all(&account_b_root).unwrap();
+        let source = fixture_material("account-a", ActiveHomeTarget::RawOauth).unwrap();
+        let cli_path = temp.path().join("cli-home");
+        let gemini_path = temp.path().join("gemini-home");
+        write_fixed_layout(
+            &cli_path,
+            &gemini_path,
+            ActiveHomeTarget::RawOauth,
+            Some(&source),
+        );
+        let cli = NormalizedStoreRoot::normalize(&cli_path).unwrap();
+        let gemini = NormalizedStoreRoot::normalize(&gemini_path).unwrap();
+        let scope = active_home_scope_id(&cli, &gemini);
+        let from_ref = fixture_reference("account-a", ActiveHomeTarget::RawOauth);
+        let to_ref = fixture_reference("account-b", ActiveHomeTarget::Api);
+        let before = fixture_profile(
+            "account-a",
+            &from_ref,
+            &scope,
+            ActiveHomeTarget::RawOauth,
+            Some(&source),
+        );
+        let after = fixture_profile("account-b", &to_ref, &scope, ActiveHomeTarget::Api, None);
+        let state = serde_json::json!({
+            "version": 2,
+            "revision": 1,
+            "accounts": [
+                fixture_account("account-a", ActiveHomeTarget::RawOauth, &from_ref),
+                fixture_account("account-b", ActiveHomeTarget::Api, &to_ref),
+            ],
+            "usage_cache": {},
+            "current_account_id": "account-a",
+            "active_profile": before,
+            "sync_watermarks": {},
+        });
+        fs::write(
+            state_root.join("state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        // 进行中的事务：journal 还躺在账号目录里，它的两份 stage 都必须活下来。
+        let in_flight = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        fs::write(
+            account_b_root.join(format!("{JOURNAL_PREFIX}{in_flight}{JOURNAL_SUFFIX}")),
+            b"{}",
+        )
+        .unwrap();
+        let protected_token =
+            cli_path.join(format!("{JOURNAL_PREFIX}{in_flight}{STAGE_TOKEN_SUFFIX}"));
+        let protected_document = gemini_path.join(format!(
+            "{JOURNAL_PREFIX}{in_flight}{STAGE_DOCUMENT_SUFFIX}"
+        ));
+        let doomed_token = cli_path.join(format!("{JOURNAL_PREFIX}{orphan}{STAGE_TOKEN_SUFFIX}"));
+        let doomed_document =
+            gemini_path.join(format!("{JOURNAL_PREFIX}{orphan}{STAGE_DOCUMENT_SUFFIX}"));
+        fs::write(&protected_token, b"in-flight-token").unwrap();
+        fs::write(&protected_document, b"in-flight-document").unwrap();
+        fs::write(&doomed_token, b"orphan-token").unwrap();
+        fs::write(&doomed_document, b"orphan-document").unwrap();
+
+        let store = StateStore::open(&state_root).unwrap();
+        let read = store.read().unwrap();
+        store
+            .with_locked_exact(&read.revision, |transaction| {
+                let permit = transaction.active_home_mutation_permit_with_ref(
+                    Some(after.clone()),
+                    Some(to_ref.clone()),
+                )?;
+                // open 自己就会跑一次 sweep，这里不需要再做别的。
+                ActiveHomeStore::from_permit_with_roots(permit, cli.clone(), gemini.clone())
+                    .map_err(StateStoreError::Invalid)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            !doomed_token.exists() && !doomed_document.exists(),
+            "the sweep did not run: orphan stage plaintext survived"
+        );
+        assert_eq!(fs::read(&protected_token).unwrap(), b"in-flight-token");
+        assert_eq!(
+            fs::read(&protected_document).unwrap(),
+            b"in-flight-document"
+        );
+    }
+
+    /// AC-3.2：只清理无主 stage；仍有 journal 的 txid 与含凭据的
+    /// tombstone/recovery 一律不碰。
+    #[test]
+    fn orphan_stage_sweep_only_targets_stages_without_a_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let pending = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        for txid in [pending, orphan] {
+            for suffix in [STAGE_TOKEN_SUFFIX, STAGE_DOCUMENT_SUFFIX] {
+                fs::write(
+                    root.path().join(format!("{JOURNAL_PREFIX}{txid}{suffix}")),
+                    b"x",
+                )
+                .unwrap();
+            }
+        }
+        for suffix in [TOMBSTONE_TOKEN_SUFFIX, RECOVERY_TOKEN_SUFFIX] {
+            fs::write(
+                root.path()
+                    .join(format!("{JOURNAL_PREFIX}{orphan}{suffix}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        fs::write(root.path().join(TOKEN_FILENAME), b"x").unwrap();
+        fs::write(
+            root.path()
+                .join(format!("{JOURNAL_PREFIX}not-a-uuid{STAGE_TOKEN_SUFFIX}")),
+            b"x",
+        )
+        .unwrap();
+        // 陌生的非普通文件（目录 / 悬空 symlink）只能被跳过：既不能进删除名单，
+        // 也不能让类型判定报错——恢复路径上的一次硬失败会把每条 sagy 命令变成 rc=1。
+        let intruder_directory = Uuid::new_v4();
+        fs::create_dir(root.path().join(format!(
+            "{JOURNAL_PREFIX}{intruder_directory}{STAGE_TOKEN_SUFFIX}"
+        )))
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let dangling = Uuid::new_v4();
+            std::os::unix::fs::symlink(
+                root.path().join("this-target-does-not-exist"),
+                root.path()
+                    .join(format!("{JOURNAL_PREFIX}{dangling}{STAGE_DOCUMENT_SUFFIX}")),
+            )
+            .unwrap();
+        }
+
+        let live = BTreeSet::from([pending]);
+        let mut names = orphan_stage_names(root.path(), &live).unwrap().unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                format!("{JOURNAL_PREFIX}{orphan}{STAGE_DOCUMENT_SUFFIX}"),
+                format!("{JOURNAL_PREFIX}{orphan}{STAGE_TOKEN_SUFFIX}"),
+            ]
+        );
+    }
+
+    /// AC-2.3：`publish` 在搬动用户真实凭据之前，必须把 `publishing` 相位真的写到
+    /// 磁盘上的 journal 里。
+    ///
+    /// 这个用例不读任何内部字段：它让 stage -> 目标文件那一步真的失败，然后把账号
+    /// 目录里那份 journal 的字节读出来断言 `phase`。只要 `publish_inner` 少写一次
+    /// journal，磁盘上留下的就仍然是 `prepared`，用例立刻变红。
+    #[test]
+    fn publish_persists_the_publishing_phase_before_moving_live_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let account_b_root = state_root.join("accounts").join("account-b");
+        fs::create_dir_all(state_root.join("accounts").join("account-a")).unwrap();
+        fs::create_dir_all(&account_b_root).unwrap();
+        // 同槽位切换：A 与 B 同为 raw OAuth token，publish 必须先 tombstone 再 move。
+        let source = fixture_material("account-a", ActiveHomeTarget::RawOauth).unwrap();
+        let target = fixture_material("account-b", ActiveHomeTarget::RawOauth).unwrap();
+        fs::write(account_b_root.join(TOKEN_FILENAME), &target).unwrap();
+        let cli_path = temp.path().join("cli-home");
+        let gemini_path = temp.path().join("gemini-home");
+        write_fixed_layout(
+            &cli_path,
+            &gemini_path,
+            ActiveHomeTarget::RawOauth,
+            Some(&source),
+        );
+        let cli = NormalizedStoreRoot::normalize(&cli_path).unwrap();
+        let gemini = NormalizedStoreRoot::normalize(&gemini_path).unwrap();
+        let scope = active_home_scope_id(&cli, &gemini);
+        let from_ref = fixture_reference("account-a", ActiveHomeTarget::RawOauth);
+        let to_ref = fixture_reference("account-b", ActiveHomeTarget::RawOauth);
+        let before = fixture_profile(
+            "account-a",
+            &from_ref,
+            &scope,
+            ActiveHomeTarget::RawOauth,
+            Some(&source),
+        );
+        let after = fixture_profile(
+            "account-b",
+            &to_ref,
+            &scope,
+            ActiveHomeTarget::RawOauth,
+            Some(&target),
+        );
+        let state = serde_json::json!({
+            "version": 2,
+            "revision": 1,
+            "accounts": [
+                fixture_account("account-a", ActiveHomeTarget::RawOauth, &from_ref),
+                fixture_account("account-b", ActiveHomeTarget::RawOauth, &to_ref),
+            ],
+            "usage_cache": {},
+            "current_account_id": "account-a",
+            "active_profile": before,
+            "sync_watermarks": {},
+        });
+        fs::write(
+            state_root.join("state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let txid = Uuid::new_v4();
+        let journal_path = account_b_root.join(format!("{JOURNAL_PREFIX}{txid}{JOURNAL_SUFFIX}"));
+        let stage_path = cli_path.join(format!("{JOURNAL_PREFIX}{txid}{STAGE_TOKEN_SUFFIX}"));
+        let tombstone_path =
+            cli_path.join(format!("{JOURNAL_PREFIX}{txid}{TOMBSTONE_TOKEN_SUFFIX}"));
+
+        let store = StateStore::open(&state_root).unwrap();
+        let read = store.read().unwrap();
+        store
+            .with_locked_exact(&read.revision, |transaction| {
+                let permit = transaction.active_home_mutation_permit_with_ref(
+                    Some(after.clone()),
+                    Some(to_ref.clone()),
+                )?;
+                let homes =
+                    ActiveHomeStore::from_permit_with_roots(permit, cli.clone(), gemini.clone())
+                        .map_err(StateStoreError::Invalid)?;
+                let prepared = homes
+                    .prepare(txid)
+                    .map_err(|error| StateStoreError::Invalid(anyhow!(error)))?;
+                assert_eq!(
+                    journal_phase(&journal_path),
+                    "prepared",
+                    "prepare must leave a prepared journal"
+                );
+                // 让 stage -> 目标文件那一步失败：publish 会在 tombstone 之后中断，
+                // 正好停在 `publishing` 窗口里。
+                fs::remove_file(&stage_path).unwrap();
+                let token = match prepared.publish() {
+                    Ok(_) => panic!("publish must fail once the stage is gone"),
+                    Err(ActiveHomeError::ReconcileRequired { token, .. }) => token,
+                    Err(error) => panic!("unexpected publish failure: {error}"),
+                };
+                assert!(
+                    tombstone_path.exists(),
+                    "publish must tombstone the live credential"
+                );
+                assert!(!cli_path.join(TOKEN_FILENAME).exists());
+                assert_eq!(
+                    journal_phase(&journal_path),
+                    "publishing",
+                    "publish must persist the publishing phase before moving credentials"
+                );
+                restore_reconcile(token).map_err(StateStoreError::Invalid)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(fs::read(cli_path.join(TOKEN_FILENAME)).unwrap(), source);
+        assert!(!tombstone_path.exists());
+        assert!(!journal_path.exists());
+    }
+
+    fn journal_phase(journal: &Path) -> String {
+        let value: Value = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
+        value["phase"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn journal_artifact_names_round_trip_through_the_txid_parser() {
+        let txid = Uuid::new_v4();
+        let journal = format!("{JOURNAL_PREFIX}{txid}{JOURNAL_SUFFIX}");
+        assert_eq!(journal_txid(&journal), Some(txid));
+        assert_eq!(journal_txid(&journal.to_uppercase()), None);
+        assert_eq!(
+            journal_txid(&format!("{JOURNAL_PREFIX}{JOURNAL_SUFFIX}")),
+            None
+        );
+        assert_eq!(
+            parse_artifact_txid(
+                &journal_artifact(txid, STAGE_TOKEN_SUFFIX)
+                    .unwrap()
+                    .to_slash_string()
+                    .unwrap(),
+                STAGE_TOKEN_SUFFIX,
+            ),
+            Some(txid)
         );
     }
 }
