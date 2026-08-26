@@ -2163,7 +2163,9 @@ impl CredentialStore {
     }
 
     fn relative_locator(&self, filename: &str) -> StoreResult<SafeRelativePath> {
-        SafeRelativePath::new(&Path::new("accounts").join(&self.account_id).join(filename))
+        SafeRelativePath::new(Path::new("accounts"))
+            .and_then(|accounts| accounts.child(&self.account_id))
+            .and_then(|account| account.child(filename))
             .map_err(CredentialStoreError::io)
     }
 

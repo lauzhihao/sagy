@@ -818,7 +818,9 @@ mod tests {
     /// 也会打印 email，但不在本工单的归属文件里。
     #[test]
     fn console_outlets_never_print_a_raw_user_string() {
-        let source = include_str!("mod.rs");
+        // actions/checkout 会在 Windows runner 上把工作树写成 CRLF；扫描规则只关心
+        // Rust 结构，不应把 checkout 的换行策略当成产品约束。
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
         // 只扫描测试模块之前的产品代码，避免把本测试自己的字面量算进去。
         let production = source
             .split_once("\n#[cfg(test)]\nmod tests {")

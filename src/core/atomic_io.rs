@@ -2196,14 +2196,12 @@ pub(crate) fn move_same_dir(
     }
     #[cfg(windows)]
     {
+        // MoveFileExW 的 WRITE_THROUGH 已经是这条“目标不存在的同卷移动”路径的
+        // 持久化边界。移动成功后立刻重新打开目标再 FlushFileBuffers 不会增加顺序
+        // 保证，反而会与 Windows Defender / 索引器刚拿到的短暂独占句柄竞争，
+        // 把已经完成的 rename 误报成需要 reconciliation。
         windows_replace_file(&source_path, &destination_path, false)
             .map_err(MutationFailure::reconcile_required)?;
-        File::options()
-            .read(true)
-            .write(true)
-            .open(&destination_path)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| MutationFailure::reconcile_required(anyhow!(error)))?;
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
