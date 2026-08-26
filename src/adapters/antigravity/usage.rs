@@ -112,6 +112,7 @@ enum LoadedCredential {
         credential: PortableCredential,
         subject: ProbeSubject,
     },
+    ProviderDelegated(PortableCredential),
     ApiKey(PortableCredential),
     Vertex(PortableCredential),
 }
@@ -261,6 +262,12 @@ fn observe_and_reduce(
             credential,
             subject,
         }) => probe_oauth(&credential, subject, now, config),
+        Some(LoadedCredential::ProviderDelegated(_credential)) => {
+            // Provider-native files are consumed by agy itself. sagy must not
+            // send either the raw token or the Gemini session access token to
+            // tokeninfo, nor infer expiry from the session's expiry_date.
+            return local_provider_delegated_snapshot(previous);
+        }
         Some(LoadedCredential::ApiKey(credential)) => probe_api_key(&credential, config),
         None => ProbeResult::outcome(ProbeOutcome::InvalidCredential),
     };
@@ -284,6 +291,21 @@ fn local_vertex_snapshot(previous: &UsageSnapshot, now: i64) -> UsageSnapshot {
     next.last_rate_limit_at = None;
     next.last_error = None;
     next
+}
+
+fn local_provider_delegated_snapshot(previous: &UsageSnapshot) -> UsageSnapshot {
+    // A child auth rejection is the only durable provider-delegated health
+    // verdict sagy may retain. A local refresh has no authority to overturn
+    // it, and all other prior probe fields are stale because no probe ran.
+    if previous.health.is_credential_rejection() {
+        return previous.clone();
+    }
+
+    UsageSnapshot {
+        plan: previous.plan.clone(),
+        health: HealthStatus::Unverified,
+        ..Default::default()
+    }
 }
 
 fn load_credential(context: &ProbeContext, account: &AccountRecord) -> Option<LoadedCredential> {
@@ -313,6 +335,9 @@ fn load_credential(context: &ProbeContext, account: &AccountRecord) -> Option<Lo
             credential: stored.credential,
             subject: ProbeSubject::AuthorizedUser,
         }),
+        CredentialRefKind::AntigravityToken | CredentialRefKind::GeminiOauthSession => {
+            Some(LoadedCredential::ProviderDelegated(stored.credential))
+        }
         CredentialRefKind::ApiKey => Some(LoadedCredential::ApiKey(stored.credential)),
         CredentialRefKind::VertexServiceAccount => {
             Some(LoadedCredential::Vertex(stored.credential))
@@ -351,7 +376,10 @@ fn credential_kind_matches(account_type: AccountType, kind: CredentialRefKind) -
     match account_type {
         AccountType::OAuth => matches!(
             kind,
-            CredentialRefKind::OauthAccessToken | CredentialRefKind::OauthAuthorizedUser
+            CredentialRefKind::OauthAccessToken
+                | CredentialRefKind::OauthAuthorizedUser
+                | CredentialRefKind::AntigravityToken
+                | CredentialRefKind::GeminiOauthSession
         ),
         AccountType::ApiKey => matches!(kind, CredentialRefKind::ApiKey),
         AccountType::Vertex => matches!(kind, CredentialRefKind::VertexServiceAccount),
@@ -405,6 +433,9 @@ fn probe_oauth(
         // request with an empty bearer value.
         return ProbeResult::outcome(match subject {
             ProbeSubject::AuthorizedUser => ProbeOutcome::Http401Authorized,
+            ProbeSubject::ProviderDelegated => ProbeOutcome::Http401 {
+                subject: ProbeSubject::ProviderDelegated,
+            },
             _ => ProbeOutcome::InvalidCredential,
         });
     };
@@ -414,6 +445,9 @@ fn probe_oauth(
         LocalTokenStatus::ExpiredJwt => {
             return ProbeResult::outcome(match subject {
                 ProbeSubject::AuthorizedUser => ProbeOutcome::Http401Authorized,
+                ProbeSubject::ProviderDelegated => ProbeOutcome::Http401 {
+                    subject: ProbeSubject::ProviderDelegated,
+                },
                 _ => ProbeOutcome::Http401Raw,
             });
         }
@@ -460,6 +494,9 @@ fn classify_response(mut response: Response, subject: ProbeSubject) -> ProbeResu
         return ProbeResult::outcome(match subject {
             ProbeSubject::AuthorizedUser => ProbeOutcome::Http401Authorized,
             ProbeSubject::RawToken => ProbeOutcome::Http401Raw,
+            ProbeSubject::ProviderDelegated => ProbeOutcome::Http401 {
+                subject: ProbeSubject::ProviderDelegated,
+            },
             ProbeSubject::ApiKey => ProbeOutcome::Http401ApiKey,
             ProbeSubject::Vertex => ProbeOutcome::Http401Vertex,
         });
@@ -510,6 +547,7 @@ fn success_outcome(subject: ProbeSubject) -> ProbeOutcome {
     match subject {
         ProbeSubject::RawToken => ProbeOutcome::Http200Raw,
         ProbeSubject::AuthorizedUser => ProbeOutcome::Http200Authorized,
+        ProbeSubject::ProviderDelegated => ProbeOutcome::Http200 { subject },
         ProbeSubject::ApiKey => ProbeOutcome::Http200ApiKey,
         ProbeSubject::Vertex => ProbeOutcome::Http200Vertex,
     }
@@ -656,7 +694,9 @@ mod tests {
         let account_dir = temp.path().join("accounts").join(&account.id);
         fs::create_dir_all(&account_dir).unwrap();
         let filename = match credential.kind() {
-            CredentialKind::OAuthAccessToken => "antigravity-oauth-token",
+            CredentialKind::OAuthAccessToken | CredentialKind::AntigravityToken => {
+                "antigravity-oauth-token"
+            }
             _ => "credentials.json",
         };
         fs::write(account_dir.join(filename), bytes).unwrap();
@@ -673,6 +713,8 @@ mod tests {
                     CredentialKind::OAuthAuthorizedUser => CredentialRefKind::OauthAuthorizedUser,
                     CredentialKind::ApiKey => CredentialRefKind::ApiKey,
                     CredentialKind::VertexServiceAccount => CredentialRefKind::VertexServiceAccount,
+                    CredentialKind::AntigravityToken => CredentialRefKind::AntigravityToken,
+                    CredentialKind::GeminiOAuthSession => CredentialRefKind::GeminiOauthSession,
                 },
                 fingerprint: credential.fingerprint(),
             },
@@ -1172,6 +1214,54 @@ mod tests {
             );
             assert_eq!(usage.health, expected, "credential {id}");
         }
+    }
+
+    #[test]
+    fn provider_native_credentials_never_touch_probe_endpoint() {
+        let session_bytes = br#"{"access_token":"provider-access","expiry_date":1,"id_token":"provider-id","refresh_token":"provider-refresh","scope":"scope","token_type":"Bearer"}"#;
+        let cases = [
+            (
+                "antigravity",
+                PortableCredential::from_antigravity_token_source(b"provider-token"),
+                b"provider-token".as_slice(),
+            ),
+            (
+                "gemini-session",
+                PortableCredential::from_gemini_oauth_session_source(session_bytes),
+                session_bytes.as_slice(),
+            ),
+        ];
+        for (id, credential, bytes) in cases {
+            let credential = credential.unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let acc = account(id, AccountType::OAuth);
+            let mut state = v2_state(&temp, &acc, &credential, bytes);
+            let (endpoint, requests) = mock_server(401, &[], "");
+            let adapter = super::super::AntigravityAdapter;
+            let usage = adapter.refresh_account_usage_at(
+                temp.path(),
+                &mut state,
+                &acc,
+                true,
+                100,
+                &config(&endpoint),
+            );
+            assert_eq!(usage.health, HealthStatus::Unverified, "credential {id}");
+            assert_eq!(usage.last_probe_at, None, "credential {id}");
+            assert_eq!(requests.load(Ordering::SeqCst), 0, "credential {id}");
+        }
+    }
+
+    #[test]
+    fn provider_native_refresh_preserves_child_auth_rejection() {
+        let previous = UsageSnapshot {
+            health: HealthStatus::AuthInvalid,
+            last_error: Some(HealthErrorKind::Unauthorized),
+            last_probe_at: Some(100),
+            ..Default::default()
+        };
+        let next = local_provider_delegated_snapshot(&previous);
+        assert_eq!(next, previous);
     }
 
     #[test]

@@ -640,6 +640,9 @@ const fn probe_subject(kind: CredentialRefKind) -> ProbeSubject {
     match kind {
         CredentialRefKind::OauthAccessToken => ProbeSubject::RawToken,
         CredentialRefKind::OauthAuthorizedUser => ProbeSubject::AuthorizedUser,
+        CredentialRefKind::AntigravityToken | CredentialRefKind::GeminiOauthSession => {
+            ProbeSubject::ProviderDelegated
+        }
         CredentialRefKind::ApiKey => ProbeSubject::ApiKey,
         CredentialRefKind::VertexServiceAccount => ProbeSubject::Vertex,
     }
@@ -838,5 +841,17 @@ wrap it in ascii_console(..): {macro_name}({args})"
         ] {
             assert!(!source.contains(&forbidden));
         }
+    }
+
+    #[test]
+    fn provider_native_refs_are_reported_as_provider_delegated_subjects() {
+        assert_eq!(
+            probe_subject(CredentialRefKind::AntigravityToken),
+            ProbeSubject::ProviderDelegated
+        );
+        assert_eq!(
+            probe_subject(CredentialRefKind::GeminiOauthSession),
+            ProbeSubject::ProviderDelegated
+        );
     }
 }

@@ -199,14 +199,15 @@ impl super::AntigravityAdapter {
         // variable: the key is the complete selected authentication input.
         let project_id = match session_reference.kind {
             CredentialRefKind::ApiKey => None,
-            CredentialRefKind::OauthAccessToken | CredentialRefKind::OauthAuthorizedUser => {
-                session_account
-                    .project_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string)
-            }
+            CredentialRefKind::OauthAccessToken
+            | CredentialRefKind::OauthAuthorizedUser
+            | CredentialRefKind::AntigravityToken
+            | CredentialRefKind::GeminiOauthSession => session_account
+                .project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
             CredentialRefKind::VertexServiceAccount => {
                 let state_project = session_account
                     .project_id
@@ -229,9 +230,10 @@ impl super::AntigravityAdapter {
             }
         };
         let auth = match session_reference.kind {
-            CredentialRefKind::OauthAccessToken | CredentialRefKind::OauthAuthorizedUser => {
-                LaunchAuth::OAuth
-            }
+            CredentialRefKind::OauthAccessToken
+            | CredentialRefKind::OauthAuthorizedUser
+            | CredentialRefKind::AntigravityToken
+            | CredentialRefKind::GeminiOauthSession => LaunchAuth::OAuth,
             CredentialRefKind::ApiKey => LaunchAuth::ApiKey(
                 stored
                     .credential
@@ -431,6 +433,18 @@ fn managed_layout_for_credential(kind: CredentialRefKind, digest: &str) -> Manag
                 sha256: digest.to_string(),
             },
         },
+        CredentialRefKind::AntigravityToken => ManagedLayout {
+            antigravity_token: SlotState::Exact {
+                sha256: digest.to_string(),
+            },
+            gemini_authorized_user: SlotState::Absent,
+        },
+        CredentialRefKind::GeminiOauthSession => ManagedLayout {
+            antigravity_token: SlotState::Absent,
+            gemini_authorized_user: SlotState::Exact {
+                sha256: digest.to_string(),
+            },
+        },
         CredentialRefKind::ApiKey | CredentialRefKind::VertexServiceAccount => {
             ManagedLayout::default()
         }
@@ -440,7 +454,9 @@ fn managed_layout_for_credential(kind: CredentialRefKind, digest: &str) -> Manag
 fn fixed_credential_filename(kind: CredentialRefKind) -> &'static str {
     match kind {
         CredentialRefKind::OauthAccessToken => ACTIVE_TOKEN_FILENAME,
+        CredentialRefKind::AntigravityToken => ACTIVE_TOKEN_FILENAME,
         CredentialRefKind::OauthAuthorizedUser
+        | CredentialRefKind::GeminiOauthSession
         | CredentialRefKind::ApiKey
         | CredentialRefKind::VertexServiceAccount => "credentials.json",
     }
@@ -450,7 +466,10 @@ fn credential_kind_matches_account(account_type: AccountType, kind: CredentialRe
     match account_type {
         AccountType::OAuth => matches!(
             kind,
-            CredentialRefKind::OauthAccessToken | CredentialRefKind::OauthAuthorizedUser
+            CredentialRefKind::OauthAccessToken
+                | CredentialRefKind::OauthAuthorizedUser
+                | CredentialRefKind::AntigravityToken
+                | CredentialRefKind::GeminiOauthSession
         ),
         AccountType::ApiKey => kind == CredentialRefKind::ApiKey,
         AccountType::Vertex => kind == CredentialRefKind::VertexServiceAccount,
@@ -1138,6 +1157,47 @@ mod tests {
                 expected_project
             );
         }
+    }
+
+    #[test]
+    fn provider_native_kinds_use_their_matching_active_home_slot() {
+        let token_digest = "sha256:token";
+        let document_digest = "sha256:document";
+
+        assert_eq!(
+            fixed_credential_filename(CredentialRefKind::AntigravityToken),
+            ACTIVE_TOKEN_FILENAME
+        );
+        assert_eq!(
+            fixed_credential_filename(CredentialRefKind::GeminiOauthSession),
+            "credentials.json"
+        );
+        assert_eq!(
+            managed_layout_for_credential(CredentialRefKind::AntigravityToken, token_digest,),
+            ManagedLayout {
+                antigravity_token: SlotState::Exact {
+                    sha256: "token".to_string(),
+                },
+                gemini_authorized_user: SlotState::Absent,
+            }
+        );
+        assert_eq!(
+            managed_layout_for_credential(CredentialRefKind::GeminiOauthSession, document_digest,),
+            ManagedLayout {
+                antigravity_token: SlotState::Absent,
+                gemini_authorized_user: SlotState::Exact {
+                    sha256: "document".to_string(),
+                },
+            }
+        );
+        assert!(credential_kind_matches_account(
+            AccountType::OAuth,
+            CredentialRefKind::AntigravityToken
+        ));
+        assert!(credential_kind_matches_account(
+            AccountType::OAuth,
+            CredentialRefKind::GeminiOauthSession
+        ));
     }
 
     #[test]

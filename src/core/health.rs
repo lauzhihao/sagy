@@ -119,6 +119,9 @@ impl fmt::Display for HealthErrorKind {
 pub enum ProbeSubject {
     RawToken,
     AuthorizedUser,
+    /// Authentication is delegated to the provider-native child CLI.  sagy
+    /// never sends this material to tokeninfo or another probe endpoint.
+    ProviderDelegated,
     ApiKey,
     Vertex,
 }
@@ -427,14 +430,35 @@ where
         ProbeOutcome::Http200Raw
         | ProbeOutcome::Http200Authorized
         | ProbeOutcome::Http200ApiKey
-        | ProbeOutcome::Http200Vertex
-        | ProbeOutcome::Http200 { .. } => {
+        | ProbeOutcome::Http200Vertex => {
             next.health = HealthStatus::Ready;
             next.cooldown = None;
             next.last_error = None;
             next.last_success_at = Some(observed_at);
             // 成功的鉴权探测不能证明配额为 100%；只有解析到可信配额字段的适配器
             // 才能单独提供配额观察值。
+            next.remaining_quota_percent = None;
+        }
+        ProbeOutcome::Http200 {
+            subject: ProbeSubject::ProviderDelegated,
+        } => {
+            // This form is retained for typed reducer completeness, but a
+            // provider-delegated credential must never become Ready merely
+            // because a caller synthesized an HTTP-style observation. The
+            // provider CLI, not sagy, owns readiness for this credential.
+            next.health = HealthStatus::Unverified;
+            next.cooldown = None;
+            next.remaining_quota_percent = None;
+            next.last_probe_at = None;
+            next.last_success_at = None;
+            next.last_error = None;
+        }
+        ProbeOutcome::Http200 { subject } => {
+            let _ = subject;
+            next.health = HealthStatus::Ready;
+            next.cooldown = None;
+            next.last_error = None;
+            next.last_success_at = Some(observed_at);
             next.remaining_quota_percent = None;
         }
         ProbeOutcome::Http401Raw => apply_error(
@@ -461,6 +485,11 @@ where
         ProbeOutcome::Http401 { subject } => {
             let status = if matches!(subject, ProbeSubject::AuthorizedUser) {
                 HealthStatus::RefreshRequired
+            } else if matches!(subject, ProbeSubject::ProviderDelegated) {
+                // agy has already consumed the provider-native file and
+                // reported an authentication rejection. There is no sagy
+                // refresh exchange for this credential family.
+                HealthStatus::AuthInvalid
             } else {
                 HealthStatus::AuthInvalid
             };
@@ -642,6 +671,16 @@ mod tests {
             200,
         );
         assert_eq!(denied.health, HealthStatus::PermissionDenied);
+
+        let delegated = reduce_usage(
+            &ready(),
+            ProbeOutcome::Http401 {
+                subject: ProbeSubject::ProviderDelegated,
+            },
+            200,
+        );
+        assert_eq!(delegated.health, HealthStatus::AuthInvalid);
+        assert_eq!(delegated.last_error, Some(HealthErrorKind::Unauthorized));
     }
 
     /// AC-2.3: the reducer side of the status matrix, including the 400 that
