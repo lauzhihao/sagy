@@ -4,6 +4,52 @@ const CI_WORKFLOW: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/.github/workflows/ci.yml"
 ));
+const RELEASE_WORKFLOW: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/.github/workflows/release.yml"
+));
+const SANDBOX_ACTION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/.github/actions/setup-sagy-sandbox/action.yml"
+));
+
+fn job_block<'a>(workflow: &'a str, job: &str) -> &'a str {
+    let marker = format!("  {job}:");
+    let start = workflow
+        .find(&marker)
+        .unwrap_or_else(|| panic!("workflow misses job {job:?}"));
+    let remainder = &workflow[start..];
+    let after_marker = &remainder[marker.len()..];
+    let end = after_marker
+        .match_indices("\n  ")
+        .find_map(|(offset, _)| {
+            (after_marker.as_bytes().get(offset + 3) != Some(&b' '))
+                .then_some(marker.len() + offset)
+        })
+        .unwrap_or(remainder.len());
+    &remainder[..end]
+}
+
+fn assert_sandbox_is_wired_before_cargo(workflow: &str, job: &str) {
+    let block = job_block(workflow, job);
+    let checkout = block
+        .find("actions/checkout@")
+        .unwrap_or_else(|| panic!("{job} does not check out the repository"));
+    let sandbox = block
+        .find("- uses: ./.github/actions/setup-sagy-sandbox")
+        .unwrap_or_else(|| panic!("{job} does not configure the sagy sandbox"));
+    assert!(
+        checkout < sandbox,
+        "{job} configures sandbox before checkout"
+    );
+    let cargo = block
+        .find("cargo ")
+        .unwrap_or_else(|| panic!("{job} does not contain a cargo command"));
+    assert!(
+        sandbox < cargo,
+        "{job} runs cargo before configuring sandbox"
+    );
+}
 
 /// 校验 workflow 里的每一个 `uses:` 都固定到 40 位 commit SHA，
 /// 并在同一行保留人类可读的版本 tag 注释。
@@ -18,6 +64,9 @@ fn assert_actions_are_sha_pinned(workflow: &str, label: &str) {
             continue;
         };
         let reference = rest.split_whitespace().next().unwrap_or_default();
+        if reference.starts_with("./") {
+            continue;
+        }
         let Some((action, pin)) = reference.rsplit_once('@') else {
             panic!("{label} action {reference:?} carries no version reference");
         };
@@ -42,10 +91,6 @@ fn pull_request_and_main_quality_workflow_is_isolated_and_complete() {
         "pull_request:",
         "branches:",
         "- main",
-        "HOME:",
-        "SAGY_HOME:",
-        "GEMINI_HOME:",
-        "ANTIGRAVITY_CONFIG_DIR:",
         "cargo fmt --all -- --check",
         "cargo check --all-targets --locked",
         "cargo clippy --all-targets --locked -- -D warnings",
@@ -60,6 +105,8 @@ fn pull_request_and_main_quality_workflow_is_isolated_and_complete() {
         );
     }
     assert!(workflow.contains("permissions:\n  contents: read"));
+    assert_sandbox_is_wired_before_cargo(workflow, "quality");
+    assert_sandbox_is_wired_before_cargo(workflow, "windows-runtime");
 }
 
 #[test]
@@ -76,10 +123,6 @@ fn release_workflow_has_version_guard_minimal_permissions_and_single_quality_job
         "expected_tag=\"v${package_version}\"",
         "needs: [version-guard, quality, windows-runtime]",
         "permissions:\n      contents: write",
-        "HOME:",
-        "SAGY_HOME:",
-        "GEMINI_HOME:",
-        "ANTIGRAVITY_CONFIG_DIR:",
         "cargo fmt --all -- --check",
         "cargo check --all-targets --locked",
         "cargo test --all-targets --locked",
@@ -112,6 +155,54 @@ fn release_workflow_has_version_guard_minimal_permissions_and_single_quality_job
     assert_eq!(
         declared_scopes, 1,
         "the publish job requests scopes beyond contents: write"
+    );
+    for job in ["version-guard", "quality", "windows-runtime", "build"] {
+        assert_sandbox_is_wired_before_cargo(&workflow, job);
+    }
+    assert!(
+        !job_block(&workflow, "publish").contains("setup-sagy-sandbox"),
+        "publish must not configure a cargo sandbox"
+    );
+}
+
+/// GitHub evaluates runner context only after a job has been assigned a runner;
+/// it is therefore invalid in a job-level env expression. The composite action
+/// is the only place where these paths may be derived from RUNNER_TEMP.
+#[test]
+fn workflows_do_not_use_runner_temp_in_job_environment() {
+    for (label, workflow) in [("ci.yml", CI_WORKFLOW), ("release.yml", RELEASE_WORKFLOW)] {
+        assert!(
+            !workflow.contains(concat!("$", "{{ runner.temp }}")),
+            "{label} evaluates runner.temp before a runner is assigned"
+        );
+    }
+}
+
+#[test]
+fn sandbox_action_sets_all_isolated_homes_on_both_platforms() {
+    for variable in [
+        "HOME=",
+        "SAGY_HOME=",
+        "GEMINI_HOME=",
+        "ANTIGRAVITY_CONFIG_DIR=",
+        "CARGO_HOME=",
+    ] {
+        assert!(
+            SANDBOX_ACTION.contains(variable),
+            "sandbox action does not export {variable:?}"
+        );
+    }
+    assert!(SANDBOX_ACTION.contains("RUNNER_TEMP"));
+    assert!(SANDBOX_ACTION.contains("GITHUB_ENV"));
+    assert!(SANDBOX_ACTION.contains("if: runner.os != 'Windows'"));
+    assert!(SANDBOX_ACTION.contains("if: runner.os == 'Windows'"));
+    assert!(
+        SANDBOX_ACTION.contains("shell: bash"),
+        "sandbox action misses the Unix branch"
+    );
+    assert!(
+        SANDBOX_ACTION.contains("shell: pwsh"),
+        "sandbox action misses the Windows branch"
     );
 }
 

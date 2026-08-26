@@ -1019,13 +1019,12 @@ fn updater_exposes_only_the_strict_version_comparison() {
 }
 
 /// AC-2.3：Windows 侧不再只依赖字符串断言。
-/// 有 PowerShell 时直接执行 harness；没有时退回到源码守卫，
-/// CI 的 windows job 会用真正的执行覆盖这一条（见 `.github/workflows/ci.yml`）。
+/// 只有 Windows CI 会注册该测试；缺少 PowerShell 时直接失败，
+/// 不允许静默退回到源码守卫（见 .github/workflows/ci.yml）。
 #[test]
+#[cfg(windows)]
 fn powershell_installer_fail_closed_harness_runs_when_powershell_is_available() {
-    let Some(shell) = powershell_shell() else {
-        return;
-    };
+    let shell = powershell_shell();
     let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/p0_checksum.ps1");
     let output = Command::new(&shell)
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harness])
@@ -1040,16 +1039,17 @@ fn powershell_installer_fail_closed_harness_runs_when_powershell_is_available() 
     );
 }
 
-fn powershell_shell() -> Option<String> {
+#[cfg(windows)]
+fn powershell_shell() -> String {
     for candidate in ["pwsh", "powershell"] {
         let probe = Command::new(candidate)
             .args(["-NoProfile", "-Command", "exit 0"])
             .output();
         if probe.is_ok_and(|output| output.status.success()) {
-            return Some(candidate.to_string());
+            return candidate.to_string();
         }
     }
-    None
+    panic!("Windows CI requires pwsh or powershell to execute the checksum harness");
 }
 
 #[test]

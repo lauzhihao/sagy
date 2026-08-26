@@ -1,0 +1,33 @@
+name: setup sagy sandbox
+description: Configure isolated per-runner homes for sagy and Cargo
+
+runs:
+  using: composite
+  steps:
+    - name: Configure isolated Unix homes
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sandbox_root="${RUNNER_TEMP}/sagy-sandbox"
+        {
+          printf 'HOME=%s/sagy-home\n' "${sandbox_root}"
+          printf 'SAGY_HOME=%s/sagy-state\n' "${sandbox_root}"
+          printf 'GEMINI_HOME=%s/gemini-home\n' "${sandbox_root}"
+          printf 'ANTIGRAVITY_CONFIG_DIR=%s/antigravity-config\n' "${sandbox_root}"
+          printf 'CARGO_HOME=%s/cargo-home\n' "${sandbox_root}"
+        } >> "${GITHUB_ENV}"
+
+    - name: Configure isolated Windows homes
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $sandboxRoot = Join-Path $env:RUNNER_TEMP "sagy-sandbox"
+        @(
+          "HOME=$sandboxRoot\sagy-home"
+          "SAGY_HOME=$sandboxRoot\sagy-state"
+          "GEMINI_HOME=$sandboxRoot\gemini-home"
+          "ANTIGRAVITY_CONFIG_DIR=$sandboxRoot\antigravity-config"
+          "CARGO_HOME=$sandboxRoot\cargo-home"
+        ) | Add-Content -LiteralPath $env:GITHUB_ENV
