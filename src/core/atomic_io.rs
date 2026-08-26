@@ -1235,17 +1235,19 @@ fn reject_protected_claim_path(path: &Path) -> Result<()> {
     // 只会让 `cd ~/.sagy && sagy list` 这种完全正常的用法随机失败，
     // 且失败原因与真实问题毫无关系。真正要挡的是 $HOME / 系统临时目录 /
     // 文件系统根这类"绝不该被整体纳管"的目录。
-    if let Some(home) = home_dir() {
-        protected.push(fs::canonicalize(home).unwrap_or_default());
-    }
-    protected.push(fs::canonicalize(std::env::temp_dir()).unwrap_or_default());
+    // Windows 上 HOME 与 USERPROFILE 是两个独立的环境输入，不能用一个
+    // 覆盖另一个；否则用户只切换其中一个变量就能把 profile 目录暴露给 claim。
+    push_protected_path(&mut protected, std::env::var_os("HOME").map(PathBuf::from));
+    #[cfg(windows)]
+    push_protected_path(
+        &mut protected,
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+    );
+    push_protected_path(&mut protected, Some(std::env::temp_dir()));
     #[cfg(unix)]
-    protected.push(fs::canonicalize(Path::new("/tmp")).unwrap_or_default());
+    push_protected_path(&mut protected, Some(PathBuf::from("/tmp")));
 
-    if protected
-        .iter()
-        .any(|candidate| !candidate.as_os_str().is_empty() && *candidate == canonical)
-    {
+    if protected.contains(&canonical) {
         bail!(
             "protected system directory cannot be claimed: {}",
             path.display()
@@ -1254,14 +1256,13 @@ fn reject_protected_claim_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
+fn push_protected_path(protected: &mut Vec<PathBuf>, path: Option<PathBuf>) {
+    let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
+        return;
+    };
+    let canonical = fs::canonicalize(&path).unwrap_or(path);
+    if !protected.contains(&canonical) {
+        protected.push(canonical);
     }
 }
 

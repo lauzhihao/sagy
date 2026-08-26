@@ -276,8 +276,14 @@ fn home_itself_is_still_refused_as_a_state_root() {
 fn filesystem_root_and_shared_temp_dir_are_refused_with_their_own_reasons() {
     let sandbox = Sandbox::new();
 
-    let separator = std::path::MAIN_SEPARATOR.to_string();
-    let output = sandbox.run(&["--state-dir", &separator, "list"]);
+    let filesystem_root = sandbox
+        .home
+        .ancestors()
+        .last()
+        .expect("sandbox home must have a filesystem root")
+        .to_str()
+        .expect("filesystem root must be UTF-8");
+    let output = sandbox.run(&["--state-dir", filesystem_root, "list"]);
     assert_failure(&output, "--state-dir /");
     let stderr = stderr_of(&output);
     assert!(
@@ -302,6 +308,70 @@ fn filesystem_root_and_shared_temp_dir_are_refused_with_their_own_reasons() {
         !shared_temp.join("state.json").exists(),
         "sagy created a state document inside the shared temp directory"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_root_relative_separator_is_not_a_filesystem_root() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["--state-dir", "\\", "list"]);
+    assert_failure(&output, "root-relative --state-dir");
+    assert!(
+        stderr_of(&output).contains("store root must be absolute"),
+        "a root-relative Windows path must not be classified as a filesystem root: {}",
+        stderr_of(&output)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_home_and_userprofile_are_both_protected() {
+    let sandbox = Sandbox::new();
+    let userprofile = sandbox._temp.path().join("userprofile");
+    fs::create_dir(&userprofile).expect("create alternate userprofile");
+
+    let roots = [&sandbox.home, &userprofile];
+    let before = roots
+        .iter()
+        .map(|root| {
+            let mut entries = fs::read_dir(root)
+                .expect("read protected root")
+                .map(|entry| entry.expect("read root entry").file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        })
+        .collect::<Vec<_>>();
+
+    for root in roots {
+        let root_text = root.to_str().expect("protected root must be UTF-8");
+        let output = sandbox
+            .command()
+            .env("HOME", &sandbox.home)
+            .env("USERPROFILE", &userprofile)
+            .args(["--state-dir", root_text, "list"])
+            .output()
+            .expect("run sagy");
+        assert_failure(&output, "claiming HOME or USERPROFILE");
+        assert!(
+            stderr_of(&output).contains("protected system directory cannot be claimed"),
+            "protected home rejection lost its reason: {}",
+            stderr_of(&output)
+        );
+    }
+
+    let after = roots
+        .iter()
+        .map(|root| {
+            let mut entries = fs::read_dir(root)
+                .expect("read protected root")
+                .map(|entry| entry.expect("read root entry").file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(before, after, "protected home claim wrote state artifacts");
 }
 
 // ---------------------------------------------------------------------------
