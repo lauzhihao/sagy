@@ -537,7 +537,7 @@ fn binary_filename_for_current_platform(base_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
     use std::thread::JoinHandle;
 
     use super::*;
@@ -559,14 +559,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
         let address = listener.local_addr().expect("listener address");
         let handle = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
+            let Ok((stream, _)) = listener.accept() else {
                 return;
             };
-            // 必须先把请求头读干净，否则写响应时可能先收到 RST。
-            let Ok(peer) = stream.try_clone() else {
-                return;
-            };
-            let mut reader = BufReader::new(peer);
+            // 必须先把请求头读干净，再从同一个 socket 写响应；Windows 上如果
+            // 用 clone 出来的 socket 读、原 socket 写并直接 Drop，仍可能把未消费
+            // 的请求字节作为 RST 处理，客户端随后会把完整响应报告为 10054。
+            let mut reader = BufReader::new(stream);
             let mut line = String::new();
             loop {
                 line.clear();
@@ -576,17 +575,28 @@ mod tests {
                     Ok(_) => {}
                 }
             }
-            let _ = stream.write_all(&response);
-            let _ = stream.flush();
+            let mut stream = reader.into_inner();
+            if stream.write_all(&response).is_ok() && stream.flush().is_ok() {
+                // 明确发送 FIN，让 close-delimited 响应有一个跨平台、协议正确的
+                // body 边界；仅依赖 Drop 在 Windows 上可能留下 RST。
+                let _ = stream.shutdown(Shutdown::Write);
+            }
         });
         (format!("http://{address}"), handle)
     }
 
     /// 声明 `Content-Length` 的响应：用来走"下载前就按声明长度拒绝"这条路径。
     fn response_advertising(length: u64, body: &[u8]) -> Vec<u8> {
-        let mut out = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+        let mut out =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n")
+                .into_bytes();
         out.extend_from_slice(body);
         out
+    }
+
+    /// 正常响应声明准确长度，避免客户端必须依赖连接关闭来判定 body 结束。
+    fn response_with_length(body: &[u8]) -> Vec<u8> {
+        response_advertising(body.len() as u64, body)
     }
 
     /// 不声明长度、靠关连接来定界的响应：用来走"流式读到上限就截断"这条路径。
@@ -630,7 +640,7 @@ mod tests {
         server.join().expect("join server");
 
         // 3) 正常大小仍然必须被接受——否则这个测试是"恒红"，证明不了上限的存在。
-        let (url, server) = serve_once(response_close_delimited(b"{\"tag_name\":\"v9.9.9\"}"));
+        let (url, server) = serve_once(response_with_length(b"{\"tag_name\":\"v9.9.9\"}"));
         let release = fetch_release_metadata(&client, &url).expect("normal metadata");
         assert_eq!(release.tag_name, "v9.9.9");
         server.join().expect("join server");
@@ -658,7 +668,7 @@ mod tests {
         assert_rejected_by_limit(error, MAX_CHECKSUM_MANIFEST_BYTES, "checksum manifest");
         server.join().expect("join server");
 
-        let (url, server) = serve_once(response_close_delimited(entry.as_bytes()));
+        let (url, server) = serve_once(response_with_length(entry.as_bytes()));
         assert_eq!(
             fetch_checksum_manifest(&client, &url).expect("normal manifest"),
             entry
@@ -698,7 +708,7 @@ mod tests {
         );
 
         // 正对照：合法响应确实会走到落盘这一步，证明上面的"没落盘"断言有牙。
-        let (url, server) = serve_once(response_close_delimited(b"archive-bytes"));
+        let (url, server) = serve_once(response_with_length(b"archive-bytes"));
         let bytes = fetch_release_asset(&client, &url).expect("normal asset");
         assert_eq!(bytes, b"archive-bytes");
         let staged = stage_release_binary(state_dir.path(), &bytes).expect("stage binary");
