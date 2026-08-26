@@ -92,7 +92,7 @@ fn assert_actions_are_sha_pinned(workflow: &str, label: &str) {
 
 #[test]
 fn pull_request_and_main_quality_workflow_is_isolated_and_complete() {
-    let workflow = CI_WORKFLOW;
+    let workflow = CI_WORKFLOW.replace("\r\n", "\n");
 
     for required in [
         "pull_request:",
@@ -112,8 +112,8 @@ fn pull_request_and_main_quality_workflow_is_isolated_and_complete() {
         );
     }
     assert!(workflow.contains("permissions:\n  contents: read"));
-    assert_sandbox_is_wired_before_cargo(workflow, "quality");
-    assert_sandbox_is_wired_before_cargo(workflow, "windows-runtime");
+    assert_sandbox_is_wired_before_cargo(&workflow, "quality");
+    assert_sandbox_is_wired_before_cargo(&workflow, "windows-runtime");
 }
 
 #[test]
@@ -122,7 +122,8 @@ fn release_workflow_has_version_guard_minimal_permissions_and_single_quality_job
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/release.yml"
     ))
-    .expect("read release workflow");
+    .expect("read release workflow")
+    .replace("\r\n", "\n");
 
     for required in [
         "version-guard:",
