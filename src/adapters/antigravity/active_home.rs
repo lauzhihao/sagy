@@ -1003,6 +1003,10 @@ manage. The previous file was kept as {}",
         let mut file = self.store.account_capability.create_new(&update)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        // ReplaceFileW opens the replacement with no sharing mode. Keeping our own update
+        // handle alive across the call therefore produces a permanent sharing violation on
+        // Windows; the bytes are already durable, so close it before publishing the journal.
+        drop(file);
         self.store
             .account_capability
             .replace(&update, &journal)
