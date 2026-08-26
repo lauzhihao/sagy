@@ -92,10 +92,7 @@ fn compatible_credential(account_type: AccountType, kind: CredentialRefKind) -> 
     match account_type {
         AccountType::OAuth => matches!(
             kind,
-            CredentialRefKind::OauthAccessToken
-                | CredentialRefKind::OauthAuthorizedUser
-                | CredentialRefKind::AntigravityToken
-                | CredentialRefKind::GeminiOauthSession
+            CredentialRefKind::OauthAccessToken | CredentialRefKind::OauthAuthorizedUser
         ),
         AccountType::ApiKey => kind == CredentialRefKind::ApiKey,
         AccountType::Vertex => kind == CredentialRefKind::VertexServiceAccount,
@@ -313,38 +310,6 @@ mod tests {
             eligibility(&oauth, None, Some(&usage(HealthStatus::Ready)), true, now),
             Eligibility::Ineligible
         );
-    }
-
-    #[test]
-    fn provider_delegated_oauth_kinds_are_selectable_after_local_validation() {
-        let account = account(AccountType::OAuth);
-        for kind in [
-            CredentialRefKind::AntigravityToken,
-            CredentialRefKind::GeminiOauthSession,
-        ] {
-            let reference = reference(kind);
-            assert_eq!(
-                eligibility(
-                    &account,
-                    Some(&reference),
-                    Some(&usage(HealthStatus::Unverified)),
-                    true,
-                    1_000,
-                ),
-                Eligibility::Fallback,
-            );
-            assert_eq!(
-                eligibility(
-                    &account,
-                    Some(&reference),
-                    Some(&usage(HealthStatus::TransientFailure)),
-                    true,
-                    1_000,
-                ),
-                Eligibility::Ineligible,
-                "provider-delegated credentials do not turn a non-transport failure into a fallback",
-            );
-        }
     }
 
     #[test]
