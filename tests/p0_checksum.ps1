@@ -126,8 +126,7 @@ function Invoke-WebRequest {
 
 function Get-Command {
     param(
-        [Parameter(Position = 0)][string]$Name,
-        [string]$ErrorAction
+        [Parameter(Position = 0)][string]$Name
     )
     if ($env:FAKE_SUMS_MODE -eq "no-hash-tool" -and $Name -eq "Get-FileHash") {
         return $null
