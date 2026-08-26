@@ -878,9 +878,8 @@ fn reconcile_published(
 
 const fn target_filename(kind: CredentialRefKind) -> &'static str {
     match kind {
-        CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken => TOKEN_FILENAME,
+        CredentialRefKind::OauthAccessToken => TOKEN_FILENAME,
         CredentialRefKind::OauthAuthorizedUser
-        | CredentialRefKind::GeminiOauthSession
         | CredentialRefKind::ApiKey
         | CredentialRefKind::VertexServiceAccount => CREDENTIALS_FILENAME,
     }
@@ -1105,7 +1104,25 @@ impl CredentialStore {
             .ok_or(CredentialStoreError::Corrupt {
                 message: "credential file disappeared during read",
             })?;
-        parse_document_bytes(self, target, bytes)
+        let credential = PortableCredential::from_native_json_str(
+            std::str::from_utf8(&bytes)
+                .map_err(|_| CredentialStoreError::Corrupt {
+                    message: "credential JSON is not UTF-8",
+                })?
+                .trim(),
+        )?;
+        if credential.kind() == CredentialKind::OAuthAccessToken {
+            return Err(CredentialStoreError::Corrupt {
+                message: "raw OAuth token must use the fixed token file",
+            });
+        }
+        Ok(Some(StoredCredential {
+            kind: credential_ref_kind(credential.kind()),
+            credential,
+            material_digest: material_digest(&bytes),
+            path: self.account_dir.join(CREDENTIALS_FILENAME),
+            bytes,
+        }))
     }
 
     fn read_kind_with_capability(
@@ -1148,16 +1165,9 @@ impl CredentialStore {
     /// existing item.
     pub fn read_layout(&self) -> StoreResult<CredentialLayout> {
         Ok(CredentialLayout {
-            token: self.read_kind(self.token_layout_kind())?,
+            token: self.read_kind(CredentialRefKind::OauthAccessToken)?,
             document: self.read_document()?,
         })
-    }
-
-    fn token_layout_kind(&self) -> CredentialRefKind {
-        match self.before_ref.as_ref().map(|reference| reference.kind) {
-            Some(CredentialRefKind::AntigravityToken) => CredentialRefKind::AntigravityToken,
-            _ => CredentialRefKind::OauthAccessToken,
-        }
     }
 
     /// Stage a credential after validating the complete two-slot layout while
@@ -2160,7 +2170,7 @@ impl CredentialStore {
     #[allow(dead_code)]
     fn read_slot(&self, slot: CredentialSlot) -> StoreResult<Option<StoredCredential>> {
         match slot {
-            CredentialSlot::Token => self.read_kind(self.token_layout_kind()),
+            CredentialSlot::Token => self.read_kind(CredentialRefKind::OauthAccessToken),
             CredentialSlot::Document => self.read_document(),
         }
     }
@@ -2514,15 +2524,13 @@ fn parse_document_bytes(
     _target: SafeRelativePath,
     bytes: Vec<u8>,
 ) -> StoreResult<Option<StoredCredential>> {
-    let text = std::str::from_utf8(&bytes).map_err(|_| CredentialStoreError::Corrupt {
-        message: "credential JSON is not UTF-8",
-    })?;
-    // Gemini session material is provider-native JSON whose exact source bytes
-    // are part of the credential fingerprint. Try the strict session parser
-    // against the original bytes first; legacy structured documents continue
-    // through the trimmed native parser below.
-    let credential = PortableCredential::from_gemini_oauth_session_source(&bytes)
-        .or_else(|_| PortableCredential::from_native_json_str(text.trim()))?;
+    let credential = PortableCredential::from_native_json_str(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| CredentialStoreError::Corrupt {
+                message: "credential JSON is not UTF-8",
+            })?
+            .trim(),
+    )?;
     if credential.kind() == CredentialKind::OAuthAccessToken {
         return Err(CredentialStoreError::Corrupt {
             message: "raw OAuth token must use the fixed token file",
@@ -2917,15 +2925,11 @@ fn ensure_slot_expected(
                 });
             };
             let kind_matches = match slot {
-                CredentialSlot::Token => matches!(
-                    kind,
-                    CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken
-                ),
+                CredentialSlot::Token => *kind == CredentialRefKind::OauthAccessToken,
                 CredentialSlot::Document => {
                     matches!(
                         kind,
                         CredentialRefKind::OauthAuthorizedUser
-                            | CredentialRefKind::GeminiOauthSession
                             | CredentialRefKind::ApiKey
                             | CredentialRefKind::VertexServiceAccount
                     )
@@ -2962,11 +2966,8 @@ fn ensure_layout_equal(expected: &CredentialLayout, actual: &CredentialLayout) -
 
 fn slot_for_kind(kind: CredentialRefKind) -> CredentialSlot {
     match kind {
-        CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken => {
-            CredentialSlot::Token
-        }
+        CredentialRefKind::OauthAccessToken => CredentialSlot::Token,
         CredentialRefKind::OauthAuthorizedUser
-        | CredentialRefKind::GeminiOauthSession
         | CredentialRefKind::ApiKey
         | CredentialRefKind::VertexServiceAccount => CredentialSlot::Document,
     }
@@ -2997,8 +2998,6 @@ fn credential_ref_kind(kind: CredentialKind) -> CredentialRefKind {
         CredentialKind::OAuthAuthorizedUser => CredentialRefKind::OauthAuthorizedUser,
         CredentialKind::ApiKey => CredentialRefKind::ApiKey,
         CredentialKind::VertexServiceAccount => CredentialRefKind::VertexServiceAccount,
-        CredentialKind::AntigravityToken => CredentialRefKind::AntigravityToken,
-        CredentialKind::GeminiOAuthSession => CredentialRefKind::GeminiOauthSession,
     }
 }
 
@@ -3008,8 +3007,6 @@ fn credential_kind(kind: CredentialRefKind) -> CredentialKind {
         CredentialRefKind::OauthAuthorizedUser => CredentialKind::OAuthAuthorizedUser,
         CredentialRefKind::ApiKey => CredentialKind::ApiKey,
         CredentialRefKind::VertexServiceAccount => CredentialKind::VertexServiceAccount,
-        CredentialRefKind::AntigravityToken => CredentialKind::AntigravityToken,
-        CredentialRefKind::GeminiOauthSession => CredentialKind::GeminiOAuthSession,
     }
 }
 
@@ -3024,18 +3021,10 @@ fn parse_material(kind: CredentialRefKind, bytes: &[u8]) -> StoreResult<Portable
     })?;
     let credential = match kind {
         CredentialRefKind::OauthAccessToken => PortableCredential::oauth_access_token(text.trim())?,
-        CredentialRefKind::AntigravityToken => {
-            PortableCredential::from_antigravity_token_source(bytes)?
-        }
         CredentialRefKind::OauthAuthorizedUser
-        | CredentialRefKind::GeminiOauthSession
         | CredentialRefKind::ApiKey
         | CredentialRefKind::VertexServiceAccount => {
-            if kind == CredentialRefKind::GeminiOauthSession {
-                PortableCredential::from_gemini_oauth_session_source(bytes)?
-            } else {
-                PortableCredential::from_native_json_str(text.trim())?
-            }
+            PortableCredential::from_native_json_str(text.trim())?
         }
     };
     if credential_ref_kind(credential.kind()) != kind {
@@ -3060,9 +3049,6 @@ fn material_bytes(credential: &PortableCredential) -> StoreResult<Vec<u8>> {
             })?
             .as_bytes()
             .to_vec()),
-        CredentialKind::AntigravityToken | CredentialKind::GeminiOAuthSession => credential
-            .to_native_bytes()
-            .map_err(CredentialStoreError::from),
         _ => Ok(credential.to_native_json_string()?.into_bytes()),
     }
 }

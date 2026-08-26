@@ -10,8 +10,8 @@ pub mod credential_store;
 use credential_store::CredentialStore;
 
 use crate::adapters::antigravity::active_home::{
-    ActiveHomeError, ActiveHomeStore, KnownHomeProof, KnownSlotProof, PreparedActiveHomeTxn,
-    PublishedActiveHomeTxn, restore_reconcile,
+    ActiveHomeError, ActiveHomeStore, PreparedActiveHomeTxn, PublishedActiveHomeTxn,
+    restore_reconcile,
 };
 use crate::adapters::antigravity::paths::{
     account_token_file, active_home_roots, active_home_scope_id, default_antigravity_cli_home,
@@ -84,12 +84,7 @@ pub(crate) enum ActiveHomeAdoption {
 
 pub fn is_valid_oauth_credential(json: &Value) -> bool {
     PortableCredential::from_native_json_str(&json.to_string())
-        .map(|credential| {
-            matches!(
-                credential.kind(),
-                CredentialKind::OAuthAuthorizedUser | CredentialKind::GeminiOAuthSession
-            )
-        })
+        .map(|credential| matches!(credential.kind(), CredentialKind::OAuthAuthorizedUser))
         .unwrap_or(false)
 }
 
@@ -363,8 +358,7 @@ impl super::AntigravityAdapter {
         state_dir: &Path,
         session: &mut StateSession,
     ) -> Result<MutationResult<Vec<AccountRecord>>> {
-        let sources = scan_known_oauth_sources()?;
-        if sources.is_empty() {
+        let Some((credential, material, email)) = scan_known_oauth_source()? else {
             if matches!(session.migration(), MigrationStatus::Missing) {
                 recover_active_home_journals(state_dir, session, None)?;
                 recover_credential_journals_session(state_dir, session)?;
@@ -378,8 +372,31 @@ impl super::AntigravityAdapter {
                 value: Vec::new(),
                 state: session.read().clone(),
             });
+        };
+        let imported = run_credential_import_session(
+            state_dir,
+            session,
+            credential,
+            material,
+            &email,
+            Some("Antigravity OAuth"),
+            ImportMatch::IdentityOrEmail,
+            true,
+        )?;
+        let pending = imported.recovery_pending();
+        let state = imported.state().clone();
+        let value = vec![imported.into_value()];
+        if pending {
+            // The original mutation already carries the exact recovery error;
+            // retain it through a bounded user-facing message.
+            Ok(MutationResult::CommittedRecoveryPending {
+                value,
+                state,
+                message: "import-known credential evidence cleanup is pending".to_string(),
+            })
+        } else {
+            Ok(MutationResult::Committed { value, state })
         }
-        run_known_credential_import_session(state_dir, session, sources)
     }
 
     pub fn import_known_sources(&self, state_dir: &Path, state: &mut State) -> Vec<AccountRecord> {
@@ -566,16 +583,7 @@ impl super::AntigravityAdapter {
                     antigravity_root,
                     gemini_root,
                 )
-                .map_err(StateStoreError::Invalid)?
-                .with_known_home_proof(
-                    if adoption == ActiveHomeAdoption::Adopt
-                        && snapshot.state.active_profile.is_none()
-                    {
-                        known_home_proof(state_dir, &snapshot.state)
-                    } else {
-                        None
-                    },
-                );
+                .map_err(StateStoreError::Invalid)?;
                 let txid = Uuid::new_v4();
                 let prepared = prepare_active_home(home_store, txid, adoption)
                     .map_err(StateStoreError::Invalid)?;
@@ -910,22 +918,18 @@ fn active_profile_for_reference(
         .unwrap_or(material_digest)
         .to_string();
     let managed_layout = match reference.kind {
-        CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken => {
-            ManagedLayout {
-                antigravity_token: SlotState::Exact {
-                    sha256: material_digest.clone(),
-                },
-                gemini_authorized_user: SlotState::Absent,
-            }
-        }
-        CredentialRefKind::OauthAuthorizedUser | CredentialRefKind::GeminiOauthSession => {
-            ManagedLayout {
-                antigravity_token: SlotState::Absent,
-                gemini_authorized_user: SlotState::Exact {
-                    sha256: material_digest,
-                },
-            }
-        }
+        CredentialRefKind::OauthAccessToken => ManagedLayout {
+            antigravity_token: SlotState::Exact {
+                sha256: material_digest.clone(),
+            },
+            gemini_authorized_user: SlotState::Absent,
+        },
+        CredentialRefKind::OauthAuthorizedUser => ManagedLayout {
+            antigravity_token: SlotState::Absent,
+            gemini_authorized_user: SlotState::Exact {
+                sha256: material_digest,
+            },
+        },
         CredentialRefKind::ApiKey | CredentialRefKind::VertexServiceAccount => {
             ManagedLayout::default()
         }
@@ -936,47 +940,6 @@ fn active_profile_for_reference(
         home_scope_id: active_home_scope_id(antigravity_root, gemini_root),
         managed_layout,
     }
-}
-
-/// Build the exact dual-source evidence required by first-run `adopt_known`.
-/// Every slot must resolve to a committed v2 reference and a readable account
-/// file; any ambiguity or stale/missing file disables adoption before the
-/// active-home transaction is allowed to mutate either root.
-fn known_home_proof(state_dir: &Path, state: &State) -> Option<KnownHomeProof> {
-    if state.active_profile.is_some() {
-        return None;
-    }
-    let mut token = None;
-    let mut document = None;
-    for account in &state.accounts {
-        let Some(reference) = state.credential_refs.get(&account.id) else {
-            continue;
-        };
-        let slot = match reference.kind {
-            CredentialRefKind::AntigravityToken => &mut token,
-            CredentialRefKind::GeminiOauthSession => &mut document,
-            _ => continue,
-        };
-        if slot.is_some() {
-            return None;
-        }
-        let store = CredentialStore::new(state_dir, &account.id).ok()?;
-        let stored = store.read(reference).ok()?;
-        let material_digest = stored
-            .material_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&stored.material_digest)
-            .to_string();
-        *slot = Some(KnownSlotProof {
-            account_id: account.id.clone(),
-            reference: reference.clone(),
-            material_digest,
-        });
-    }
-    Some(KnownHomeProof {
-        token: token?,
-        document: document?,
-    })
 }
 
 fn prepare_active_home(
@@ -1015,77 +978,83 @@ fn publish_active_home(prepared: PreparedActiveHomeTxn) -> Result<PublishedActiv
     }
 }
 
-#[derive(Clone)]
-struct KnownCredentialSource {
-    credential: PortableCredential,
-    material: Vec<u8>,
-    email: String,
-    plan_label: &'static str,
-}
+fn scan_known_oauth_source() -> Result<Option<(PortableCredential, Vec<u8>, String)>> {
+    let active_email = default_gemini_home()
+        .map(|home| home.join("google_accounts.json"))
+        .filter(|path| path.exists())
+        .map(|path| -> Result<Option<String>> {
+            let bytes = read_external_regular_file_bounded(
+                &path,
+                credential_store::MAX_CREDENTIAL_FILE_BYTES,
+            )?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .context("known google_accounts.json is not valid JSON")?;
+            Ok(value
+                .get("active")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string))
+        })
+        .transpose()?
+        .flatten();
 
-/// Scan the two provider-owned fixed files independently.
-///
-/// The files intentionally stay as separate sources: Antigravity's token is
-/// consumed from the token slot while the Gemini session is consumed from the
-/// document slot. Merging them would make either provider's refresh/rotation
-/// semantics impossible to preserve byte-for-byte.
-fn scan_known_oauth_sources() -> Result<Vec<KnownCredentialSource>> {
-    let active_email = read_known_active_email()?;
-    let mut sources = Vec::new();
+    let local_token = default_antigravity_cli_home()
+        .map(|home| home.join("antigravity-oauth-token"))
+        .filter(|path| path.exists())
+        .map(|path| -> Result<Option<String>> {
+            let bytes = read_external_regular_file_bounded(
+                &path,
+                credential_store::MAX_CREDENTIAL_FILE_BYTES,
+            )?;
+            let token = std::str::from_utf8(&bytes)
+                .context("known OAuth token is not UTF-8")?
+                .trim()
+                .to_string();
+            if token.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(token))
+        })
+        .transpose()?
+        .flatten();
 
-    if let Some(home) = default_antigravity_cli_home() {
-        let path = home.join("antigravity-oauth-token");
-        if path.exists() {
+    let authorized = default_gemini_home()
+        .map(|home| home.join("oauth_creds.json"))
+        .filter(|path| path.exists())
+        .map(|path| {
             let bytes = read_import_source(&path)?;
-            let credential = PortableCredential::from_antigravity_token_source(&bytes)
-                .map_err(anyhow::Error::new)
-                .context("known Antigravity token is invalid")?;
-            sources.push(KnownCredentialSource {
-                credential,
-                material: bytes,
-                email: "antigravity-token@gemini".to_string(),
-                plan_label: "Antigravity OAuth",
-            });
+            let (credential, _) = parse_import_source(&bytes)?;
+            if credential.kind() != CredentialKind::OAuthAuthorizedUser {
+                bail!("known oauth_creds.json is not an authorized-user credential")
+            }
+            Ok((credential, bytes))
+        })
+        .transpose()?;
+
+    let (credential, material) = match (local_token, authorized) {
+        (None, None) => return Ok(None),
+        (Some(token), None) => {
+            let credential =
+                PortableCredential::oauth_access_token(&token).map_err(anyhow::Error::new)?;
+            (credential, token.into_bytes())
         }
-    }
-
-    if let Some(home) = default_gemini_home() {
-        let path = home.join("oauth_creds.json");
-        if path.exists() {
-            let bytes = read_import_source(&path)?;
-            let credential = PortableCredential::from_gemini_oauth_session_source(&bytes)
-                .map_err(anyhow::Error::new)
-                .context("known Gemini OAuth session is invalid")?;
-            sources.push(KnownCredentialSource {
-                credential,
-                material: bytes,
-                email: active_email.unwrap_or_else(|| "google-oauth-user@gemini".to_string()),
-                plan_label: "Gemini OAuth session",
-            });
+        (None, Some((credential, bytes))) => (credential, bytes),
+        (Some(token), Some((credential, _))) => {
+            let merged = credential
+                .with_access_token(&token)
+                .map_err(anyhow::Error::new)?;
+            let material = merged
+                .to_native_json_string()
+                .map_err(anyhow::Error::new)?
+                .into_bytes();
+            (merged, material)
         }
-    }
-
-    Ok(sources)
-}
-
-fn read_known_active_email() -> Result<Option<String>> {
-    let Some(path) = default_gemini_home().map(|home| home.join("google_accounts.json")) else {
-        return Ok(None);
     };
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes =
-        read_external_regular_file_bounded(&path, credential_store::MAX_CREDENTIAL_FILE_BYTES)
-            .context("failed to inspect known google_accounts.json")?;
-    let value: Value =
-        serde_json::from_slice(&bytes).context("known google_accounts.json is not valid JSON")?;
-    Ok(value
-        .get("active")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string))
+    let email = credential_email(&credential)
+        .or(active_email)
+        .unwrap_or_else(|| "antigravity-user@gemini".to_string());
+    Ok(Some((credential, material, email)))
 }
 
 fn read_import_source(path: &Path) -> Result<Vec<u8>> {
@@ -1108,17 +1077,16 @@ fn parse_import_source(bytes: &[u8]) -> Result<(PortableCredential, Vec<u8>)> {
         let (credential, portable_envelope) = match PortableCredential::from_json_str(trimmed) {
             Ok(credential) => (credential, true),
             Err(_) => (
-                PortableCredential::from_native_json_str(text).map_err(anyhow::Error::new)?,
+                PortableCredential::from_native_json_str(trimmed).map_err(anyhow::Error::new)?,
                 false,
             ),
         };
-        let material = if matches!(
-            credential.kind(),
-            CredentialKind::OAuthAccessToken
-                | CredentialKind::AntigravityToken
-                | CredentialKind::GeminiOAuthSession
-        ) {
-            credential.to_native_bytes().map_err(anyhow::Error::new)?
+        let material = if credential.kind() == CredentialKind::OAuthAccessToken {
+            credential
+                .access_token()
+                .ok_or_else(|| anyhow::anyhow!("raw OAuth credential has no access token"))?
+                .as_bytes()
+                .to_vec()
         } else if portable_envelope {
             credential.to_native_json_string()?.into_bytes()
         } else {
@@ -1153,12 +1121,6 @@ fn credential_material(credential: &PortableCredential) -> Result<Vec<u8>> {
             .ok_or_else(|| anyhow::anyhow!("raw OAuth credential has no access token"))?
             .as_bytes()
             .to_vec());
-    }
-    if matches!(
-        credential.kind(),
-        CredentialKind::AntigravityToken | CredentialKind::GeminiOAuthSession
-    ) {
-        return credential.to_native_bytes().map_err(anyhow::Error::new);
     }
     Ok(credential.to_native_json_string()?.into_bytes())
 }
@@ -1242,8 +1204,6 @@ fn credential_ref_kind_for(credential: &PortableCredential) -> CredentialRefKind
         CredentialKind::OAuthAuthorizedUser => CredentialRefKind::OauthAuthorizedUser,
         CredentialKind::ApiKey => CredentialRefKind::ApiKey,
         CredentialKind::VertexServiceAccount => CredentialRefKind::VertexServiceAccount,
-        CredentialKind::AntigravityToken => CredentialRefKind::AntigravityToken,
-        CredentialKind::GeminiOAuthSession => CredentialRefKind::GeminiOauthSession,
     }
 }
 
@@ -1723,7 +1683,6 @@ fn run_credential_import_session(
             base.version = base.version.max(1);
 
             let incoming_fingerprint = incoming.fingerprint();
-            let incoming_identity = incoming.identity_fingerprint();
             // 升级前写出的 API key 文档还带着 `email` / `project_id`，指纹与现在
             // 只含 `api_key` 的文档不同。ApiKey 导入按 IdentityOnly 只比指纹，
             // 于是升级后重跑同一条 `sagy add --api-key` 会新建第二个账号、写出
@@ -1732,7 +1691,7 @@ fn run_credential_import_session(
             let incoming_api_key = incoming.api_key_value().map(ToString::to_string);
             let existing = base.accounts.iter().find(|account| match matching {
                 ImportMatch::IdentityOnly => {
-                    account.identity_fingerprint.as_deref() == Some(incoming_identity.as_str())
+                    account.identity_fingerprint.as_deref() == Some(incoming_fingerprint.as_str())
                         || base
                             .credential_refs
                             .get(&account.id)
@@ -1742,7 +1701,7 @@ fn run_credential_import_session(
                         })
                 }
                 ImportMatch::IdentityOrEmail => {
-                    account.identity_fingerprint.as_deref() == Some(incoming_identity.as_str())
+                    account.identity_fingerprint.as_deref() == Some(incoming_fingerprint.as_str())
                         || base
                             .credential_refs
                             .get(&account.id)
@@ -1943,178 +1902,6 @@ fn run_credential_import_session(
     }
 }
 
-struct PlannedKnownImport {
-    account_id: String,
-    record: AccountRecord,
-    credential: PortableCredential,
-    material: Vec<u8>,
-    reference: CredentialRef,
-}
-
-/// Import all provider-native known sources in one State CAS.
-///
-/// This path deliberately does not reuse the single-credential importer: the
-/// token and session have separate identity domains and must never be merged by
-/// their display email. Staging/publishing still uses the same per-account
-/// journal protocol, with account locks acquired in sorted order.
-fn run_known_credential_import_session(
-    state_dir: &Path,
-    session: &mut StateSession,
-    sources: Vec<KnownCredentialSource>,
-) -> Result<MutationResult<Vec<AccountRecord>>> {
-    recover_active_home_journals(state_dir, session, None)?;
-    recover_credential_journals_session(state_dir, session)?;
-    if matches!(session.migration(), MigrationStatus::Missing) {
-        session.bootstrap_empty_v2().map_err(anyhow::Error::new)?;
-    }
-    if !matches!(session.migration(), MigrationStatus::None) {
-        bail!("known credential import requires a current v2 state")
-    }
-    if session.read().recovery_pending {
-        bail!("state recovery is pending; recover before known credential import")
-    }
-
-    session
-        .with_locked_exact(|transaction| {
-            let snapshot = transaction.snapshot().map_err(anyhow::Error::new)?;
-            let base = snapshot.state;
-            let now = Utc::now().timestamp();
-            let mut plans = Vec::with_capacity(sources.len());
-            let mut used_ids = std::collections::BTreeSet::new();
-
-            for source in &sources {
-                let kind = credential_ref_kind_for(&source.credential);
-                let fingerprint = source.credential.fingerprint();
-                let identity = source.credential.identity_fingerprint();
-                let existing = base.accounts.iter().find(|account| {
-                    if used_ids.contains(account.id.as_str()) {
-                        return false;
-                    }
-                    let Some(reference) = base.credential_refs.get(&account.id) else {
-                        return false;
-                    };
-                    reference.kind == kind
-                        && (account.identity_fingerprint.as_deref() == Some(identity.as_str())
-                            || reference.fingerprint == fingerprint)
-                });
-                let account_id = existing
-                    .map(|account| account.id.clone())
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
-                if !used_ids.insert(account_id.clone()) {
-                    return Err(StateStoreError::Invalid(anyhow!(
-                        "known credential sources resolved to the same account"
-                    )));
-                }
-                let read_store =
-                    CredentialStore::new(state_dir, &account_id).map_err(anyhow::Error::new)?;
-                let mut record = record_from_credential(
-                    &account_id,
-                    &source.email,
-                    &source.credential,
-                    &read_store,
-                    now,
-                )?;
-                if let Some(existing) = existing {
-                    preserve_account_metadata(&mut record, existing, now);
-                }
-                record.plan = Some(source.plan_label.to_string());
-                plans.push(PlannedKnownImport {
-                    account_id,
-                    record,
-                    credential: source.credential.clone(),
-                    material: source.material.clone(),
-                    reference: CredentialRef { kind, fingerprint },
-                });
-            }
-
-            let mut ordered = plans
-                .iter()
-                .map(|plan| plan.account_id.clone())
-                .collect::<Vec<_>>();
-            ordered.sort();
-            let mut staged = Vec::with_capacity(plans.len());
-            for account_id in ordered {
-                let plan = plans
-                    .iter()
-                    .find(|plan| plan.account_id == account_id)
-                    .ok_or_else(|| {
-                        StateStoreError::Invalid(anyhow!("known import plan disappeared"))
-                    })?;
-                let permit = transaction
-                    .credential_mutation_permit(&plan.account_id)
-                    .map_err(anyhow::Error::new)?;
-                let (store, prepared) =
-                    prepare_credential_with_permit(permit, &plan.credential, &plan.material)?;
-                staged.push((
-                    plan.account_id.clone(),
-                    plan.reference.clone(),
-                    store,
-                    prepared,
-                ));
-            }
-
-            let mut published = Vec::with_capacity(staged.len());
-            for (account_id, reference, store, prepared) in staged {
-                match store.publish(prepared) {
-                    Ok(published_txn) => {
-                        published.push((account_id, Some(reference), store, published_txn))
-                    }
-                    Err(error) => {
-                        restore_published_transactions(published)?;
-                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
-                    }
-                }
-            }
-            let mut proofs = Vec::with_capacity(published.len());
-            for (_, _, store, published_txn) in &published {
-                match store.journal_proof(published_txn) {
-                    Ok(proof) => proofs.push(proof),
-                    Err(error) => {
-                        restore_published_transactions(published)?;
-                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
-                    }
-                }
-            }
-
-            let mut candidate = base;
-            for plan in &plans {
-                upsert_account(&mut candidate, plan.record.clone(), now);
-                candidate
-                    .credential_refs
-                    .insert(plan.account_id.clone(), plan.reference.clone());
-            }
-            let receipt = match transaction.commit_coordinated(&candidate, proofs) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    restore_published_transactions(published)?;
-                    return Err(error);
-                }
-            };
-            let mut after = transaction.snapshot()?;
-            let mut recovery = Vec::new();
-            for (_, _, store, published_txn) in published {
-                if let Err(error) = store.finalize(published_txn, &receipt) {
-                    recovery.push(error.to_string());
-                }
-            }
-            let value = plans.into_iter().map(|plan| plan.record).collect();
-            if recovery.is_empty() {
-                Ok(MutationResult::Committed {
-                    value,
-                    state: after,
-                })
-            } else {
-                after.recovery_pending = true;
-                Ok(MutationResult::CommittedRecoveryPending {
-                    value,
-                    state: after,
-                    message: recovery.join("; "),
-                })
-            }
-        })
-        .map_err(anyhow::Error::new)
-}
-
 /// Reject an import that would replace an account's credential with a
 /// different credential family.
 ///
@@ -2201,10 +1988,9 @@ the complete authentication input. Use an OAuth or Vertex account if you need a 
 
 const fn account_type_for(kind: CredentialKind) -> AccountType {
     match kind {
-        CredentialKind::OAuthAccessToken
-        | CredentialKind::OAuthAuthorizedUser
-        | CredentialKind::AntigravityToken
-        | CredentialKind::GeminiOAuthSession => AccountType::OAuth,
+        CredentialKind::OAuthAccessToken | CredentialKind::OAuthAuthorizedUser => {
+            AccountType::OAuth
+        }
         CredentialKind::ApiKey => AccountType::ApiKey,
         CredentialKind::VertexServiceAccount => AccountType::Vertex,
     }
@@ -2265,18 +2051,6 @@ fn record_from_credential(
             Some("google".to_string()),
             Some("Antigravity OAuth".to_string()),
         ),
-        CredentialKind::AntigravityToken => (
-            AccountType::OAuth,
-            account_token_file(store.account_dir()),
-            Some("antigravity-oauth".to_string()),
-            Some("Antigravity OAuth".to_string()),
-        ),
-        CredentialKind::GeminiOAuthSession => (
-            AccountType::OAuth,
-            store.account_dir().join("credentials.json"),
-            Some("gemini-oauth".to_string()),
-            Some("Gemini OAuth session".to_string()),
-        ),
         CredentialKind::ApiKey => (
             AccountType::ApiKey,
             store.account_dir().join("credentials.json"),
@@ -2291,12 +2065,6 @@ fn record_from_credential(
         ),
     };
     let document = credential.native_document();
-    let identity_fingerprint = match credential.kind() {
-        CredentialKind::AntigravityToken | CredentialKind::GeminiOAuthSession => {
-            credential.identity_fingerprint()
-        }
-        _ => credential.fingerprint(),
-    };
     Ok(AccountRecord {
         id: account_id.to_string(),
         email: email.to_string(),
@@ -2310,15 +2078,12 @@ fn record_from_credential(
             .and_then(|value| value.get("account_id"))
             .and_then(Value::as_str)
             .map(ToString::to_string),
-        identity_fingerprint: Some(identity_fingerprint),
+        identity_fingerprint: Some(credential.fingerprint()),
         plan,
         auth_path: auth_path.to_string_lossy().into_owned(),
         config_path: None,
         oauth_token: credential.access_token().map(ToString::to_string),
-        refresh_token: credential
-            .refresh_token()
-            .map(ToString::to_string)
-            .or_else(|| credential.gemini_refresh_token()),
+        refresh_token: credential.refresh_token().map(ToString::to_string),
         api_key: credential.api_key_value().map(ToString::to_string),
         added_at: now,
         updated_at: now,
@@ -3505,7 +3270,7 @@ mod tests {
             .expect("matrix account ref")
             .kind
         {
-            CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken => {
+            CredentialRefKind::OauthAccessToken => {
                 let bytes = token.expect("raw target token slot");
                 assert!(document.is_none(), "raw target must clear document slot");
                 assert_eq!(
@@ -3519,7 +3284,7 @@ mod tests {
                     SlotState::Absent
                 ));
             }
-            CredentialRefKind::OauthAuthorizedUser | CredentialRefKind::GeminiOauthSession => {
+            CredentialRefKind::OauthAuthorizedUser => {
                 let bytes = document.expect("authorized target document slot");
                 assert!(token.is_none(), "authorized target must clear token slot");
                 assert_eq!(
