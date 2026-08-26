@@ -566,8 +566,46 @@ fn final_launch_args(extra_args: &[OsString], resume: bool) -> Vec<OsString> {
     if resume && !has_prompt_or_continue_args(extra_args) {
         final_args.push(OsString::from("--continue"));
     }
-    final_args.extend_from_slice(extra_args);
+    final_args.extend(compact_bare_prompt(extra_args).unwrap_or_else(|| extra_args.to_vec()));
     final_args
+}
+
+/// Turn the leading positional argv run into agy's explicit print prompt.
+///
+/// Only the first positional run is compacted. Once an option is seen, the
+/// remainder is forwarded item by item so an unknown flag's value is never
+/// guessed or rearranged. Building the prompt with `OsString::push` keeps
+/// Unix non-UTF-8 arguments byte-for-byte intact.
+fn compact_bare_prompt(extra_args: &[OsString]) -> Option<Vec<OsString>> {
+    let first = extra_args.first()?;
+    if !is_bare_token(first) {
+        return None;
+    }
+
+    let option_index = extra_args
+        .iter()
+        .position(|arg| arg.as_encoded_bytes().first() == Some(&b'-'))
+        .unwrap_or(extra_args.len());
+    let prompt_args = &extra_args[..option_index];
+    let mut prompt = OsString::new();
+    for (index, arg) in prompt_args.iter().enumerate() {
+        if index > 0 {
+            prompt.push(" ");
+        }
+        prompt.push(arg);
+    }
+
+    let mut compacted = Vec::with_capacity(2 + extra_args.len() - option_index);
+    compacted.push(OsString::from("-p"));
+    compacted.push(prompt);
+    compacted.extend(extra_args[option_index..].iter().cloned());
+    Some(compacted)
+}
+
+fn is_bare_token(arg: &OsString) -> bool {
+    arg.as_encoded_bytes()
+        .first()
+        .is_some_and(|byte| *byte != b'-')
 }
 
 /// `-m` 是 agy 对 `--model` 的短写法。只认长写法会让 `sagy -m X` 同时收到注入的
@@ -862,6 +900,51 @@ mod tests {
         ])));
         assert!(has_prompt_or_continue_args(&args(&["--", "--help"])));
         assert!(has_prompt_or_continue_args(&args(&["--prompt", "hello"])));
+    }
+
+    #[test]
+    fn leading_bare_tokens_become_one_print_prompt_without_resume() {
+        assert_eq!(
+            final_launch_args(&args(&["say", "hi"]), true),
+            args(&["--model", DEFAULT_MODEL_ID, "-p", "say hi"])
+        );
+        assert_eq!(
+            final_launch_args(&args(&["say", "hi", "--foo", "bar"]), true),
+            args(&["--model", DEFAULT_MODEL_ID, "-p", "say hi", "--foo", "bar"])
+        );
+    }
+
+    #[test]
+    fn option_leading_and_explicit_prompt_args_are_forwarded_verbatim() {
+        for user_args in [
+            args(&["--foo", "say", "hi"]),
+            args(&["-p", "say", "hi"]),
+            args(&["--print", "say", "hi"]),
+            args(&["-i", "say", "hi"]),
+            args(&["--continue"]),
+        ] {
+            let resolved = final_launch_args(&user_args, true);
+            assert!(resolved.ends_with(&user_args));
+            assert!(
+                !resolved.contains(&OsString::from("-p"))
+                    || user_args.first() == Some(&OsString::from("-p"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_prompt_compaction_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = OsString::from_vec(vec![b'h', 0x80]);
+        let second = OsString::from_vec(vec![b'i', 0xff]);
+        let resolved = final_launch_args(&[first, second], true);
+        assert_eq!(
+            resolved[3],
+            OsString::from_vec(vec![b'h', 0x80, b' ', b'i', 0xff])
+        );
+        assert!(!resolved.contains(&OsString::from("--continue")));
     }
 
     /// 表增长时这条会跟着覆盖新变量, 不需要再改 launcher。
