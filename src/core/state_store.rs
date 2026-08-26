@@ -274,10 +274,7 @@ impl ActiveHomeJournalProof {
                 validate_active_layout_for_reference(reference.kind, &profile.managed_layout)?;
             }
         }
-        if !matches!(
-            adoption_mode.as_str(),
-            "strict" | "adopt" | "adopt_known" | "takeover"
-        ) {
+        if !matches!(adoption_mode.as_str(), "strict" | "adopt" | "takeover") {
             bail!("active-home adoption mode is invalid");
         }
         validate_managed_layout_shape(&before_layout)?;
@@ -2023,7 +2020,7 @@ fn validate_active_home_journal_value(value: &Value, proof: &ActiveHomeJournalPr
         .get("mode")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("active-home journal mode is missing"))?;
-    if !matches!(mode, "strict" | "adopt" | "adopt_known" | "takeover") {
+    if !matches!(mode, "strict" | "adopt" | "takeover") {
         bail!("active-home journal adoption mode is invalid");
     }
     let state_before_layout = object

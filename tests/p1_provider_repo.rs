@@ -59,10 +59,7 @@ fn provider_native_bundle_roundtrip_preserves_exact_source_bytes() {
         .iter()
         .find(|account| account.id == "antigravity")
         .unwrap();
-    assert_eq!(
-        decoded_token.credential.source_bytes(),
-        Some(token_source.as_slice())
-    );
+    assert_eq!(decoded_token.credential.source_bytes(), Some(token_source));
     let decoded_session = decoded
         .accounts()
         .iter()
@@ -70,7 +67,7 @@ fn provider_native_bundle_roundtrip_preserves_exact_source_bytes() {
         .unwrap();
     assert_eq!(
         decoded_session.credential.source_bytes(),
-        Some(session_source.as_slice())
+        Some(session_source)
     );
 }
 

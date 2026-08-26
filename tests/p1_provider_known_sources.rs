@@ -11,8 +11,6 @@ use tempfile::TempDir;
 const TOKEN: &[u8] = b"provider-token-source\n";
 const GEMINI_SESSION: &[u8] = br#"{"access_token":"gemini-access","expiry_date":4102444800000,"id_token":"gemini-id","refresh_token":"gemini-refresh","scope":"scope","token_type":"Bearer"}
 "#;
-const ROTATED_GEMINI_SESSION: &[u8] = br#"{"access_token":"gemini-access-2","expiry_date":4102444801000,"id_token":"gemini-id-2","refresh_token":"gemini-refresh","scope":"scope","token_type":"Bearer"}
-"#;
 
 struct Fixture {
     _temp: TempDir,
@@ -146,28 +144,6 @@ fn known_sources_import_independently_and_repeat_idempotently() {
     }));
     assert!(accounts.iter().any(|account| {
         fs::read(account.join("credentials.json")).ok().as_deref() == Some(GEMINI_SESSION)
-    }));
-}
-
-#[test]
-fn gemini_access_rotation_reuses_refresh_identity_after_restart() {
-    let fixture = Fixture::new();
-    let first = fixture.run(&["import-known"]);
-    assert_success(&first, "initial known-source import");
-    let accounts = fixture.account_dirs();
-    assert_eq!(accounts.len(), 2);
-
-    fs::write(
-        fixture.gemini().join("oauth_creds.json"),
-        ROTATED_GEMINI_SESSION,
-    )
-    .expect("rotate Gemini session source");
-    let second = fixture.run(&["import-known"]);
-    assert_success(&second, "rotated known-source import");
-
-    assert_eq!(fixture.account_dirs(), accounts);
-    assert!(accounts.iter().any(|account| {
-        fs::read(account.join("credentials.json")).ok().as_deref() == Some(ROTATED_GEMINI_SESSION)
     }));
 }
 

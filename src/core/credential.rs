@@ -865,11 +865,9 @@ fn validate_gemini_oauth_session_source(
     // These are provider fields, not filesystem paths. Keep the generic
     // credential document path guard out of this strict six-field parser so a
     // valid provider string is not rejected solely because it starts with `/`.
-    for field in ["access_token", "refresh_token"] {
+    let values = ["access_token", "id_token", "refresh_token", "scope"];
+    for field in values {
         validate_bounded_nonempty_string(&document, field)?;
-    }
-    for field in ["id_token", "scope"] {
-        validate_bounded_string(&document, field)?;
     }
     let expiry_date = document
         .get("expiry_date")
@@ -894,21 +892,6 @@ fn validate_bounded_nonempty_string(
     field: &'static str,
 ) -> Result<(), CredentialError> {
     required_bounded_nonempty_string(document, field).map(|_| ())
-}
-
-fn validate_bounded_string(
-    document: &Map<String, Value>,
-    field: &'static str,
-) -> Result<(), CredentialError> {
-    let value = document
-        .get(field)
-        .ok_or(CredentialError::MissingField(field))?
-        .as_str()
-        .ok_or(CredentialError::InvalidFieldType(field))?;
-    if value.len() > MAX_CREDENTIAL_FIELD_BYTES {
-        return Err(CredentialError::FieldTooLarge);
-    }
-    Ok(())
 }
 
 fn required_bounded_nonempty_string<'a>(
@@ -1637,13 +1620,6 @@ mod tests {
                 "source should be rejected: {source}"
             );
         }
-    }
-
-    #[test]
-    fn gemini_oauth_session_accepts_empty_optional_string_values() {
-        let source = br#"{"access_token":"access","expiry_date":1,"id_token":"","refresh_token":"refresh","scope":"","token_type":"Bearer"}"#;
-        let credential = PortableCredential::from_gemini_oauth_session_source(source).unwrap();
-        assert_eq!(credential.to_native_bytes().unwrap(), source);
     }
 
     #[test]
