@@ -205,7 +205,9 @@ exit /b 1
 
     # Post-install auto import of existing ~/.gemini credentials.
     # 安装后动作不得吞掉失败：把子命令的输出原样转给用户，并让脚本退出码如实反映结果。
-    $geminiDir = Join-Path $HOME ".gemini"
+    # 与 sagy 本体的 active-home 解析保持一致：显式 GEMINI_HOME 优先，
+    # 既支持定制运行时目录，也让自动化测试不必改写 PowerShell 的只读 $HOME。
+    $geminiDir = if ($env:GEMINI_HOME) { $env:GEMINI_HOME } else { Join-Path $HOME ".gemini" }
     if (Test-Path $geminiDir) {
         $importLog = Join-Path $WorkDir "import-known.log"
         # 子进程往 stderr 写字节不等于失败；判据只有退出码，所以这里临时放开

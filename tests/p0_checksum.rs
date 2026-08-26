@@ -1071,6 +1071,10 @@ fn powershell_installer_has_fail_closed_checksum_guard() {
     assert!(source.contains("if ($actualHash -ne $expectedHash)"));
     assert!(source.contains("Release archive did not contain a top-level sagy.exe binary."));
     assert!(!source.contains("Checksum verification skipped or failed"));
+    assert!(
+        source.contains("if ($env:GEMINI_HOME) { $env:GEMINI_HOME }"),
+        "install.ps1 must honor GEMINI_HOME before probing for credentials"
+    );
 
     // AC-1.1：一次性工作目录 + 无条件清理。
     assert!(source.contains("[guid]::NewGuid().ToString(\"N\")"));

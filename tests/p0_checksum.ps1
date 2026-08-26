@@ -62,7 +62,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Variable -Name HOME -Scope Global -Value $SandboxHome
+$env:GEMINI_HOME = Join-Path $SandboxHome ".gemini"
 
 function Get-ModeHash {
     if ($env:FAKE_SUMS_MODE -eq "missing-binary") { return $BadHash }
