@@ -126,6 +126,14 @@ fail-closed. Adoption and import preserve the original active-home bytes; portab
 repo bundles serialize the canonical form, so omitted and canonical input have the same
 fingerprint.
 
+The active authentication authority of recent provider CLIs may be an operating-system credential
+store rather than either managed file. In particular, a strict six-field provider session
+(`access_token`, `expiry_date`, `id_token`, `refresh_token`, `scope`, `token_type`) is not sufficient
+evidence of a portable account or a successful account switch. Known-source discovery rejects this
+shape before any State or active-home mutation and before spawning `agy`. sagy does not inspect or
+modify Keychain, Secret Service, or Credential Manager; native-session support requires a stable
+provider contract for non-interactive auth override and effective-identity verification.
+
 ## 5. Account Selection & Cooldown Policy
 
 1. **Fail-closed eligibility**: Every candidate must have a compatible State v2 credential reference and a locally verified fixed credential slot. Zero quota, active cooldown, invalid authentication, permission failures, and explicit service rejection are ineligible.
@@ -136,7 +144,7 @@ fingerprint.
 ## 6. Launch Argument Composition & Session Resume
 
 `launcher::final_launch_args` builds the exact argv appended after the resolved `agy` executable,
-from two independent decisions plus the user's own arguments:
+from three independent decisions plus the user's own arguments:
 
 1. **Default model**: `--model gemini-3.7-flash-high` is prepended unless the user already passed
    `--model` / `-m` (long or `=` form).
@@ -160,9 +168,15 @@ from two independent decisions plus the user's own arguments:
      `Route::Passthrough`, and clap strips it again for `launch -- <args>`, so `sagy -- --help`
      reaches `has_prompt_or_continue_args` as just `["--help"]` and still resumes. A separator in a
      later position (`sagy --yolo -- --help`) survives into `extra_args` and does suppress resuming.
+3. **Bare prompt shorthand**: when the first forwarded argument is positional,
+   `compact_bare_prompt` joins the consecutive positional run before the first option into one
+   `-p` value. Thus `sagy say hi` produces `agy --model <default> -p "say hi"` with no implicit
+   `--continue`. Once an option is reached, the remainder is forwarded item-by-item so sagy never
+   guesses the value ownership of an unknown option. Unix non-UTF-8 bytes remain intact.
 
-The user's own arguments are always appended last, so `agy`'s own precedence rules decide when both
-an injected and a user-supplied form of the same option are present.
+Except for that leading bare-prompt normalization, the user's arguments remain ordered after the
+injected defaults, so `agy`'s own precedence rules decide when both an injected and a user-supplied
+form of the same option are present.
 
 ## 7. State and Credential Transactions
 

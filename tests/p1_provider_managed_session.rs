@@ -204,7 +204,7 @@ fn launch_auto_discovery_fails_before_spawning_agy() {
     fixture.oauth_creds(&provider_session());
     fixture.companion_token();
 
-    let output = fixture.run(&["launch", "--no-resume"]);
+    let output = fixture.run(&["say", "hi"]);
     let text = combined(&output);
     assert!(
         !output.status.success(),

@@ -11,8 +11,10 @@ checksum fail-open、凭据同步失真、429 自动轮换不可达、state 并�
 
 2026-08-26 的发布就绪跟进又关闭了 workflow 中非法提前求值 `runner.temp` 的问题、
 authorized-user 缺失 `token_uri` 的真实凭据兼容问题，以及 README/架构与 child auth env
-实现不一致的问题。当前本地门禁全绿；代码尚未 push，原生 Windows CI 证据仍待远端产生，
-且本轮不创建 tag 或 release。
+实现不一致的问题。随后修复了裸 prompt 未转换成 `agy -p` 的启动 bug，并确认当前 provider
+登录权威可能位于操作系统 credential store；strict six-field provider session 现已在导入前
+fail-closed。当前本地门禁全绿；代码尚未 push，原生 Windows CI 证据仍待远端产生，且本轮不创建
+tag 或 release。
 
 当前门禁与验收：
 
@@ -20,7 +22,7 @@ authorized-user 缺失 `token_uri` 的真实凭据兼容问题，以及 README/�
 cargo fmt --all -- --check                         CLEAN
 cargo check --all-targets --locked                 CLEAN
 cargo clippy --all-targets --locked -- -D warnings CLEAN
-cargo test --all-targets --locked                  22 个 test executable / 485 个测试 / 0 失败
+cargo test --all-targets --locked                  24 个 test executable / 496 个测试 / 0 失败
 actionlint .github/workflows/*.yml                  CLEAN
 backlog/verify/t*.sh                                7 个脚本 / 72 项断言 / 全部 PASS
 ```
@@ -28,6 +30,7 @@ backlog/verify/t*.sh                                7 个脚本 / 72 项断言 /
 完整的问题基线、修复过程、验收依据、已知残留见：
 
 - [2026-08-26 发布就绪跟进](./reviews/2026-08-26-release-readiness-followup.md)（**当前状态与发布前剩余证据**）
+- [2026-08-26 Keychain 认证边界跟进](./reviews/2026-08-26-keychain-auth-followup.md)（裸 prompt、system vault 与 provider session fail-closed）
 - [2026-08-25 重构后全库审计报告](./reviews/2026-08-25-post-refactor-audit.md)（历史修复与验收结论）
 - [2026-08-24 全库代码审查报告](./reviews/2026-08-24-full-code-review.md)（历史，已关闭项的出处）
 

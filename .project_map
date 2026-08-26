@@ -1,5 +1,5 @@
 # sagy Project Map
-> Generated: Wed Aug 26 17:30:54 CST 2026
+> Generated: Wed Aug 26 19:39:34 CST 2026
 > Strategy: Source Focused (src expanded, build outputs omitted)
 
 ## Package
@@ -32,6 +32,7 @@
 |   |-- [D] reviews/
 |   |   |-- [F] 2026-08-24-full-code-review.md
 |   |   |-- [F] 2026-08-25-post-refactor-audit.md
+|   |   |-- [F] 2026-08-26-keychain-auth-followup.md
 |   |   -- [F] 2026-08-26-release-readiness-followup.md
 |   |-- [D] tasks/
 |   |   |-- [F] bugs-001-cargo-test-overwrites-real-credentials.md
@@ -158,10 +159,12 @@
 |   |-- [F] p1_active_home_recovery.rs
 |   |-- [F] p1_auth_secret_input.rs
 |   |-- [F] p1_authorized_user_compat.rs
+|   |-- [F] p1_bare_prompt.rs
 |   |-- [F] p1_launch_observation.rs
 |   |-- [F] p1_launcher_auth_env.rs
 |   |-- [F] p1_legacy_migration.rs
 |   |-- [F] p1_offline_availability.rs
+|   |-- [F] p1_provider_managed_session.rs
 |   |-- [F] p1_rate_limit_fallback.rs
 |   |-- [F] p1_refresh_token_preservation.rs
 |   |-- [F] p1_repo_sync_pool.rs

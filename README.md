@@ -72,6 +72,9 @@ Angle brackets `<>` mark required arguments, square brackets `[]` mark optional 
 | `sagy -- <agy args...>` | Pass every remaining argument straight through to `agy` |
 
 Any first token that is not a known subcommand is also passed through to `agy`.
+When that passthrough starts with bare positional words, sagy joins the leading positional run into
+one explicit print prompt: `sagy say hi` launches `agy -p "say hi"`. Options after the prompt remain
+separate and in their original order.
 
 ### How `login` / `add` Obtain Credentials
 
@@ -88,6 +91,13 @@ sagy also never exchanges a `refresh_token` for a fresh access token. A `refresh
 performed by `agy` itself against Google. When a probe reports an expired authorized-user
 credential, sagy only marks the account as needing a refresh - it does not perform one.
 
+Recent `agy` versions can keep the effective login in the operating system credential store
+(macOS Keychain and equivalent platform vaults). A strict six-field provider session in
+`~/.gemini/oauth_creds.json` is therefore not treated as a portable or independently switchable
+account: `import-known` fails closed without changing the file or launching `agy`. Run `agy`
+directly for that current provider-managed session. sagy will only add native-session support after
+the provider exposes a stable non-interactive storage override and an identity postcondition.
+
 For Google `authorized_user` JSON, `client_id`, `client_secret`, and `refresh_token` are required.
 `token_uri` may be omitted; sagy canonicalizes it internally to
 `https://oauth2.googleapis.com/token`. An explicitly supplied different endpoint is rejected
@@ -101,7 +111,9 @@ probe channel unreachable, a locally validated credential remains selectable in 
 ### Session Resume
 
 `sagy` and `sagy launch` append `--continue` to the `agy` argv, so the previous conversation is
-resumed by default. Exactly two things suppress it:
+resumed by default. A leading bare prompt is normalized first: consecutive positional words before
+the first option become one `-p` value, so `sagy say hi` starts a new print turn and never receives
+an implicit `--continue`. Otherwise, exactly two things suppress resuming:
 
 1. `--no-resume`. It is a sagy-side flag, so it must appear before the first `agy` argument
    (`sagy --no-resume ...` or `sagy launch --no-resume ...`). Written after one, it is no longer a
@@ -155,6 +167,10 @@ Antigravity home are `$ANTIGRAVITY_CONFIG_DIR/antigravity-oauth-token` and
 `$GEMINI_HOME/oauth_creds.json`.
 
 Two cases are distinguished, and only the second one needs you to do anything:
+
+A strict six-field provider-managed session is handled before these cases: sagy neither adopts nor
+overwrites it because the effective secret may live only in the operating system credential store.
+The command stops with an explicit unsupported-session error and directs you to run `agy` directly.
 
 1. The file already there **is** one of your registered accounts (byte-for-byte identical). `sagy`
    adopts it in place, rewrites nothing, and the first `sagy` run on a machine that was already
