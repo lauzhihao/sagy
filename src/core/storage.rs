@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use directories::BaseDirs;
@@ -57,7 +57,14 @@ pub struct RepoSyncConfig {
 pub(crate) fn create_secure_dir_all(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
-        current.push(component);
+        // Windows 的 `canonicalize` 会返回 `\\?\C:\...` 形式的 verbatim
+        // 路径。Prefix/RootDir 只是路径锚点，不是可以创建的目录；如果把
+        // Prefix 单独交给 `DirBuilder::create`，Windows 会把它解析成
+        // `\\?\C:` 并返回 Access is denied。
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
         if current.as_os_str().is_empty() || current.exists() {
             continue;
         }
@@ -289,5 +296,19 @@ mod tests {
             loaded.last_repo,
             Some("git@github.com:test/pool.git".to_string())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secure_directory_creation_handles_canonical_windows_paths() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // Windows `canonicalize` commonly returns a `\\?\` verbatim path. Keep
+        // this test on the same path shape used by the CLI after state-root
+        // normalization so drive prefixes are never treated as directories.
+        let canonical_root = fs::canonicalize(temp_dir.path()).expect("canonical temp dir");
+        let nested = canonical_root.join("nested").join("leaf");
+
+        create_secure_dir_all(&nested).expect("create nested canonical path");
+        assert!(nested.is_dir());
     }
 }
