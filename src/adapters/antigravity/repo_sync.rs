@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -234,27 +234,35 @@ fn normalize_remote_repo_path(path: &str) -> String {
 /// `.git` is deliberately *not* stripped here: `/srv/pool` and `/srv/pool.git`
 /// can both exist as distinct directories on the same machine.
 fn normalize_local_repo_path(path: &str) -> String {
-    let absolute = path.starts_with('/');
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                if segments.last().is_some_and(|last| *last != "..") {
-                    segments.pop();
+    let mut components = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if components
+                    .last()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)))
+                {
+                    components.pop();
                 } else {
-                    segments.push("..");
+                    components.push(component);
                 }
             }
-            other => segments.push(other),
+            Component::Normal(_) | Component::Prefix(_) | Component::RootDir => {
+                components.push(component);
+            }
         }
     }
-    let joined = segments.join("/");
-    if absolute {
-        format!("/{joined}")
-    } else {
-        joined
-    }
+
+    // 从原生 components 重建，既保留 Windows 的 Prefix/RootDir，又让输出使用
+    // 当前平台的分隔符；整个过程不触碰文件系统，因此 identity 不受目录现场影响。
+    let normalized = components
+        .into_iter()
+        .fold(PathBuf::new(), |mut path, component| {
+            path.push(component.as_os_str());
+            path
+        });
+    normalized.to_string_lossy().into_owned()
 }
 
 /// Derive a spelling-independent identity for a repository location.
@@ -3001,6 +3009,53 @@ mod tests {
         ] {
             assert_eq!(pool_id_for_repo(spelling), expected, "{spelling:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_path_spellings_share_one_pool_id() {
+        let spellings = [
+            r"C:\sagy\repo",
+            "C:/sagy/repo",
+            r"C:/sagy\./repo",
+            r"C:/sagy\sub/../repo",
+            r"C:\sagy\repo/",
+        ];
+        let expected = pool_id_for_repo(spellings[0]);
+        for spelling in spellings {
+            assert_eq!(
+                pool_id_for_repo(spelling),
+                expected,
+                "Windows spelling {spelling:?} derived a different pool"
+            );
+        }
+        assert_ne!(
+            pool_id_for_repo(r"D:\sagy\repo"),
+            expected,
+            "different Windows drives must remain different repositories"
+        );
+        assert_ne!(
+            pool_id_for_repo(r"C:\sagy\other"),
+            expected,
+            "different Windows directories must remain different repositories"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_local_path_keeps_backslashes_and_git_suffix_distinct() {
+        let with_backslash = r"/srv/repo\name";
+        assert_eq!(normalize_local_repo_path(with_backslash), with_backslash);
+        assert_ne!(
+            pool_id_for_repo(with_backslash),
+            pool_id_for_repo("/srv/repo/name"),
+            "a Unix backslash must remain an ordinary filename character"
+        );
+        assert_ne!(
+            pool_id_for_repo("/srv/pool"),
+            pool_id_for_repo("/srv/pool.git"),
+            "a local .git suffix must remain part of the directory identity"
+        );
     }
 
     #[test]
