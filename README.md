@@ -72,6 +72,9 @@ Angle brackets `<>` mark required arguments, square brackets `[]` mark optional 
 | `sagy -- <agy args...>` | Pass every remaining argument straight through to `agy` |
 
 Any first token that is not a known subcommand is also passed through to `agy`.
+When that passthrough starts with bare positional words, sagy joins the leading positional run into
+one explicit print prompt: `sagy say hi` launches `agy -p "say hi"`. Options that follow the prompt
+remain separate and in their original order.
 
 ### How `login` / `add` Obtain Credentials
 
@@ -88,6 +91,13 @@ sagy also never exchanges a `refresh_token` for a fresh access token. A `refresh
 performed by `agy` itself against Google. When a probe reports an expired authorized-user
 credential, sagy only marks the account as needing a refresh - it does not perform one.
 
+`import-known` scans the two provider-owned files independently. The raw
+`~/.gemini/antigravity-cli/antigravity-oauth-token` and the strict six-field Gemini session in
+`~/.gemini/oauth_creds.json` become separate accounts and keep their exact source bytes. A legacy
+Google `authorized_user` document in the latter path remains supported. Provider-native sessions
+are not probed, refreshed, merged, or reserialized by sagy; the selected file is published exactly
+and `agy` owns the authentication result.
+
 For Google `authorized_user` JSON, `client_id`, `client_secret`, and `refresh_token` are required.
 `token_uri` may be omitted; sagy canonicalizes it internally to
 `https://oauth2.googleapis.com/token`. An explicitly supplied different endpoint is rejected
@@ -101,7 +111,9 @@ probe channel unreachable, a locally validated credential remains selectable in 
 ### Session Resume
 
 `sagy` and `sagy launch` append `--continue` to the `agy` argv, so the previous conversation is
-resumed by default. Exactly two things suppress it:
+resumed by default. A leading bare prompt is normalized first: consecutive positional words before
+the first option become one `-p` value, so `sagy say hi` starts a new print turn and never receives
+an implicit `--continue`. Otherwise, exactly two things suppress resuming:
 
 1. `--no-resume`. It is a sagy-side flag, so it must appear before the first `agy` argument
    (`sagy --no-resume ...` or `sagy launch --no-resume ...`). Written after one, it is no longer a
@@ -158,7 +170,9 @@ Two cases are distinguished, and only the second one needs you to do anything:
 
 1. The file already there **is** one of your registered accounts (byte-for-byte identical). `sagy`
    adopts it in place, rewrites nothing, and the first `sagy` run on a machine that was already
-   using Antigravity just works. No flag needed.
+   using Antigravity just works. During `import-known`, each of the two provider-owned files is
+   adopted independently so one source is never merged into or substituted for the other. No flag
+   is needed.
 2. The file is something `sagy` does not recognise. The switch is refused, nothing on disk is
    touched, and the error names the command below.
 

@@ -1147,8 +1147,17 @@ impl CredentialStore {
     /// creates the account directory, acquires the mutation lock or chmods any
     /// existing item.
     pub fn read_layout(&self) -> StoreResult<CredentialLayout> {
+        self.read_layout_for_kind(self.token_layout_kind())
+    }
+
+    fn read_layout_for_kind(&self, kind: CredentialRefKind) -> StoreResult<CredentialLayout> {
+        let token_kind = if kind == CredentialRefKind::AntigravityToken {
+            CredentialRefKind::AntigravityToken
+        } else {
+            self.token_layout_kind()
+        };
         Ok(CredentialLayout {
-            token: self.read_kind(self.token_layout_kind())?,
+            token: self.read_kind(token_kind)?,
             document: self.read_document()?,
         })
     }
@@ -1727,7 +1736,7 @@ impl CredentialStore {
         if let Err(error) = validate_journal(&staged, &journal) {
             return Err(reconcile_published(staged, error));
         }
-        let current = match self.read_layout() {
+        let current = match self.read_layout_for_kind(staged.kind) {
             Ok(current) => current,
             Err(error) => return Err(reconcile_published(staged, error)),
         };
@@ -1831,7 +1840,7 @@ impl CredentialStore {
                 },
             ));
         }
-        let current = match self.read_layout() {
+        let current = match self.read_layout_for_kind(staged.kind) {
             Ok(current) => current,
             Err(error) => return Err(reconcile_published(staged, error)),
         };
@@ -2063,7 +2072,7 @@ impl CredentialStore {
 
     fn cleanup_unlocked(&self, staged: &StagedCredential) -> StoreResult<()> {
         let capability = self.mutation_capability()?;
-        let current = self.read_layout()?;
+        let current = self.read_layout_for_kind(staged.kind)?;
         if current != staged.baseline
             && current != staged.published
             && !layout_after_opposite_move(staged, &current)

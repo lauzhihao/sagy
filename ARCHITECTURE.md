@@ -126,6 +126,16 @@ fail-closed. Adoption and import preserve the original active-home bytes; portab
 repo bundles serialize the canonical form, so omitted and canonical input have the same
 fingerprint.
 
+The two provider-native known sources are separate credential kinds and separate authorities:
+`AntigravityToken` retains the exact bytes from
+`~/.gemini/antigravity-cli/antigravity-oauth-token`, while `GeminiOAuthSession` requires the exact
+six-field shape in `~/.gemini/oauth_creds.json` and retains that document byte-for-byte. Known-source
+import scans, commits, and adopts both independently; it never synthesizes one from the other or
+injects OAuth endpoints. Access-token rotation reuses the stable refresh-token identity without
+persisting that identity fingerprint in plaintext state. Repo bundles preserve the same native
+bytes. Health is provider-delegated for both kinds: sagy performs no probe or refresh and only a
+bounded authentication result from the launched `agy` process can change durable auth health.
+
 ## 5. Account Selection & Cooldown Policy
 
 1. **Fail-closed eligibility**: Every candidate must have a compatible State v2 credential reference and a locally verified fixed credential slot. Zero quota, active cooldown, invalid authentication, permission failures, and explicit service rejection are ineligible.
@@ -136,7 +146,7 @@ fingerprint.
 ## 6. Launch Argument Composition & Session Resume
 
 `launcher::final_launch_args` builds the exact argv appended after the resolved `agy` executable,
-from two independent decisions plus the user's own arguments:
+from three independent decisions plus the user's own arguments:
 
 1. **Default model**: `--model gemini-3.7-flash-high` is prepended unless the user already passed
    `--model` / `-m` (long or `=` form).
@@ -160,16 +170,22 @@ from two independent decisions plus the user's own arguments:
      `Route::Passthrough`, and clap strips it again for `launch -- <args>`, so `sagy -- --help`
      reaches `has_prompt_or_continue_args` as just `["--help"]` and still resumes. A separator in a
      later position (`sagy --yolo -- --help`) survives into `extra_args` and does suppress resuming.
+3. **Bare prompt shorthand**: when the first forwarded argument is positional,
+   `compact_bare_prompt` joins the consecutive positional run before the first option into one
+   `-p` value. Thus `sagy say hi` produces `agy --model <default> -p "say hi"` with no implicit
+   `--continue`. Once an option is reached, the remaining arguments are forwarded item-by-item;
+   sagy never guesses which value belongs to an unknown option. Unix non-UTF-8 bytes are preserved.
 
-The user's own arguments are always appended last, so `agy`'s own precedence rules decide when both
-an injected and a user-supplied form of the same option are present.
+Except for that leading bare-prompt normalization, the user's arguments remain ordered after the
+injected defaults, so `agy`'s own precedence rules decide when both an injected and a user-supplied
+form of the same option are present.
 
 ## 7. State and Credential Transactions
 
 - One CLI invocation owns one exact `StateSession`; all mutations use revision-checked compare-and-swap commits.
 - State stores credential references and digests, never credential payloads or caller-controlled credential paths.
 - Credential files and the two active-home OAuth slots are published with durable journals before State commits. Recovery is receipt-bound and runs before later mutations.
-- OAuth access tokens, OAuth authorized-user documents, API keys, and Vertex service accounts have mutually exclusive launch environments and fixed managed layouts.
+- OAuth access tokens, OAuth authorized-user documents, provider-native Antigravity/Gemini sessions, API keys, and Vertex service accounts have mutually exclusive launch environments and fixed managed layouts.
 
 ## 8. Encrypted Account Pool Synchronization
 

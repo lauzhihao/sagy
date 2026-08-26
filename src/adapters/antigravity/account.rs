@@ -1053,14 +1053,31 @@ fn scan_known_oauth_sources() -> Result<Vec<KnownCredentialSource>> {
         let path = home.join("oauth_creds.json");
         if path.exists() {
             let bytes = read_import_source(&path)?;
-            let credential = PortableCredential::from_gemini_oauth_session_source(&bytes)
-                .map_err(anyhow::Error::new)
-                .context("known Gemini OAuth session is invalid")?;
+            let credential = match PortableCredential::from_gemini_oauth_session_source(&bytes) {
+                Ok(credential) => credential,
+                Err(gemini_error) => {
+                    let text = std::str::from_utf8(&bytes)
+                        .context("known oauth_creds.json is not UTF-8")?;
+                    let legacy = PortableCredential::from_native_json_str(text.trim())
+                        .map_err(anyhow::Error::new)
+                        .context("known oauth_creds.json is not a supported credential")?;
+                    if legacy.kind() != CredentialKind::OAuthAuthorizedUser {
+                        return Err(anyhow::Error::new(gemini_error)
+                            .context("known Gemini OAuth session is invalid"));
+                    }
+                    legacy
+                }
+            };
+            let plan_label = if credential.kind() == CredentialKind::GeminiOAuthSession {
+                "Gemini OAuth session"
+            } else {
+                "Antigravity OAuth"
+            };
             sources.push(KnownCredentialSource {
                 credential,
                 material: bytes,
                 email: active_email.unwrap_or_else(|| "google-oauth-user@gemini".to_string()),
-                plan_label: "Gemini OAuth session",
+                plan_label,
             });
         }
     }
@@ -1112,11 +1129,15 @@ fn parse_import_source(bytes: &[u8]) -> Result<(PortableCredential, Vec<u8>)> {
                 false,
             ),
         };
-        let material = if matches!(
+        let material = if credential.kind() == CredentialKind::OAuthAccessToken {
+            credential
+                .access_token()
+                .ok_or_else(|| anyhow!("raw OAuth credential has no access token"))?
+                .as_bytes()
+                .to_vec()
+        } else if matches!(
             credential.kind(),
-            CredentialKind::OAuthAccessToken
-                | CredentialKind::AntigravityToken
-                | CredentialKind::GeminiOAuthSession
+            CredentialKind::AntigravityToken | CredentialKind::GeminiOAuthSession
         ) {
             credential.to_native_bytes().map_err(anyhow::Error::new)?
         } else if portable_envelope {
@@ -1995,7 +2016,13 @@ fn run_known_credential_import_session(
                     };
                     reference.kind == kind
                         && (account.identity_fingerprint.as_deref() == Some(identity.as_str())
-                            || reference.fingerprint == fingerprint)
+                            || reference.fingerprint == fingerprint
+                            || CredentialStore::new(state_dir, &account.id)
+                                .ok()
+                                .and_then(|store| store.read(reference).ok())
+                                .is_some_and(|stored| {
+                                    stored.credential.identity_fingerprint() == identity
+                                }))
                 });
                 let account_id = existing
                     .map(|account| account.id.clone())

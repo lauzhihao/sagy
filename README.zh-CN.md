@@ -72,6 +72,8 @@ cargo build --release
 | `sagy -- <agy 参数...>` | 把 `--` 之后的全部参数原样透传给 `agy` |
 
 第一个 token 只要不是已知子命令，同样会被整体透传给 `agy`。
+若透传内容以裸 positional 单词开头，sagy 会把第一个 option 之前的连续单词合成一个显式
+print prompt：`sagy say hi` 实际启动 `agy -p "say hi"`。后续 option 仍按原顺序逐项透传。
 
 ### `login` / `add` 如何取得凭据
 
@@ -87,6 +89,12 @@ sagy 同样不会拿 `refresh_token` 去换新的 access token。`authorized_use
 只被原样保存、同步并交给 `agy`，真正的刷新由 `agy` 自己向 Google 发起。探测发现 authorized_user
 凭据过期时，sagy 只把账号标记为"需要刷新"，不会代为刷新。
 
+`import-known` 会独立扫描两个 provider 自有文件：
+`~/.gemini/antigravity-cli/antigravity-oauth-token` 的 raw token 与
+`~/.gemini/oauth_creds.json` 的严格六字段 Gemini session 会成为两个独立账号，并逐字节保留原始
+内容；后一路径中的旧式 Google `authorized_user` 文档仍然兼容。provider-native session 不由 sagy
+探测、刷新、合并或重新序列化；sagy 只精确发布被选中的文件，最终认证结果交给 `agy`。
+
 Google `authorized_user` JSON 必须包含 `client_id`、`client_secret` 与 `refresh_token`。
 `token_uri` 可以省略；sagy 会在内部将其规范化为
 `https://oauth2.googleapis.com/token`。如果显式提供了其它 endpoint，则按 fail-closed
@@ -98,7 +106,9 @@ Google `authorized_user` JSON 必须包含 `client_id`、`client_secret` 与 `re
 ### 会话续接规则
 
 `sagy` 与 `sagy launch` 会向 `agy` 的 argv 追加 `--continue`，因此默认续接上一轮会话。
-只有两种情况会关闭它：
+开头的裸 prompt 会先被规范化：第一个 option 之前的连续 positional 单词会合成一个 `-p` 值，
+因此 `sagy say hi` 会开启新的 print turn，不会再收到隐式 `--continue`。除此以外，只有两种情况
+会关闭续接：
 
 1. `--no-resume`。它属于 sagy 侧参数，必须写在第一个 `agy` 参数之前
    （`sagy --no-resume ...` 或 `sagy launch --no-resume ...`）。写在 `agy` 参数之后就不再是
@@ -153,7 +163,8 @@ sagy 绝不静默覆盖不是自己写的凭据。它在 active home 里纳管�
 两种情况被区别对待，只有第二种需要你动手：
 
 1. 文件里的内容**就是**某个已登记账号的凭据（逐字节一致）：sagy 就地接管，一个字节都不改写。
-   已经在用 Antigravity 的机器上第一次跑 `sagy` 属于这一类，不需要任何参数。
+   已经在用 Antigravity 的机器上第一次跑 `sagy` 属于这一类。`import-known` 会分别接管两个
+   provider 自有文件，绝不把其中一个合并或替代为另一个；不需要任何参数。
 2. 文件是 sagy 不认识的：本次切换被拒绝，磁盘不做任何改动，错误信息里会直接给出下面这条命令。
 
 `--takeover` 就是第二种情况的显式 opt-in。它在写入所选账号之前，把每个被替换掉的文件
