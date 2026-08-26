@@ -70,17 +70,6 @@ pub enum CredentialPayload {
     OAuthAuthorizedUser(Map<String, Value>),
     ApiKey(Map<String, Value>),
     VertexServiceAccount(Map<String, Value>),
-    /// The raw UTF-8 material stored in the Antigravity token slot.
-    ///
-    /// This is deliberately not stored as a parsed JSON value or as a
-    /// normalized string: active-home adoption and portable round-trips must
-    /// retain the exact bytes supplied by the provider.
-    AntigravityToken(Vec<u8>),
-    /// The raw UTF-8 `oauth_creds.json` material used by Gemini.
-    ///
-    /// Validation parses the document, but the parsed map is never used as
-    /// the source of truth for serialization.
-    GeminiOAuthSession(Vec<u8>),
 }
 
 impl CredentialPayload {
@@ -91,8 +80,6 @@ impl CredentialPayload {
             Self::OAuthAuthorizedUser(_) => CredentialKind::OAuthAuthorizedUser,
             Self::ApiKey(_) => CredentialKind::ApiKey,
             Self::VertexServiceAccount(_) => CredentialKind::VertexServiceAccount,
-            Self::AntigravityToken(_) => CredentialKind::AntigravityToken,
-            Self::GeminiOAuthSession(_) => CredentialKind::GeminiOAuthSession,
         }
     }
 
@@ -127,30 +114,6 @@ impl CredentialPayload {
             _ => None,
         }
     }
-
-    /// Return the exact source bytes for a raw provider credential.
-    pub fn source_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::AntigravityToken(source) | Self::GeminiOAuthSession(source) => Some(source),
-            _ => None,
-        }
-    }
-
-    /// Return the exact Antigravity token source bytes, if present.
-    pub fn antigravity_token_source(&self) -> Option<&[u8]> {
-        match self {
-            Self::AntigravityToken(source) => Some(source),
-            _ => None,
-        }
-    }
-
-    /// Return the exact Gemini OAuth session source bytes, if present.
-    pub fn gemini_oauth_session_source(&self) -> Option<&[u8]> {
-        match self {
-            Self::GeminiOAuthSession(source) => Some(source),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Debug for CredentialPayload {
@@ -169,11 +132,6 @@ impl fmt::Debug for CredentialPayload {
                 .field("kind", &kind)
                 .field("fields", &document.keys().collect::<Vec<_>>())
                 .finish(),
-            Self::AntigravityToken(_) | Self::GeminiOAuthSession(_) => formatter
-                .debug_struct("CredentialPayload")
-                .field("kind", &kind)
-                .field("source", &"<redacted>")
-                .finish(),
         }
     }
 }
@@ -185,8 +143,6 @@ pub enum CredentialKind {
     OAuthAuthorizedUser,
     ApiKey,
     VertexServiceAccount,
-    AntigravityToken,
-    GeminiOAuthSession,
 }
 
 impl CredentialKind {
@@ -196,8 +152,6 @@ impl CredentialKind {
             Self::OAuthAuthorizedUser => "oauth_authorized_user",
             Self::ApiKey => "api_key",
             Self::VertexServiceAccount => "vertex_service_account",
-            Self::AntigravityToken => "antigravity_token",
-            Self::GeminiOAuthSession => "gemini_oauth_session",
         }
     }
 
@@ -207,8 +161,6 @@ impl CredentialKind {
             "oauth_authorized_user" => Ok(Self::OAuthAuthorizedUser),
             "api_key" => Ok(Self::ApiKey),
             "vertex_service_account" => Ok(Self::VertexServiceAccount),
-            "antigravity_token" => Ok(Self::AntigravityToken),
-            "gemini_oauth_session" => Ok(Self::GeminiOAuthSession),
             _ => Err(CredentialError::InvalidKind),
         }
     }
@@ -249,24 +201,6 @@ impl PortableCredential {
     /// Construct a Vertex service-account credential from its complete JSON object.
     pub fn vertex_service_account(document: Value) -> Result<Self, CredentialError> {
         Self::new(CredentialPayload::VertexServiceAccount(object(document)?))
-    }
-
-    /// Construct an Antigravity token from the exact provider source bytes.
-    ///
-    /// The source must be bounded UTF-8 and contain a non-empty token after
-    /// trimming. The original bytes, including surrounding whitespace, are
-    /// retained for every subsequent serialization.
-    pub fn from_antigravity_token_source(input: &[u8]) -> Result<Self, CredentialError> {
-        Self::new(CredentialPayload::AntigravityToken(input.to_vec()))
-    }
-
-    /// Construct a Gemini OAuth session from the exact provider JSON bytes.
-    ///
-    /// The document is parsed strictly for validation, but is never
-    /// reserialized into the payload. This preserves provider formatting and
-    /// unknown byte-level details that are valid UTF-8 JSON source.
-    pub fn from_gemini_oauth_session_source(input: &[u8]) -> Result<Self, CredentialError> {
-        Self::new(CredentialPayload::GeminiOAuthSession(input.to_vec()))
     }
 
     /// Parse a raw authorized-user JSON document.
@@ -315,14 +249,6 @@ impl PortableCredential {
             if object.get("api_key").is_some() {
                 return Self::api_key_document(value);
             }
-
-            // A Gemini OAuth session is intentionally distinguished from the
-            // older Google `authorized_user` document by its fixed six-field
-            // shape and has no `type` marker. Use the original input bytes so
-            // this convenience parser remains byte preserving.
-            if object.contains_key("access_token") || object.contains_key("refresh_token") {
-                return Self::from_gemini_oauth_session_source(input.as_bytes());
-            }
         }
         Err(CredentialError::InvalidEnvelope)
     }
@@ -337,10 +263,6 @@ impl PortableCredential {
             CredentialPayload::OAuthAuthorizedUser(document)
             | CredentialPayload::ApiKey(document)
             | CredentialPayload::VertexServiceAccount(document) => Value::Object(document.clone()),
-            CredentialPayload::AntigravityToken(source)
-            | CredentialPayload::GeminiOAuthSession(source) => {
-                return String::from_utf8(source.clone()).map_err(|_| CredentialError::InvalidUtf8);
-            }
         };
         let bytes = serde_json::to_vec(&value).map_err(|_| CredentialError::SerializationFailed)?;
         if bytes.len() > MAX_CREDENTIAL_SERIALIZED_BYTES {
@@ -357,10 +279,6 @@ impl PortableCredential {
                 .get("access_token")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty()),
-            CredentialPayload::AntigravityToken(source) => std::str::from_utf8(source)
-                .ok()
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
             _ => None,
         }
     }
@@ -374,21 +292,6 @@ impl PortableCredential {
                 .filter(|value| !value.trim().is_empty()),
             _ => None,
         }
-    }
-
-    /// Return a Gemini session refresh token as an owned value.
-    ///
-    /// Session payloads retain raw bytes rather than a parsed map, so callers
-    /// that need the field receive a short-lived owned copy.
-    pub fn gemini_refresh_token(&self) -> Option<String> {
-        let CredentialPayload::GeminiOAuthSession(source) = &self.payload else {
-            return None;
-        };
-        let document = parse_gemini_oauth_session(source).ok()?;
-        document
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
     }
 
     /// Return an API key payload's secret, if this is an API credential.
@@ -427,9 +330,7 @@ impl PortableCredential {
             CredentialPayload::OAuthAuthorizedUser(document)
             | CredentialPayload::ApiKey(document)
             | CredentialPayload::VertexServiceAccount(document) => Some(document),
-            CredentialPayload::OAuthAccessToken(_)
-            | CredentialPayload::AntigravityToken(_)
-            | CredentialPayload::GeminiOAuthSession(_) => None,
+            CredentialPayload::OAuthAccessToken(_) => None,
         }
     }
 
@@ -456,21 +357,6 @@ impl PortableCredential {
         &self.payload
     }
 
-    /// Return exact provider-native source bytes for the raw credential
-    /// variants. Structured legacy variants intentionally return `None`.
-    pub fn source_bytes(&self) -> Option<&[u8]> {
-        self.payload.source_bytes()
-    }
-
-    /// Return exact provider-native source bytes for any credential that has a
-    /// native byte representation.
-    pub fn to_native_bytes(&self) -> Result<Vec<u8>, CredentialError> {
-        if let Some(source) = self.source_bytes() {
-            return Ok(source.to_vec());
-        }
-        Ok(self.to_native_json_string()?.into_bytes())
-    }
-
     /// Return a canonical JSON representation and enforce its size bound.
     pub fn to_json_string(&self) -> Result<String, CredentialError> {
         let value = self.to_value()?;
@@ -483,9 +369,6 @@ impl PortableCredential {
 
     /// Return a stable SHA-256 fingerprint without including the secret in output.
     pub fn fingerprint(&self) -> String {
-        if let Some(source) = self.payload.source_bytes() {
-            return fingerprint_raw_material(self.kind(), source);
-        }
         let value = self
             .to_value()
             .expect("validated portable credential must serialize");
@@ -494,33 +377,6 @@ impl PortableCredential {
         digest.update(FINGERPRINT_DOMAIN);
         digest.update(bytes);
         format!("sha256:{:x}", digest.finalize())
-    }
-
-    /// Return the account identity fingerprint.
-    ///
-    /// Existing credential kinds intentionally retain their historical exact
-    /// portable fingerprint semantics. New provider-native kinds separate
-    /// mutable source bytes from identity: Antigravity uses the trimmed token,
-    /// while Gemini uses the refresh token.
-    pub fn identity_fingerprint(&self) -> String {
-        match &self.payload {
-            CredentialPayload::AntigravityToken(source) => {
-                let token = std::str::from_utf8(source)
-                    .expect("validated Antigravity token must be UTF-8")
-                    .trim();
-                identity_hash(b"antigravity_token", token.as_bytes())
-            }
-            CredentialPayload::GeminiOAuthSession(source) => {
-                let document = parse_gemini_oauth_session(source)
-                    .expect("validated Gemini OAuth session must parse");
-                let refresh_token = document
-                    .get("refresh_token")
-                    .and_then(Value::as_str)
-                    .expect("validated Gemini OAuth session has refresh_token");
-                identity_hash(b"gemini_oauth_session", refresh_token.as_bytes())
-            }
-            _ => self.fingerprint(),
-        }
     }
 
     fn new(mut payload: CredentialPayload) -> Result<Self, CredentialError> {
@@ -566,22 +422,6 @@ impl PortableCredential {
             CredentialKind::ApiKey => CredentialPayload::ApiKey(payload_object),
             CredentialKind::VertexServiceAccount => {
                 CredentialPayload::VertexServiceAccount(payload_object)
-            }
-            CredentialKind::AntigravityToken => {
-                validate_exact_keys(&payload_object, &["source"])?;
-                CredentialPayload::AntigravityToken(
-                    required_string(&payload_object, "source")?
-                        .as_bytes()
-                        .to_vec(),
-                )
-            }
-            CredentialKind::GeminiOAuthSession => {
-                validate_exact_keys(&payload_object, &["source"])?;
-                CredentialPayload::GeminiOAuthSession(
-                    required_string(&payload_object, "source")?
-                        .as_bytes()
-                        .to_vec(),
-                )
             }
         };
 
@@ -652,14 +492,6 @@ impl PortableCredential {
             CredentialPayload::OAuthAuthorizedUser(document)
             | CredentialPayload::ApiKey(document)
             | CredentialPayload::VertexServiceAccount(document) => Value::Object(document.clone()),
-            CredentialPayload::AntigravityToken(source)
-            | CredentialPayload::GeminiOAuthSession(source) => {
-                let source = std::str::from_utf8(source)
-                    .expect("validated raw credential source must be UTF-8");
-                let mut payload = Map::new();
-                payload.insert("source".to_string(), Value::String(source.to_string()));
-                Value::Object(payload)
-            }
         }
     }
 }
@@ -709,7 +541,6 @@ pub enum CredentialError {
     MissingField(&'static str),
     EmptyField(&'static str),
     InvalidFieldType(&'static str),
-    InvalidUtf8,
     AmbiguousSecret,
     AbsolutePath,
     FieldTooLarge,
@@ -746,7 +577,6 @@ impl CredentialError {
             Self::MissingField(_) => "required credential field is missing",
             Self::EmptyField(_) => "required credential field is empty",
             Self::InvalidFieldType(_) => "credential field has an invalid type",
-            Self::InvalidUtf8 => "credential source is not valid UTF-8",
             Self::AmbiguousSecret => "credential contains ambiguous secret fields",
             Self::AbsolutePath => "absolute paths are not portable credential data",
             Self::FieldTooLarge => "credential field is too large",
@@ -821,119 +651,8 @@ fn validate_payload(
         CredentialPayload::VertexServiceAccount(document) => {
             validate_service_account(document, depth, budget)?;
         }
-        CredentialPayload::AntigravityToken(source) => {
-            validate_antigravity_token_source(source)?;
-        }
-        CredentialPayload::GeminiOAuthSession(source) => {
-            validate_gemini_oauth_session_source(source, depth, budget)?;
-        }
     }
     Ok(())
-}
-
-fn validate_antigravity_token_source(source: &[u8]) -> Result<(), CredentialError> {
-    if source.len() > MAX_CREDENTIAL_FIELD_BYTES {
-        return Err(CredentialError::FieldTooLarge);
-    }
-    let text = std::str::from_utf8(source).map_err(|_| CredentialError::InvalidUtf8)?;
-    if text.trim().is_empty() {
-        return Err(CredentialError::EmptyField("antigravity_token"));
-    }
-    Ok(())
-}
-
-fn validate_gemini_oauth_session_source(
-    source: &[u8],
-    depth: usize,
-    budget: &mut usize,
-) -> Result<(), CredentialError> {
-    if source.len() > MAX_CREDENTIAL_SERIALIZED_BYTES {
-        return Err(CredentialError::SerializedTooLarge);
-    }
-    let document = parse_gemini_oauth_session(source)?;
-    validate_exact_keys(
-        &document,
-        &[
-            "access_token",
-            "expiry_date",
-            "id_token",
-            "refresh_token",
-            "scope",
-            "token_type",
-        ],
-    )?;
-    // These are provider fields, not filesystem paths. Keep the generic
-    // credential document path guard out of this strict six-field parser so a
-    // valid provider string is not rejected solely because it starts with `/`.
-    let values = ["access_token", "id_token", "refresh_token", "scope"];
-    for field in values {
-        validate_bounded_nonempty_string(&document, field)?;
-    }
-    let expiry_date = document
-        .get("expiry_date")
-        .ok_or(CredentialError::MissingField("expiry_date"))?;
-    if expiry_date.as_u64().is_none() {
-        return Err(CredentialError::InvalidFieldType("expiry_date"));
-    }
-    let token_type = required_bounded_nonempty_string(&document, "token_type")?;
-    if token_type != "Bearer" {
-        return Err(CredentialError::InvalidFieldType("token_type"));
-    }
-    let value_count = document.len().saturating_add(1);
-    *budget = budget
-        .checked_sub(value_count)
-        .ok_or(CredentialError::TooManyValues)?;
-    let _ = depth;
-    Ok(())
-}
-
-fn validate_bounded_nonempty_string(
-    document: &Map<String, Value>,
-    field: &'static str,
-) -> Result<(), CredentialError> {
-    required_bounded_nonempty_string(document, field).map(|_| ())
-}
-
-fn required_bounded_nonempty_string<'a>(
-    document: &'a Map<String, Value>,
-    field: &'static str,
-) -> Result<&'a str, CredentialError> {
-    let value = document
-        .get(field)
-        .ok_or(CredentialError::MissingField(field))?
-        .as_str()
-        .ok_or(CredentialError::InvalidFieldType(field))?;
-    if value.trim().is_empty() {
-        return Err(CredentialError::EmptyField(field));
-    }
-    if value.len() > MAX_CREDENTIAL_FIELD_BYTES {
-        return Err(CredentialError::FieldTooLarge);
-    }
-    Ok(value)
-}
-
-fn parse_gemini_oauth_session(source: &[u8]) -> Result<Map<String, Value>, CredentialError> {
-    let text = std::str::from_utf8(source).map_err(|_| CredentialError::InvalidUtf8)?;
-    let value = parse_strict_json(text)?;
-    object(value)
-}
-
-fn fingerprint_raw_material(kind: CredentialKind, source: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(FINGERPRINT_DOMAIN);
-    digest.update(kind.as_str().as_bytes());
-    digest.update([0]);
-    digest.update(source);
-    format!("sha256:{:x}", digest.finalize())
-}
-
-fn identity_hash(kind: &[u8], material: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"sagy-credential-identity\0v1\0");
-    digest.update(kind);
-    digest.update([0]);
-    digest.update(material);
-    format!("sha256:{:x}", digest.finalize())
 }
 
 /// 在 PortableCredential 汇合点规范化 provider-native 文档。
@@ -1529,104 +1248,5 @@ mod tests {
             .unwrap();
         assert!(PortableCredential::parse_oauth_authorized_user_json(&portable).is_err());
         assert!(PortableCredential::parse_vertex_service_account_json(&portable).is_err());
-    }
-
-    #[test]
-    fn antigravity_token_retains_raw_source_and_separates_identity_from_material() {
-        let source = b"  antigravity-token\n";
-        let credential = PortableCredential::from_antigravity_token_source(source).unwrap();
-        assert_eq!(credential.kind(), CredentialKind::AntigravityToken);
-        assert_eq!(credential.access_token(), Some("antigravity-token"));
-        assert_eq!(credential.payload().source_bytes(), Some(source.as_slice()));
-        assert_eq!(
-            credential.to_native_json_string().unwrap().as_bytes(),
-            source
-        );
-
-        let portable = credential.to_json_string().unwrap();
-        let decoded = PortableCredential::from_json_str(&portable).unwrap();
-        assert_eq!(decoded.payload().source_bytes(), Some(source.as_slice()));
-        assert_eq!(decoded.to_native_json_string().unwrap().as_bytes(), source);
-        assert_eq!(decoded.fingerprint(), credential.fingerprint());
-        assert_eq!(
-            decoded.identity_fingerprint(),
-            credential.identity_fingerprint()
-        );
-
-        let trimmed =
-            PortableCredential::from_antigravity_token_source(b"antigravity-token").unwrap();
-        assert_ne!(credential.fingerprint(), trimmed.fingerprint());
-        assert_eq!(
-            credential.identity_fingerprint(),
-            trimmed.identity_fingerprint()
-        );
-    }
-
-    #[test]
-    fn gemini_oauth_session_retains_raw_json_and_uses_refresh_identity() {
-        let source = br#"{
-  "access_token": "access\u002dtoken",
-  "expiry_date": 1770000000000,
-  "id_token": "id-token",
-  "refresh_token": "refresh-token",
-  "scope": "scope-a scope-b",
-  "token_type": "Bearer"
-}"#;
-        let credential = PortableCredential::from_gemini_oauth_session_source(source).unwrap();
-        assert_eq!(credential.kind(), CredentialKind::GeminiOAuthSession);
-        assert_eq!(credential.payload().source_bytes(), Some(source.as_slice()));
-        assert_eq!(
-            credential.gemini_refresh_token().as_deref(),
-            Some("refresh-token")
-        );
-        assert_eq!(
-            credential.to_native_json_string().unwrap().as_bytes(),
-            source
-        );
-
-        let portable = credential.to_json_string().unwrap();
-        let decoded = PortableCredential::from_json_str(&portable).unwrap();
-        assert_eq!(decoded, credential);
-        assert_eq!(decoded.to_native_json_string().unwrap().as_bytes(), source);
-
-        let equivalent = PortableCredential::from_gemini_oauth_session_source(
-            br#"{"access_token":"new-access","expiry_date":1770000001000,"id_token":"new-id","refresh_token":"refresh-token","scope":"scope-a scope-b","token_type":"Bearer"}"#,
-        )
-        .unwrap();
-        assert_ne!(credential.fingerprint(), equivalent.fingerprint());
-        assert_eq!(
-            credential.identity_fingerprint(),
-            equivalent.identity_fingerprint()
-        );
-    }
-
-    #[test]
-    fn gemini_oauth_session_rejects_duplicates_unknown_fields_and_bad_values() {
-        let valid = |extra: &str| {
-            format!(
-                "{{\"access_token\":\"access\",\"expiry_date\":1,\"id_token\":\"id\",\"refresh_token\":\"refresh\",\"scope\":\"scope\",\"token_type\":\"Bearer\"{extra}}}"
-            )
-        };
-        for source in [
-            valid(",\"type\":\"authorized_user\""),
-            valid(",\"token_uri\":\"https://example.test/token\""),
-            r#"{"access_token":"access","access_token":"duplicate","expiry_date":1,"id_token":"id","refresh_token":"refresh","scope":"scope","token_type":"Bearer"}"#.to_string(),
-            r#"{"access_token":"access","expiry_date":-1,"id_token":"id","refresh_token":"refresh","scope":"scope","token_type":"Bearer"}"#.to_string(),
-            r#"{"access_token":"access","expiry_date":1,"id_token":"id","refresh_token":"refresh","scope":"scope","token_type":"bearer"}"#.to_string(),
-            r#"{"access_token":"access","expiry_date":1,"id_token":"id","refresh_token":"","scope":"scope","token_type":"Bearer"}"#.to_string(),
-        ] {
-            assert!(
-                PortableCredential::from_gemini_oauth_session_source(source.as_bytes()).is_err(),
-                "source should be rejected: {source}"
-            );
-        }
-    }
-
-    #[test]
-    fn native_json_convenience_parser_detects_gemini_session_without_reserializing() {
-        let source = "{\n  \"access_token\": \"a\",\n  \"expiry_date\": 1,\n  \"id_token\": \"i\",\n  \"refresh_token\": \"r\",\n  \"scope\": \"s\",\n  \"token_type\": \"Bearer\"\n}\n";
-        let credential = PortableCredential::from_native_json_str(source).unwrap();
-        assert_eq!(credential.kind(), CredentialKind::GeminiOAuthSession);
-        assert_eq!(credential.to_native_json_string().unwrap(), source);
     }
 }

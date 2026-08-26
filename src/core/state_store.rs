@@ -423,7 +423,7 @@ fn validate_active_layout_for_reference(
 ) -> Result<()> {
     validate_managed_layout_shape(layout)?;
     match kind {
-        CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken => {
+        CredentialRefKind::OauthAccessToken => {
             if !matches!(
                 layout.antigravity_token,
                 super::state::SlotState::Exact { .. }
@@ -434,7 +434,7 @@ fn validate_active_layout_for_reference(
                 bail!("active OAuth token layout has an invalid slot combination");
             }
         }
-        CredentialRefKind::OauthAuthorizedUser | CredentialRefKind::GeminiOauthSession => {
+        CredentialRefKind::OauthAuthorizedUser => {
             if !matches!(layout.antigravity_token, super::state::SlotState::Absent)
                 || !matches!(
                     layout.gemini_authorized_user,
@@ -2233,19 +2233,13 @@ fn validate_credential_journal_value(value: &Value, proof: &CredentialJournalPro
         let document = before_or_after_descriptor(after, "document")?;
         match (token, document) {
             (Some((kind, fingerprint, digest)), None) => {
-                if !matches!(
-                    kind,
-                    CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken
-                ) {
+                if kind != CredentialRefKind::OauthAccessToken {
                     bail!("token journal slot has a non-token credential kind");
                 }
                 (kind, fingerprint, digest, "token")
             }
             (None, Some((kind, fingerprint, digest))) => {
-                if matches!(
-                    kind,
-                    CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken
-                ) {
+                if kind == CredentialRefKind::OauthAccessToken {
                     bail!("document journal slot has a raw token kind");
                 }
                 (kind, fingerprint, digest, "document")
@@ -2430,8 +2424,6 @@ fn credential_ref_value(value: Option<&Value>) -> Result<Option<CredentialRef>> 
         Some("oauth_authorized_user") => CredentialRefKind::OauthAuthorizedUser,
         Some("api_key") => CredentialRefKind::ApiKey,
         Some("vertex_service_account") => CredentialRefKind::VertexServiceAccount,
-        Some("antigravity_token") => CredentialRefKind::AntigravityToken,
-        Some("gemini_oauth_session") => CredentialRefKind::GeminiOauthSession,
         _ => bail!("credential journal credential reference kind is invalid"),
     };
     let fingerprint = object
@@ -2462,8 +2454,6 @@ fn before_or_after_descriptor(
         Some("oauth_authorized_user") => CredentialRefKind::OauthAuthorizedUser,
         Some("api_key") => CredentialRefKind::ApiKey,
         Some("vertex_service_account") => CredentialRefKind::VertexServiceAccount,
-        Some("antigravity_token") => CredentialRefKind::AntigravityToken,
-        Some("gemini_oauth_session") => CredentialRefKind::GeminiOauthSession,
         _ => bail!("credential journal descriptor kind is invalid"),
     };
     let fingerprint = descriptor
@@ -3732,41 +3722,6 @@ mod tests {
 
     fn absent_layout() -> ManagedLayout {
         ManagedLayout::default()
-    }
-
-    #[test]
-    fn credential_journal_accepts_provider_native_reference_tags() {
-        let fingerprint = format!("sha256:{}", "a".repeat(64));
-        for (tag, expected) in [
-            ("antigravity_token", CredentialRefKind::AntigravityToken),
-            (
-                "gemini_oauth_session",
-                CredentialRefKind::GeminiOauthSession,
-            ),
-        ] {
-            let value = serde_json::json!({
-                "kind": tag,
-                "fingerprint": fingerprint.clone(),
-            });
-            assert_eq!(
-                credential_ref_value(Some(&value)).unwrap().unwrap().kind,
-                expected
-            );
-        }
-        assert!(
-            validate_active_layout_for_reference(
-                CredentialRefKind::AntigravityToken,
-                &token_layout()
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_active_layout_for_reference(
-                CredentialRefKind::GeminiOauthSession,
-                &authorized_user_layout()
-            )
-            .is_ok()
-        );
     }
 
     fn v2_state() -> State {
