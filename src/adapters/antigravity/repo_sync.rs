@@ -2289,11 +2289,15 @@ fn clone_repo(
         }
     };
 
-    let checkout_str = checkout_dir.to_string_lossy();
+    // `NormalizedStoreRoot` intentionally keeps Windows' verbatim path form
+    // for internal validation. Git for Windows does not accept that form as a
+    // worktree destination, so normalize only this generated external argv
+    // value at the process boundary.
+    let checkout_str = path_for_git(&checkout_dir);
     // `--` is deliberately before every user-controlled positional argument. Git clone
     // accepts this form and therefore cannot interpret a repository named like `-A` as an
     // option; the destination is generated under our validated temporary root.
-    let args = ["clone", "--depth", "1", "--", repo, checkout_str.as_ref()];
+    let args = ["clone", "--depth", "1", "--", repo, checkout_str.as_str()];
 
     if let Err(error) = git_cmd(git_bin, state_dir, &args, identity_file, insecure_host_key) {
         let _ = fs::remove_dir_all(&checkout_dir);
@@ -2320,6 +2324,38 @@ fn clone_repo(
     }
 
     Ok(checkout)
+}
+
+/// Convert an internal Windows canonical path to the ordinary absolute path
+/// spelling accepted by Git for Windows.
+///
+/// This is deliberately limited to the external Git argument boundary. The
+/// returned path is never used for trust-boundary validation or internal file
+/// operations, which continue to use the normalized `Path` value.
+fn path_for_git(path: &Path) -> String {
+    let value = path.to_string_lossy();
+
+    #[cfg(windows)]
+    {
+        const VERBATIM_PREFIX: &str = "\\\\?\\";
+        const VERBATIM_UNC_PREFIX: &str = "\\\\?\\UNC\\";
+
+        if let Some(rest) = value.strip_prefix(VERBATIM_UNC_PREFIX) {
+            return format!("\\\\{rest}");
+        }
+        if let Some(rest) = value.strip_prefix(VERBATIM_PREFIX) {
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')
+            {
+                return rest.to_owned();
+            }
+        }
+    }
+
+    value.into_owned()
 }
 
 fn git_cmd(
@@ -2659,6 +2695,28 @@ mod tests {
         assert_eq!(
             quoted,
             "'/tmp/key with spaces; touch /tmp/pwned '\\''$HOME'\\'''"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_git_path_converts_verbatim_disk_and_unc_prefixes() {
+        // 内部校验保留 verbatim 形式，只有交给 Git 的参数才转换为普通绝对路径。
+        assert_eq!(
+            path_for_git(Path::new("\\\\?\\C:\\sagy\\tmp\\checkout")),
+            "C:\\sagy\\tmp\\checkout"
+        );
+        assert_eq!(
+            path_for_git(Path::new("\\\\?\\UNC\\server\\share\\checkout")),
+            "\\\\server\\share\\checkout"
+        );
+        assert_eq!(
+            path_for_git(Path::new("C:\\sagy\\tmp\\checkout")),
+            "C:\\sagy\\tmp\\checkout"
+        );
+        assert_eq!(
+            path_for_git(Path::new("\\\\?\\Volume{abc}\\checkout")),
+            "\\\\?\\Volume{abc}\\checkout"
         );
     }
 

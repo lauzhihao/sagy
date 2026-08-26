@@ -252,8 +252,12 @@ fn black_box_unsafe_path_does_not_modify_victim() {
     );
     assert_eq!(fs::read(&victim).expect("victim"), b"unchanged");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    #[cfg(windows)]
+    let expected_error = "bundle path cannot contain backslashes";
+    #[cfg(not(windows))]
+    let expected_error = "bundle path must be relative";
     assert!(
-        stderr.contains("bundle path must be relative"),
+        stderr.contains(expected_error),
         "unexpected error: {stderr}"
     );
 }
