@@ -5199,16 +5199,8 @@ mod tests {
         fs::write(&target, bytes).unwrap();
         #[cfg(unix)]
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-        let mode_before = {
-            #[cfg(unix)]
-            {
-                fs::metadata(&root).unwrap().permissions().mode() & 0o777
-            }
-            #[cfg(not(unix))]
-            {
-                0
-            }
-        };
+        #[cfg(unix)]
+        let mode_before = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
         let store = StateStore::open(&root).unwrap();
         let legacy = store.read().unwrap();
         assert_eq!(legacy.revision.generation, RevisionGeneration::Legacy);

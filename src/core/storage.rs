@@ -63,6 +63,7 @@ pub(crate) fn create_secure_dir_all(path: &Path) -> Result<()> {
         }
         // 目录必须"创建时就是 0700"。先 create_dir 再 chmod 会留下一个
         // 其它用户可进入的窗口，凭据正是在这个窗口里被写进去的。
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {

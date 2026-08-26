@@ -574,7 +574,7 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-fn configure_process_group(command: &mut Command) {
+fn configure_process_group(#[cfg_attr(not(unix), allow(unused_variables))] command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

@@ -4043,11 +4043,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let mode = fs::metadata(store.account_dir())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o077, 0);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(store.account_dir())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
     }
 
     #[test]
