@@ -2122,17 +2122,19 @@ pub(crate) fn replace_same_dir(
         windows_replace_file(&prepared_path, &target_path, target_metadata.is_some())
             .map_err(MutationFailure::reconcile_required)?;
         if target_metadata.is_some() {
-            File::options()
-                .read(true)
-                .write(true)
-                .open(&target_path)
-                .and_then(|file| file.sync_all())
-                .map_err(|error| {
-                    MutationFailure::reconcile_required(anyhow!(error).context(format!(
-                        "failed to sync replaced target: {}",
-                        target_path.display()
-                    )))
-                })?;
+            retry_windows_sharing(|| {
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .open(&target_path)
+                    .and_then(|file| file.sync_all())
+            })
+            .map_err(|error| {
+                MutationFailure::reconcile_required(anyhow!(error).context(format!(
+                    "failed to sync replaced target: {}",
+                    target_path.display()
+                )))
+            })?;
         }
     }
 
@@ -2216,20 +2218,13 @@ pub(crate) fn move_same_dir(
 #[cfg(windows)]
 fn windows_replace_file(prepared: &Path, target: &Path, target_exists: bool) -> io::Result<()> {
     use std::ptr::null_mut;
-    use std::time::Duration;
-    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
     };
 
     let prepared_wide = wide_path(prepared);
     let target_wide = wide_path(target);
-    // Virus scanners and indexers may briefly open a newly written credential without
-    // FILE_SHARE_DELETE. A failed call with ERROR_SHARING_VIOLATION has not applied the
-    // rename, so a short bounded retry is safe. Every other error remains fail-closed.
-    const MAX_SHARING_RETRIES: usize = 50;
-    const SHARING_RETRY_DELAY: Duration = Duration::from_millis(10);
-    for attempt in 0..=MAX_SHARING_RETRIES {
+    retry_windows_sharing(|| {
         let succeeded = unsafe {
             if target_exists {
                 // ReplaceFileW's flags=0 is followed by an explicit read/write
@@ -2253,15 +2248,34 @@ fn windows_replace_file(prepared: &Path, target: &Path, target_exists: bool) -> 
             }
         };
         if succeeded {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION as i32)
-            || attempt == MAX_SHARING_RETRIES
-        {
-            return Err(error);
+    })
+}
+
+#[cfg(windows)]
+fn retry_windows_sharing<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+    // Virus scanners and indexers may briefly open a newly written credential without
+    // compatible sharing flags. A short bounded retry is safe only for the explicit Windows
+    // sharing error; every other error remains fail-closed.
+    const MAX_SHARING_RETRIES: usize = 100;
+    const SHARING_RETRY_DELAY: Duration = Duration::from_millis(10);
+    for attempt in 0..=MAX_SHARING_RETRIES {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+                    && attempt < MAX_SHARING_RETRIES =>
+            {
+                std::thread::sleep(SHARING_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
         }
-        std::thread::sleep(SHARING_RETRY_DELAY);
     }
     unreachable!("bounded Windows sharing retry loop always returns")
 }
@@ -2616,7 +2630,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_move_retries_a_transient_non_delete_sharing_handle() {
+    fn windows_mutations_retry_transient_non_delete_sharing_handles() {
         use std::os::windows::fs::OpenOptionsExt;
         use std::time::Duration;
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -2655,6 +2669,26 @@ mod tests {
                 .as_deref(),
             Some(&b"credential"[..])
         );
+
+        let destination_path = root.join("destination.bin");
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&destination_path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        retry_windows_sharing(|| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&destination_path)
+                .and_then(|file| file.sync_all())
+        })
+        .unwrap();
+        release.join().unwrap();
     }
 
     #[cfg(unix)]
