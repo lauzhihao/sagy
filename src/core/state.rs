@@ -41,6 +41,8 @@ pub enum CredentialRefKind {
     OauthAuthorizedUser,
     ApiKey,
     VertexServiceAccount,
+    AntigravityToken,
+    GeminiOauthSession,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,7 +262,10 @@ pub(crate) fn validate_state_invariants(state: &State) -> anyhow::Result<()> {
             let compatible = match account.account_type {
                 AccountType::OAuth => matches!(
                     reference.kind,
-                    CredentialRefKind::OauthAccessToken | CredentialRefKind::OauthAuthorizedUser
+                    CredentialRefKind::OauthAccessToken
+                        | CredentialRefKind::OauthAuthorizedUser
+                        | CredentialRefKind::AntigravityToken
+                        | CredentialRefKind::GeminiOauthSession
                 ),
                 AccountType::ApiKey => matches!(reference.kind, CredentialRefKind::ApiKey),
                 AccountType::Vertex => {
@@ -406,7 +411,7 @@ fn validate_managed_layout(
             }
         }
         AccountType::OAuth => match credential_kind {
-            CredentialRefKind::OauthAccessToken => {
+            CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken => {
                 if !matches!(layout.antigravity_token, SlotState::Exact { .. })
                     || !matches!(layout.gemini_authorized_user, SlotState::Absent)
                 {
@@ -415,7 +420,7 @@ fn validate_managed_layout(
                     );
                 }
             }
-            CredentialRefKind::OauthAuthorizedUser => {
+            CredentialRefKind::OauthAuthorizedUser | CredentialRefKind::GeminiOauthSession => {
                 if !matches!(layout.antigravity_token, SlotState::Absent)
                     || !matches!(layout.gemini_authorized_user, SlotState::Exact { .. })
                 {
@@ -458,5 +463,45 @@ mod tests {
         assert_eq!(deserialized, AccountType::OAuth);
         let api_key_type = AccountType::ApiKey;
         assert_eq!(api_key_type.as_str(), "api_key");
+    }
+
+    #[test]
+    fn provider_native_credential_ref_tags_are_oauth_compatible() {
+        assert_eq!(
+            serde_json::to_string(&CredentialRefKind::AntigravityToken).unwrap(),
+            "\"antigravity_token\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CredentialRefKind::GeminiOauthSession).unwrap(),
+            "\"gemini_oauth_session\""
+        );
+
+        let mut state = State {
+            version: STATE_V2_VERSION,
+            accounts: vec![AccountRecord {
+                id: "oauth-native".to_string(),
+                account_type: AccountType::OAuth,
+                ..Default::default()
+            }],
+            revision: 1,
+            ..Default::default()
+        };
+        state.credential_refs.insert(
+            "oauth-native".to_string(),
+            CredentialRef {
+                kind: CredentialRefKind::AntigravityToken,
+                fingerprint: format!("sha256:{}", "a".repeat(64)),
+            },
+        );
+        validate_state_invariants(&state).unwrap();
+
+        state.credential_refs.insert(
+            "oauth-native".to_string(),
+            CredentialRef {
+                kind: CredentialRefKind::GeminiOauthSession,
+                fingerprint: format!("sha256:{}", "b".repeat(64)),
+            },
+        );
+        validate_state_invariants(&state).unwrap();
     }
 }
