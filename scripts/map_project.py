@@ -9,7 +9,7 @@ OUTPUT_FILE = ".project_map"
 
 # 1. 强力去噪 (完全忽略)
 IGNORE_PATTERNS = [
-    ".git", ".idea", ".vscode", ".DS_Store",
+    ".git", ".idea", ".vscode", ".DS_Store", "target",
     "__pycache__", "*.pyc",
     "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico",
     "*.woff", "*.woff2", "*.ttf",
@@ -20,7 +20,6 @@ IGNORE_PATTERNS = [
 
 # 2. 定点强制折叠 (构建产物 / 大型生成目录)
 FORCE_COLLAPSE_PATHS = [
-    "target",               # Rust 编译产物
     ".gemini",              # Gemini 配置
     ".sagy",                # Sagy 本地配置
 ]
@@ -233,7 +232,7 @@ def main():
     content = [
         "# sagy Project Map",
         f"> Generated: {os.popen('date').read().strip()}",
-        "> Strategy: Source Focused (src expanded, target collapsed)",
+        "> Strategy: Source Focused (src expanded, build outputs omitted)",
         "",
         "## Package",
         "",

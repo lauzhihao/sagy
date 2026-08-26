@@ -28,12 +28,15 @@ You are a **Senior sagy Rust Engineer**, responsible for maintaining and extendi
 ## 2. Directory Layout & Architecture
 ```text
 .github/
+  actions/
+    setup-sagy-sandbox/
+      action.yml        # Cross-platform isolated Cargo/credential homes for CI jobs
   workflows/
     ci.yml              # PR/push gates: fmt, clippy, tests
     release.yml         # Cross-platform release build and publish pipeline
 backlog/
   README.md             # Backlog protocol, executor rules, current scoreboard
-  reviews/              # Cross-module audit reports and release-blocking gates
+  reviews/              # Cross-module audit reports, follow-ups, and release-blocking gates
   tasks/                # 1st generation tickets (narrative)
   tasks-v2/             # 2nd generation tickets (imperative)
   tasks-v3/             # 3rd generation tickets (current) + COMMON.md
@@ -78,7 +81,7 @@ src/
     storage.rs          # State dir resolution, repo-sync config, legacy helpers
     ui.rs               # Locale detection, ANSI tables and messages
     update.rs           # GitHub release download, checksum, self-replace
-tests/                  # Integration tests (p0_*/p1_*/p2_*, cli_routing, ci_workflow)
+tests/                  # Integration tests (p0_*/p1_*/p2_*, docs/CI consistency, Windows runtime)
 Cargo.toml
 Cargo.lock
 rust-toolchain.toml

@@ -42,6 +42,13 @@ fn assert_sandbox_is_wired_before_cargo(workflow: &str, job: &str) {
         checkout < sandbox,
         "{job} configures sandbox before checkout"
     );
+    let toolchain = block
+        .find("dtolnay/rust-toolchain@")
+        .unwrap_or_else(|| panic!("{job} does not configure the Rust toolchain"));
+    assert!(
+        sandbox < toolchain,
+        "{job} configures the Rust toolchain before the sandbox"
+    );
     let cargo = block
         .find("cargo ")
         .unwrap_or_else(|| panic!("{job} does not contain a cargo command"));
@@ -203,6 +210,14 @@ fn sandbox_action_sets_all_isolated_homes_on_both_platforms() {
     assert!(
         SANDBOX_ACTION.contains("shell: pwsh"),
         "sandbox action misses the Windows branch"
+    );
+    assert!(
+        SANDBOX_ACTION.contains("umask 077") && SANDBOX_ACTION.contains("mkdir -p --"),
+        "sandbox action does not create private Unix directories"
+    );
+    assert!(
+        SANDBOX_ACTION.contains("New-Item -ItemType Directory -Force"),
+        "sandbox action does not create Windows directories"
     );
 }
 

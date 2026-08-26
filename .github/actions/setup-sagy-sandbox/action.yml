@@ -9,7 +9,14 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        umask 077
         sandbox_root="${RUNNER_TEMP}/sagy-sandbox"
+        mkdir -p -- \
+          "${sandbox_root}/sagy-home" \
+          "${sandbox_root}/sagy-state" \
+          "${sandbox_root}/gemini-home" \
+          "${sandbox_root}/antigravity-config" \
+          "${sandbox_root}/cargo-home"
         {
           printf 'HOME=%s/sagy-home\n' "${sandbox_root}"
           printf 'SAGY_HOME=%s/sagy-state\n' "${sandbox_root}"
@@ -24,6 +31,16 @@ runs:
       run: |
         $ErrorActionPreference = "Stop"
         $sandboxRoot = Join-Path $env:RUNNER_TEMP "sagy-sandbox"
+        $sandboxPaths = @(
+          (Join-Path $sandboxRoot "sagy-home")
+          (Join-Path $sandboxRoot "sagy-state")
+          (Join-Path $sandboxRoot "gemini-home")
+          (Join-Path $sandboxRoot "antigravity-config")
+          (Join-Path $sandboxRoot "cargo-home")
+        )
+        foreach ($path in $sandboxPaths) {
+          New-Item -ItemType Directory -Force -Path $path | Out-Null
+        }
         @(
           "HOME=$sandboxRoot\sagy-home"
           "SAGY_HOME=$sandboxRoot\sagy-state"

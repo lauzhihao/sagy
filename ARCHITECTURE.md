@@ -100,12 +100,15 @@ tests/                     Integration tests (p0_*/p1_*/p2_*, cli_routing, ci_wo
   `ANTIGRAVITY_CONFIG_DIR` (default `~/.gemini/antigravity-cli`) and `GEMINI_HOME` (default
   `~/.gemini`).
 - **Child environment deny-list**: `launcher::configure_auth_environment` starts every launch by
-  removing exactly `GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_PROJECT`
-  from the child environment, then re-sets only what the selected credential requires
-  (`GEMINI_API_KEY` for API-key accounts, `GOOGLE_APPLICATION_CREDENTIALS` for Vertex service
-  accounts, `GOOGLE_CLOUD_PROJECT` when the account carries a project ID). This is a fixed
-  three-name deny-list, not deny-by-default: every other inherited variable, including
-  `GOOGLE_API_KEY` and `GOOGLE_GENAI_USE_VERTEXAI`, reaches `agy` unchanged.
+  removing the complete authentication surface maintained by `core::credential`:
+  `CLOUDSDK_AUTH_ACCESS_TOKEN`, `CLOUDSDK_CORE_PROJECT`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_ACCESS_TOKEN`, `GOOGLE_CLOUD_LOCATION`,
+  `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_QUOTA_PROJECT`, `GOOGLE_GENAI_USE_GCA`,
+  `GOOGLE_GENAI_USE_VERTEXAI`, and `GOOGLE_OAUTH_ACCESS_TOKEN`. It then rebuilds only
+  `GEMINI_API_KEY` for API-key accounts, `GOOGLE_APPLICATION_CREDENTIALS` for Vertex service
+  accounts, `GOOGLE_CLOUD_PROJECT` when the OAuth or Vertex account carries a project ID, and a
+  syntactically sanitized inherited `GOOGLE_CLOUD_LOCATION`. All other listed variables remain
+  absent from the child.
 
 ## 4. Credential Acquisition Boundary
 
@@ -116,10 +119,17 @@ prompt (`auth.rs`) into which the user pastes a token they already hold. A `refr
 refresh against Google. `health.rs` can only classify a credential as `RefreshRequired` - it never
 refreshes one.
 
+Google `authorized_user` material requires `client_id`, `client_secret`, and `refresh_token`.
+`token_uri` is optional at the ingestion boundary and is canonicalized internally to the exact
+`https://oauth2.googleapis.com/token` endpoint. Any explicitly different endpoint is rejected
+fail-closed. Adoption and import preserve the original active-home bytes; portable material and
+repo bundles serialize the canonical form, so omitted and canonical input have the same
+fingerprint.
+
 ## 5. Account Selection & Cooldown Policy
 
-1. **Fail-closed eligibility**: Every candidate must have a compatible State v2 credential reference and a locally verified fixed credential slot. Zero quota, active cooldown, invalid authentication, permission failures, and transient failures are ineligible.
-2. **Typed tiers**: A successful probe is `Primary`, a refreshable authorized-user credential is `Secondary`, and a locally verified but unprobed credential is `Fallback`. Small quota/plan/recency bonuses only order accounts inside those safety tiers.
+1. **Fail-closed eligibility**: Every candidate must have a compatible State v2 credential reference and a locally verified fixed credential slot. Zero quota, active cooldown, invalid authentication, permission failures, and explicit service rejection are ineligible.
+2. **Typed tiers**: A successful probe is `Primary`, a refreshable authorized-user credential is `Secondary`, and a locally verified but unprobed credential is `Fallback`. A locally validated credential whose probe channel failed through timeout, DNS, connection, proxy, or gateway errors is still selectable as the lowest `Degraded` tier. Small quota/plan/recency bonuses only order accounts inside those safety tiers.
 3. **Stickiness**: The current account is retained only when it passes the same eligibility predicate as every other candidate.
 4. **Automatic fallback**: Only a bounded, canonical Google JSON error from a failed `agy` child can establish `RESOURCE_EXHAUSTED`. The exact credential enters a bounded cooldown without further probes, and one launch can try at most three eligible accounts.
 
@@ -172,3 +182,15 @@ an injected and a user-supplied form of the same option are present.
 - **Cross-Host Workflow**:
   - `sagy push [repo]`: Exports local accounts, encrypts into bundle, commits and pushes to Git.
   - `sagy pull [repo]`: Clones repository, decrypts bundle, merges accounts into local state, and refreshes usage cache.
+
+## 9. CI and Release Boundary
+
+- Every GitHub Actions job that invokes Cargo first runs
+  `.github/actions/setup-sagy-sandbox/action.yml`. The composite action derives isolated
+  `HOME`, `SAGY_HOME`, `GEMINI_HOME`, `ANTIGRAVITY_CONFIG_DIR`, and `CARGO_HOME` paths at runner
+  runtime and creates those directories before Rust toolchain setup.
+- CI runs the Rust quality gate on Linux and the Windows runtime/checksum harness on a native
+  Windows runner. Release builds depend on the version guard, quality job, and Windows harness.
+- The publish job alone receives `contents: write`; third-party Actions are pinned to commit SHAs.
+- No GitHub Release exists yet. Source builds are the current installation path; installer and
+  updater downloads become usable only after the first separately approved tag/release.

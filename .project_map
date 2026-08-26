@@ -1,6 +1,6 @@
 # sagy Project Map
-> Generated: Tue Aug 25 18:42:18 CST 2026
-> Strategy: Source Focused (src expanded, target collapsed)
+> Generated: Wed Aug 26 17:30:54 CST 2026
+> Strategy: Source Focused (src expanded, build outputs omitted)
 
 ## Package
 
@@ -22,13 +22,17 @@
 ## Directory Structure
 ```text
 |-- [D] .github/
+|   |-- [D] actions/
+|   |   -- [D] setup-sagy-sandbox/
+|   |       -- [F] action.yml
 |   -- [D] workflows/
 |       |-- [F] ci.yml
 |       -- [F] release.yml
 |-- [D] backlog/
 |   |-- [D] reviews/
 |   |   |-- [F] 2026-08-24-full-code-review.md
-|   |   -- [F] 2026-08-25-post-refactor-audit.md
+|   |   |-- [F] 2026-08-25-post-refactor-audit.md
+|   |   -- [F] 2026-08-26-release-readiness-followup.md
 |   |-- [D] tasks/
 |   |   |-- [F] bugs-001-cargo-test-overwrites-real-credentials.md
 |   |   |-- [F] bugs-002-oauth-probe-blocks-launch.md
@@ -142,7 +146,6 @@
 |   |   -- [F] update.rs
 |   |-- [F] lib.rs
 |   -- [F] main.rs
-|-- [D] target/  [collapsed: 138056 files]
 |-- [D] tests/
 |   |-- [F] ci_workflow.rs
 |   |-- [F] cli_routing.rs
@@ -154,6 +157,7 @@
 |   |-- [F] p0_state_root_layout.rs
 |   |-- [F] p1_active_home_recovery.rs
 |   |-- [F] p1_auth_secret_input.rs
+|   |-- [F] p1_authorized_user_compat.rs
 |   |-- [F] p1_launch_observation.rs
 |   |-- [F] p1_launcher_auth_env.rs
 |   |-- [F] p1_legacy_migration.rs
@@ -162,6 +166,7 @@
 |   |-- [F] p1_refresh_token_preservation.rs
 |   |-- [F] p1_repo_sync_pool.rs
 |   |-- [F] p2_cli_surface.rs
+|   |-- [F] p2_docs_consistency.rs
 |   -- [F] windows_runtime.rs
 |-- [F] AGENTS.md
 |-- [F] ARCHITECTURE.md

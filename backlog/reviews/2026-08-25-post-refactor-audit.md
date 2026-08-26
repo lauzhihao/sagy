@@ -1,5 +1,8 @@
 # sagy 重构后全库审计报告（2026-08-25）
 
+> 本文保留 2026-08-25 基线的历史结论。2026-08-26 的 CI、authorized-user 兼容性与
+> 文档复核见[发布就绪跟进](./2026-08-26-release-readiness-followup.md)，当前状态以后者为准。
+
 ## 审查基线
 
 - 基线提交：`ec18dfc`（refactor(security): harden state and credential lifecycle）
@@ -236,6 +239,9 @@ gcloud 写出的 ADC 文件通常**不含** `token_uri`。该约束是 `ec18dfc`
 不是这三轮修复引入的，但需要拿真实的 `~/.gemini/oauth_creds.json` 核对一次，
 否则 `sagy import-auth` 可能拒绝真实凭据文件。
 
+**后续状态（2026-08-26）**：已关闭。缺失 `token_uri` 的 provider-valid 文档会在内部
+规范为 Google canonical endpoint；显式非 canonical endpoint 仍 fail-closed。
+
 ---
 
 ## 修复与验收结论（2026-08-25 收尾）
@@ -284,7 +290,7 @@ cargo test --all-targets                 20 个二进制 / 476 个测试 / 0 失
 | `t10-sync-commit.sh` | pull 协同提交的坏账号场景 | 5/8 | **8/8** |
 | `t11-first-run.sh` | HOME-002 | 2/10 | **10/10** |
 
-`backlog/verify/bugs-*.sh`（tasks-v2 遗留）中 7 个仍 FAIL，逐个核实**全部是脚本自身过期**：
+`backlog/verify/bugs-*.sh`（tasks-v2 遗留）中 8 个仍 FAIL，逐个核实**全部是脚本自身过期**：
 
 - `bugs-013` / `bugs-015`：把探测端点指向不可达地址后 15/15、7/7 全 PASS。
   线上失败是因为脚本用伪造 JWT，真实探测正确地拒绝了它。
@@ -307,9 +313,9 @@ cargo test --all-targets                 20 个二进制 / 476 个测试 / 0 失
 - 真实 429 只要伴随任意一份 401/403 形态文档，就会按"认证失效优先"丢失自动 fallback。
   这是刻意的取舍（更需要用户介入的结论优先），但代价未被测试固定。
 
-### 需要操作者确认的一条
+### 后续已关闭项
 
-`src/core/credential.rs:665` 要求 authorized-user 文档同时具备
-`client_id` / `client_secret` / `refresh_token` / `token_uri`。gcloud 写出的 ADC 文件通常不含
-`token_uri`。该约束是 `ec18dfc` 基线自带的，不是这四轮引入的，但需要拿真实的
-`~/.gemini/oauth_creds.json` 核对一次，否则 `sagy import-auth` 可能拒绝真实凭据文件。
+2026-08-26 已补齐 provider-valid authorized-user 兼容：`client_id`、`client_secret`、
+`refresh_token` 仍必填，缺失 `token_uri` 时内部规范为
+`https://oauth2.googleapis.com/token`；显式提供其它 endpoint 时拒绝。原始 active-home
+字节保持不变，portable/repo-sync 输出使用 canonical form。完整证据见后续发布就绪复核。

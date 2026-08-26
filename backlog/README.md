@@ -9,18 +9,26 @@ checksum fail-open、凭据同步失真、429 自动轮换不可达、state 并�
 2026-08-25 的重构后审计（基线 `ec18dfc`）又发现 3 个 P0、4 个 P1、10 个 P2 和一批 P3。
 这些条目**已于 2026-08-25 分四轮全部关闭**，复核提出的 6 个 blocker 与 15 个 major 也已全部修复。
 
+2026-08-26 的发布就绪跟进又关闭了 workflow 中非法提前求值 `runner.temp` 的问题、
+authorized-user 缺失 `token_uri` 的真实凭据兼容问题，以及 README/架构与 child auth env
+实现不一致的问题。当前本地门禁全绿；代码尚未 push，原生 Windows CI 证据仍待远端产生，
+且本轮不创建 tag 或 release。
+
 当前门禁与验收：
 
 ```text
-cargo fmt --check                         CLEAN
-cargo clippy --all-targets -- -D warnings CLEAN
-cargo test --all-targets                  20 个二进制 / 476 个测试 / 0 失败
-backlog/verify/t*.sh                      7 个脚本 / 72 项断言 / 全部 PASS
+cargo fmt --all -- --check                         CLEAN
+cargo check --all-targets --locked                 CLEAN
+cargo clippy --all-targets --locked -- -D warnings CLEAN
+cargo test --all-targets --locked                  22 个 test executable / 485 个测试 / 0 失败
+actionlint .github/workflows/*.yml                  CLEAN
+backlog/verify/t*.sh                                7 个脚本 / 72 项断言 / 全部 PASS
 ```
 
 完整的问题基线、修复过程、验收依据、已知残留见：
 
-- [2026-08-25 重构后全库审计报告](./reviews/2026-08-25-post-refactor-audit.md)（**当前基线，含修复与验收结论**）
+- [2026-08-26 发布就绪跟进](./reviews/2026-08-26-release-readiness-followup.md)（**当前状态与发布前剩余证据**）
+- [2026-08-25 重构后全库审计报告](./reviews/2026-08-25-post-refactor-audit.md)（历史修复与验收结论）
 - [2026-08-24 全库代码审查报告](./reviews/2026-08-24-full-code-review.md)（历史，已关闭项的出处）
 
 ## 目录结构
@@ -120,17 +128,20 @@ done
 
 ## 待执行工单
 
-无。`tasks-v3/` 的四轮工单（T1-T9、round2 R1-R9、round3 R10-R12、round4 R13）全部完成并验收。
-已知残留全部为 minor，列在审计报告的「已知残留」一节，需要时再单独开工单。
+实现工单已完成。发布前还需要把当前 exact commit 推到 GitHub，取得 Linux quality 与原生
+Windows runtime/checksum jobs 的绿色证据；本轮不执行 tag/release。Vertex service-account
+文档的 `token_uri` endpoint 信任策略是独立 security review 项，不随 authorized-user
+兼容修改扩 scope。其它已知残留仍为 minor，列在两份最新 review 中。
 
 自检命令统一为：
 
 ```bash
 export ANTIGRAVITY_CONFIG_DIR=/tmp/sagy-canary
 export GEMINI_HOME=/tmp/sagy-canary
-cargo fmt
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo fmt --all -- --check
+cargo check --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
 for s in t1-state-root t2-migration t4-repo-sync t6-offline t7-cli t10-sync-commit t11-first-run; do
   printf '%-18s ' "$s"; bash backlog/verify/$s.sh 2>&1 | grep -E '^RESULT'
 done

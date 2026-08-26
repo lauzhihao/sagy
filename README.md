@@ -10,6 +10,9 @@ This repository contains only open-source code and never contains private accoun
 
 ## 1. Installation
 
+> No GitHub Release has been published yet. Until the first release exists, the one-click
+> installers and `sagy update` cannot download a binary; build from source as shown below.
+
 ### Unix (macOS / Linux):
 
 ```bash
@@ -84,6 +87,16 @@ sagy also never exchanges a `refresh_token` for a fresh access token. A `refresh
 `authorized_user` document is stored, synchronized, and handed to `agy` unchanged; any refresh is
 performed by `agy` itself against Google. When a probe reports an expired authorized-user
 credential, sagy only marks the account as needing a refresh - it does not perform one.
+
+For Google `authorized_user` JSON, `client_id`, `client_secret`, and `refresh_token` are required.
+`token_uri` may be omitted; sagy canonicalizes it internally to
+`https://oauth2.googleapis.com/token`. An explicitly supplied different endpoint is rejected
+fail-closed. Imported active-home bytes are preserved unchanged, while portable or repo-sync
+serialization uses the canonical endpoint.
+
+If a timeout, DNS failure, connection refusal, proxy failure, or gateway failure makes only the
+probe channel unreachable, a locally validated credential remains selectable in the lowest
+`Degraded` tier. An explicit credential rejection from the service remains ineligible.
 
 ### Session Resume
 
@@ -235,19 +248,28 @@ Installer-only variables:
 
 ### Environment Handed To The `agy` Child
 
-The child `agy` process inherits the parent environment, except that every launch first clears the
-three authentication variables below so a parent shell or a previously selected account cannot
-contribute credentials. Each is then re-set only when the selected account actually needs it:
+Every launch first removes the complete authentication surface below so a parent shell or a
+previously selected account cannot contribute credentials:
 
-| Variable | Always cleared before launch | Re-set by sagy when |
-| :--- | :--- | :--- |
-| `GEMINI_API_KEY` | yes | the selected account is an API-key account |
-| `GOOGLE_APPLICATION_CREDENTIALS` | yes | the selected account is a Vertex service account |
-| `GOOGLE_CLOUD_PROJECT` | yes | the account carries a project ID (OAuth and Vertex accounts) |
+```text
+CLOUDSDK_AUTH_ACCESS_TOKEN
+CLOUDSDK_CORE_PROJECT
+GEMINI_API_KEY
+GOOGLE_API_KEY
+GOOGLE_APPLICATION_CREDENTIALS
+GOOGLE_CLOUD_ACCESS_TOKEN
+GOOGLE_CLOUD_LOCATION
+GOOGLE_CLOUD_PROJECT
+GOOGLE_CLOUD_QUOTA_PROJECT
+GOOGLE_GENAI_USE_GCA
+GOOGLE_GENAI_USE_VERTEXAI
+GOOGLE_OAUTH_ACCESS_TOKEN
+```
 
-The list is an explicit deny-list of exactly these three names. Any other Google-related variable
-in your shell (for example `GOOGLE_API_KEY` or `GOOGLE_GENAI_USE_VERTEXAI`) is inherited by `agy`
-unchanged, so unset it yourself if it must not influence the child.
+sagy then rebuilds only the values needed for this launch: `GEMINI_API_KEY` for an API-key
+account, `GOOGLE_APPLICATION_CREDENTIALS` for a Vertex service account,
+`GOOGLE_CLOUD_PROJECT` when the OAuth or Vertex account carries a project ID, and a sanitized
+`GOOGLE_CLOUD_LOCATION` inherited from the parent. The other listed variables stay absent.
 
 `ANTIGRAVITY_CONFIG_DIR` and `GEMINI_HOME` are also the credential sandbox used when developing:
 point both at a scratch directory before running `cargo test`, otherwise the test suite writes over

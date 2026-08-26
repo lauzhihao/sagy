@@ -10,6 +10,9 @@
 
 ## 一、安装
 
+> 当前尚未发布 GitHub Release。在首个 release 产生之前，一键安装脚本和 `sagy update`
+> 无法下载二进制；目前请使用下方的源码编译方式。
+
 ### Unix (macOS / Linux):
 
 ```bash
@@ -83,6 +86,14 @@ cargo build --release
 sagy 同样不会拿 `refresh_token` 去换新的 access token。`authorized_user` 文档里的 `refresh_token`
 只被原样保存、同步并交给 `agy`，真正的刷新由 `agy` 自己向 Google 发起。探测发现 authorized_user
 凭据过期时，sagy 只把账号标记为"需要刷新"，不会代为刷新。
+
+Google `authorized_user` JSON 必须包含 `client_id`、`client_secret` 与 `refresh_token`。
+`token_uri` 可以省略；sagy 会在内部将其规范化为
+`https://oauth2.googleapis.com/token`。如果显式提供了其它 endpoint，则按 fail-closed
+原则拒绝。active home 中导入的原始字节保持不变，portable 与 repo-sync 序列化使用规范 endpoint。
+
+若 timeout、DNS 失败、连接拒绝、代理失败或网关失败仅说明探测通道不可达，且凭据已在本地校验，
+该账号仍可在最低的 `Degraded` 等级参与选择；服务端明确拒绝凭据时仍不可选。
 
 ### 会话续接规则
 
@@ -228,18 +239,27 @@ host key 校验**默认开启**：sagy 不会削弱 SSH 的默认行为，遇到
 
 ### 传给 `agy` 子进程的环境
 
-子进程 `agy` 继承父进程环境，但每次启动都会先清掉下面三个认证变量，
-避免父 shell 或上一个账号把凭据带进来；随后只在选中账号确实需要时才重新设置：
+每次启动都会先清除下面完整的认证面，避免父 shell 或上一个账号把凭据带进来：
 
-| 变量 | 启动前必定清除 | sagy 何时重新设置 |
-| :--- | :--- | :--- |
-| `GEMINI_API_KEY` | 是 | 选中账号是 API key 账号 |
-| `GOOGLE_APPLICATION_CREDENTIALS` | 是 | 选中账号是 Vertex service account |
-| `GOOGLE_CLOUD_PROJECT` | 是 | 账号带 project ID（OAuth 与 Vertex 账号） |
+```text
+CLOUDSDK_AUTH_ACCESS_TOKEN
+CLOUDSDK_CORE_PROJECT
+GEMINI_API_KEY
+GOOGLE_API_KEY
+GOOGLE_APPLICATION_CREDENTIALS
+GOOGLE_CLOUD_ACCESS_TOKEN
+GOOGLE_CLOUD_LOCATION
+GOOGLE_CLOUD_PROJECT
+GOOGLE_CLOUD_QUOTA_PROJECT
+GOOGLE_GENAI_USE_GCA
+GOOGLE_GENAI_USE_VERTEXAI
+GOOGLE_OAUTH_ACCESS_TOKEN
+```
 
-这份 deny-list 精确只有这三个名字。你 shell 里其它 Google 相关变量
-（例如 `GOOGLE_API_KEY`、`GOOGLE_GENAI_USE_VERTEXAI`）会被 `agy` 原样继承，
-不希望它们影响子进程就得自己 unset。
+随后只重建本次启动需要的值：API key 账号写入 `GEMINI_API_KEY`，Vertex service account
+写入 `GOOGLE_APPLICATION_CREDENTIALS`，OAuth 或 Vertex 账号带 project ID 时写入
+`GOOGLE_CLOUD_PROJECT`，父进程的 `GOOGLE_CLOUD_LOCATION` 只有通过 region 格式校验后才会写回。
+清单中的其它变量保持不存在。
 
 `ANTIGRAVITY_CONFIG_DIR` 与 `GEMINI_HOME` 同时也是开发期的凭据沙箱：跑 `cargo test`
 之前必须把两者指向临时目录，否则测试会覆盖你 `~/.gemini` 里的真实凭据。
