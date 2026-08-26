@@ -4065,7 +4065,7 @@ mod tests {
             "client_id": "client",
             "client_secret": "secret",
             "refresh_token": "refresh",
-            "token_uri": "https://example.test/token",
+            "token_uri": "https://oauth2.googleapis.com/token",
             "access_token": "new-token",
             "unknown": "preserve"
         }))
@@ -4129,7 +4129,7 @@ mod tests {
             "client_id": "client",
             "client_secret": "secret",
             "refresh_token": "refresh",
-            "token_uri": "https://example.test/token"
+            "token_uri": "https://oauth2.googleapis.com/token"
         }))
         .unwrap();
         let staged = store.stage(Uuid::new_v4(), &authorized).unwrap();
@@ -4219,7 +4219,7 @@ mod tests {
             "client_id": "client",
             "client_secret": "secret",
             "refresh_token": "refresh",
-            "token_uri": "https://example.test/token"
+            "token_uri": "https://oauth2.googleapis.com/token"
         }))
         .unwrap();
         fs::write(store.account_dir().join(TOKEN_FILENAME), b"raw-token").unwrap();
@@ -4251,7 +4251,7 @@ mod tests {
             "client_id": "client",
             "client_secret": "secret",
             "refresh_token": "refresh",
-            "token_uri": "https://example.test/token"
+            "token_uri": "https://oauth2.googleapis.com/token"
         }))
         .unwrap();
         fs::write(store.account_dir().join(TOKEN_FILENAME), b"raw-token").unwrap();

@@ -29,6 +29,7 @@ pub const MAX_CREDENTIAL_CONTAINER_ITEMS: usize = 256;
 
 const MAX_CREDENTIAL_VALUES: usize = 4096;
 const FINGERPRINT_DOMAIN: &[u8] = b"sagy-portable-credential\0v1\0";
+const CANONICAL_OAUTH2_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 
 /// Every Google authentication variable a launched child must never inherit.
 ///
@@ -378,7 +379,8 @@ impl PortableCredential {
         format!("sha256:{:x}", digest.finalize())
     }
 
-    fn new(payload: CredentialPayload) -> Result<Self, CredentialError> {
+    fn new(mut payload: CredentialPayload) -> Result<Self, CredentialError> {
+        normalize_payload(&mut payload)?;
         let credential = Self {
             schema_version: CREDENTIAL_SCHEMA_VERSION,
             payload,
@@ -428,8 +430,9 @@ impl PortableCredential {
 
     fn new_with_version(
         schema_version: u32,
-        payload: CredentialPayload,
+        mut payload: CredentialPayload,
     ) -> Result<Self, CredentialError> {
+        normalize_payload(&mut payload)?;
         let credential = Self {
             schema_version,
             payload,
@@ -650,6 +653,43 @@ fn validate_payload(
         }
     }
     Ok(())
+}
+
+/// 在 PortableCredential 汇合点规范化 provider-native 文档。
+///
+/// 较早客户端写出的 Google `authorized_user` 文件可能缺少 `token_uri`；provider
+/// 的 canonical endpoint 是确定的，因此 portable value 只在这里补一次，后续
+/// portable/repository serialization 都输出同一份文档。显式 endpoint 只有逐字节
+/// 等于 canonical 值时才接受，未知 token exchange destination 一律 fail-closed。
+fn normalize_payload(payload: &mut CredentialPayload) -> Result<(), CredentialError> {
+    if let CredentialPayload::OAuthAuthorizedUser(document) = payload {
+        normalize_authorized_user(document)?;
+    }
+    Ok(())
+}
+
+fn normalize_authorized_user(document: &mut Map<String, Value>) -> Result<(), CredentialError> {
+    match document.get("token_uri") {
+        None => {
+            document.insert(
+                "token_uri".to_string(),
+                Value::String(CANONICAL_OAUTH2_TOKEN_URI.to_string()),
+            );
+            Ok(())
+        }
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or(CredentialError::InvalidFieldType("token_uri"))?;
+            if value.is_empty() {
+                return Err(CredentialError::EmptyField("token_uri"));
+            }
+            if value != CANONICAL_OAUTH2_TOKEN_URI {
+                return Err(CredentialError::InvalidFieldType("token_uri"));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_authorized_user(
@@ -931,7 +971,7 @@ mod tests {
             "client_id": "client-id",
             "client_secret": "client-secret",
             "refresh_token": "refresh-token",
-            "token_uri": "https://oauth2.example.test/token",
+            "token_uri": "https://oauth2.googleapis.com/token",
             "unknown_nested": {"preserve": [true, 7, null]}
         })
     }
@@ -1035,7 +1075,7 @@ mod tests {
                 "client_id": "client",
                 "client_secret": "",
                 "refresh_token": "refresh",
-                "token_uri": "https://example.test/token"
+                "token_uri": "https://oauth2.googleapis.com/token"
             })),
             Err(CredentialError::EmptyField("client_secret"))
         ));
@@ -1044,7 +1084,7 @@ mod tests {
                 "type": "authorized_user",
                 "client_id": "client",
                 "client_secret": "secret",
-                "token_uri": "https://example.test/token"
+                "token_uri": "https://oauth2.googleapis.com/token"
             })),
             Err(CredentialError::MissingField("refresh_token"))
         ));
@@ -1084,7 +1124,7 @@ mod tests {
         ));
         assert!(matches!(
             PortableCredential::parse_oauth_authorized_user_json(
-                r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://example.test/token","api_key":"ambiguous"}"#
+                r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://oauth2.googleapis.com/token","api_key":"ambiguous"}"#
             ),
             Err(CredentialError::AmbiguousSecret)
         ));

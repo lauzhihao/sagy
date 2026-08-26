@@ -1027,7 +1027,7 @@ mod tests {
                     "client_id": "client-id",
                     "client_secret": "client-secret",
                     "refresh_token": "refresh-secret",
-                    "token_uri": "https://oauth.example.test/token",
+                    "token_uri": "https://oauth2.googleapis.com/token",
                     "unknown_provider_field": {"enabled": true}
                 }))
                 .unwrap(),
@@ -1177,7 +1177,7 @@ mod tests {
             "client_id": "client-id",
             "client_secret": "client-secret",
             "refresh_token": "refresh-secret",
-            "token_uri": "https://oauth.example.test/token"
+            "token_uri": "https://oauth2.googleapis.com/token"
         });
         for _ in 0..(MAX_BUNDLE_NESTING_DEPTH + 2) {
             nested = json!({"nested": nested});

@@ -2216,7 +2216,7 @@ mod tests {
             "client_secret": "secret",
             "access_token": "ya29.sample",
             "refresh_token": "1//sample",
-            "token_uri": "https://oauth2.example.test/token"
+            "token_uri": "https://oauth2.googleapis.com/token"
         });
         assert!(is_valid_oauth_credential(&valid_oauth));
 
@@ -2472,7 +2472,7 @@ mod tests {
         let native = temp.path().join("authorized.json");
         fs::write(
             &native,
-            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://example.test/token","unknown":"keep"}"#,
+            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://oauth2.googleapis.com/token","unknown":"keep"}"#,
         )
         .expect("write native credential");
         let native_record = adapter
@@ -2500,7 +2500,7 @@ mod tests {
         let authorized_path = temp.path().join("authorized.json");
         fs::write(
             &authorized_path,
-            r#"{"type":"authorized_user","email":"user@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_uri":"https://example.test/token","unknown":"keep"}"#,
+            r#"{"type":"authorized_user","email":"user@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_uri":"https://oauth2.googleapis.com/token","unknown":"keep"}"#,
         )
         .expect("write authorized credential");
         let merged = adapter
@@ -2567,7 +2567,7 @@ mod tests {
         fs::create_dir_all(&account_dir).expect("create legacy account directory");
         fs::write(
             account_dir.join("credentials.json"),
-            r#"{"type":"authorized_user","email":"legacy@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_uri":"https://example.test/token","access_token":"old-access","unknown":"keep"}"#,
+            r#"{"type":"authorized_user","email":"legacy@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","token_uri":"https://oauth2.googleapis.com/token","access_token":"old-access","unknown":"keep"}"#,
         )
         .expect("write legacy credential");
         fs::write(
@@ -2618,7 +2618,7 @@ mod tests {
         fs::create_dir_all(&account_dir).expect("create legacy account directory");
         fs::write(
             account_dir.join("credentials.json"),
-            r#"{"type":"authorized_user","email":"legacy-only@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh-only","access_token":"old-access","token_uri":"https://example.test/token"}"#,
+            r#"{"type":"authorized_user","email":"legacy-only@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh-only","access_token":"old-access","token_uri":"https://oauth2.googleapis.com/token"}"#,
         )
         .expect("write legacy credential");
         fs::write(
@@ -2783,7 +2783,7 @@ mod tests {
         fs::create_dir_all(&account_dir).expect("create account dir");
         fs::write(
             account_dir.join("credentials.json"),
-            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://example.test/token"}"#,
+            r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r","token_uri":"https://oauth2.googleapis.com/token"}"#,
         )
         .expect("write authorized credential");
         fs::write(account_dir.join("antigravity-oauth-token"), "new-access")
@@ -2864,7 +2864,7 @@ mod tests {
         let authorized_path = temp.path().join("authorized.json");
         fs::write(
             &authorized_path,
-            r#"{"type":"authorized_user","email":"authorized@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","access_token":"authorized-access","token_uri":"https://example.test/token"}"#,
+            r#"{"type":"authorized_user","email":"authorized@example.com","client_id":"client","client_secret":"secret","refresh_token":"refresh","access_token":"authorized-access","token_uri":"https://oauth2.googleapis.com/token"}"#,
         )
         .expect("write authorized credential");
         let authorized = adapter

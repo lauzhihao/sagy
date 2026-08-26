@@ -258,7 +258,7 @@ fn child_auth_environment_is_rebuilt_for_each_account_type() {
     assert!(oauth_path.exists());
 
     let authorized = Harness::new();
-    let authorized_document = r#"{"type":"authorized_user","client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token","token_uri":"https://oauth2.example.test/token"}"#;
+    let authorized_document = r#"{"type":"authorized_user","client_id":"client-id","client_secret":"client-secret","refresh_token":"refresh-token","token_uri":"https://oauth2.googleapis.com/token"}"#;
     authorized.write_credentials(
         "authorized-account",
         "credentials.json",

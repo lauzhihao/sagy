@@ -3269,7 +3269,7 @@ mod tests {
                     "client_id": "client",
                     "client_secret": "client-secret",
                     "refresh_token": "refresh-secret",
-                    "token_uri": "https://oauth.example.test/token"
+                    "token_uri": "https://oauth2.googleapis.com/token"
                 }))
                 .unwrap(),
             ),

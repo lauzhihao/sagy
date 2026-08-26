@@ -1138,7 +1138,7 @@ mod tests {
             "client_id": "client",
             "client_secret": "secret",
             "refresh_token": "refresh",
-            "token_uri": "https://oauth2.example/token",
+            "token_uri": "https://oauth2.googleapis.com/token",
             "access_token": "ya29.access"
         });
         for (id, credential, expected) in [
