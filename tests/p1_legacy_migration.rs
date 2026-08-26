@@ -4,7 +4,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sagy::core::credential::PortableCredential;
 use sagy::core::storage;
@@ -47,7 +49,10 @@ impl Harness {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sagy"))
+        const RUN_DEADLINE: Duration = Duration::from_secs(20);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+        command
             .env("HOME", &self.home_dir)
             .env("SAGY_HOME", &self.state_dir)
             .env("ANTIGRAVITY_CONFIG_DIR", self.home_dir.join("antigravity"))
@@ -57,8 +62,34 @@ impl Harness {
             .arg("--state-dir")
             .arg(&self.state_dir)
             .args(args)
-            .output()
-            .expect("run sagy")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().expect("spawn sagy test subprocess");
+        let deadline = Instant::now() + RUN_DEADLINE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child
+                        .wait_with_output()
+                        .expect("collect sagy test subprocess output");
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("sagy test subprocess exceeded its deadline");
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("failed to observe sagy test subprocess status");
+                }
+            }
+        }
     }
 
     fn state_document(&self) -> Value {
@@ -594,7 +625,7 @@ fn upgraded_api_key_account_is_reused_even_with_a_different_email() {
 // -------------------------------------------------------------------------
 // AC-R2-2: the interactive branch must fail before it asks for the secret.
 
-const OAUTH_SECRET_PROMPT: &str = "Paste your Antigravity OAuth Token";
+const HIDDEN_TOKEN_PROMPT: &str = "Paste your Antigravity OAuth Token";
 
 #[test]
 fn interactive_add_reports_a_cross_kind_conflict_before_prompting_for_a_secret() {
@@ -608,8 +639,8 @@ fn interactive_add_reports_a_cross_kind_conflict_before_prompting_for_a_secret()
     ]);
     assert_exit_zero(&added, "API-key import");
 
-    // 真实的交互路径：不带 --token/--api-key 的 `sagy add` 会走 rpassword 提示。
-    // Command::output() 把 stdin 接到 /dev/null，等价于用户还没来得及输入。
+    // 真实的交互路径：不带 --token/--api-key 的 `sagy add` 会走隐藏输入提示。
+    // Harness 将 stdin 显式接到 null，等价于用户还没来得及输入。
     let output = harness.run(&["add", "--email", "clash@example.test"]);
     assert_ne!(
         output.status.code(),
@@ -619,7 +650,7 @@ fn interactive_add_reports_a_cross_kind_conflict_before_prompting_for_a_secret()
     let stdout = stdout_of(&output);
     // AC-R2-2.1: 提示语一次都不能出现。
     assert!(
-        !stdout.contains(OAUTH_SECRET_PROMPT),
+        !stdout.contains(HIDDEN_TOKEN_PROMPT),
         "the secret prompt must never be shown for a conflicting email\n{stdout}"
     );
     // AC-R2-2.2: 错误必须点名冲突对象与下一步。
@@ -639,18 +670,6 @@ fn interactive_add_reports_a_cross_kind_conflict_before_prompting_for_a_secret()
             .expect("accounts array")
             .len(),
         1
-    );
-}
-
-#[test]
-fn interactive_add_still_reaches_the_prompt_without_a_conflict() {
-    // 反面对照：没有冲突时前置检查不得吃掉正常的交互路径。
-    let harness = Harness::new();
-    let output = harness.run(&["add", "--email", "fresh@example.test"]);
-    assert!(
-        stdout_of(&output).contains(OAUTH_SECRET_PROMPT),
-        "a conflict-free interactive add must still ask for the secret\n{}",
-        stdout_of(&output)
     );
 }
 

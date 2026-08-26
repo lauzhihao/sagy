@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 
 use crate::adapters::antigravity::account::{MutationResult, ensure_import_kind_compatible};
 use crate::core::credential::CredentialKind;
-use crate::core::state::AccountRecord;
+use crate::core::state::{AccountRecord, State};
 use crate::core::state_store::StateSession;
 
 #[derive(Clone)]
@@ -76,22 +76,13 @@ impl super::AntigravityAdapter {
         match mode {
             LoginMode::OAuth { email_hint } => {
                 let email = email_hint.unwrap_or("antigravity-user@google.com");
-                // 跨类型冲突必须在提示粘贴 secret **之前**发现。原来的顺序是
-                // 先读完 token 再进 import 才检查，用户白粘一次不说，secret 也
-                // 已经进过终端和进程内存。检查是纯只读函数，可以安全前置。
-                ensure_import_kind_compatible(
-                    session.state(),
-                    email,
-                    CredentialKind::OAuthAccessToken,
-                )?;
-                println!("Paste your Antigravity OAuth Token (or Google Token):");
-                let token_input = rpassword::prompt_password("> ")?;
-                let token = validate_secret_input(&token_input)?;
+                let token =
+                    acquire_hidden_token(session.state(), email, rpassword::prompt_password)?;
                 self.import_or_update_token_session(
                     state_dir,
                     session,
                     email,
-                    token,
+                    &token,
                     Some("Antigravity OAuth"),
                 )
             }
@@ -120,9 +111,27 @@ impl super::AntigravityAdapter {
     }
 }
 
+/// Acquire a token through the hidden-input path with an injectable prompt seam.
+///
+/// The ordering here is security-sensitive: reject a cross-kind email
+/// collision before printing or reading any secret, then keep the product
+/// prompt and validation around the one production hidden-input call.
+fn acquire_hidden_token<P>(state: &State, email: &str, prompt_secret: P) -> Result<String>
+where
+    P: FnOnce(&'static str) -> std::io::Result<String>,
+{
+    ensure_import_kind_compatible(state, email, CredentialKind::OAuthAccessToken)?;
+    println!("Paste your Antigravity OAuth Token (or Google Token):");
+    let token_input = prompt_secret("> ")?;
+    Ok(validate_secret_input(&token_input)?.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LoginMode, validate_secret_input};
+    use std::cell::Cell;
+
+    use super::{LoginMode, acquire_hidden_token, validate_secret_input};
+    use crate::core::state::{AccountRecord, AccountType, State};
 
     #[test]
     fn secret_input_rejects_empty_and_whitespace() {
@@ -156,5 +165,45 @@ mod tests {
         );
         assert!(!api_key_debug.contains("also-do-not-print"));
         assert!(api_key_debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn hidden_token_conflict_rejects_before_secret_prompt() {
+        let state = State {
+            accounts: vec![AccountRecord {
+                id: "occupying-account".to_string(),
+                email: "clash@example.test".to_string(),
+                account_type: AccountType::ApiKey,
+                ..AccountRecord::default()
+            }],
+            ..State::default()
+        };
+
+        let result = acquire_hidden_token(&state, "clash@example.test", |_| {
+            panic!("hidden token prompt must not run on a kind conflict")
+        });
+        let error = result
+            .expect_err("cross-kind conflict must fail")
+            .to_string();
+        assert!(error.contains("clash@example.test"));
+        assert!(error.contains("api_key"));
+    }
+
+    #[test]
+    fn hidden_token_prompt_seam_runs_once_with_the_product_prompt() {
+        let state = State::default();
+        let calls = Cell::new(0);
+        let mut prompt_seen = String::new();
+
+        let result = acquire_hidden_token(&state, "fresh@example.test", |prompt| {
+            calls.set(calls.get() + 1);
+            prompt_seen.push_str(prompt);
+            Ok(String::from("synthetic-token"))
+        });
+
+        let token = result.expect("the injected token must pass validation");
+        assert_eq!(token, "synthetic-token");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(prompt_seen, "> ");
     }
 }
