@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -1024,6 +1025,9 @@ fn scan_known_oauth_source() -> Result<Option<(PortableCredential, Vec<u8>, Stri
         .filter(|path| path.exists())
         .map(|path| {
             let bytes = read_import_source(&path)?;
+            if is_provider_managed_session(&bytes) {
+                return Err(anyhow::Error::new(ProviderManagedSession));
+            }
             let (credential, _) = parse_import_source(&bytes)?;
             if credential.kind() != CredentialKind::OAuthAuthorizedUser {
                 bail!("known oauth_creds.json is not an authorized-user credential")
@@ -1055,6 +1059,84 @@ fn scan_known_oauth_source() -> Result<Option<(PortableCredential, Vec<u8>, Stri
         .or(active_email)
         .unwrap_or_else(|| "antigravity-user@gemini".to_string());
     Ok(Some((credential, material, email)))
+}
+
+/// A provider-native Gemini session is not an authorized-user document.  Its
+/// refresh lifecycle may be owned by the provider's system credential store,
+/// so treating it as portable OAuth would either lose the owner metadata or
+/// make sagy responsible for refreshing a credential it cannot safely manage.
+/// Keep this error private: callers only need the actionable, secret-free
+/// message and the public credential schema must not grow for an unsupported
+/// provider format.
+#[derive(Debug, Clone, Copy)]
+struct ProviderManagedSession;
+
+impl fmt::Display for ProviderManagedSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "known oauth_creds.json is a provider-managed session; sagy cannot safely import or switch it because its credential may be managed by the system credential store; run `agy` directly",
+        )
+    }
+}
+
+impl std::error::Error for ProviderManagedSession {}
+
+/// Recognize only the provider's six-field session shape.  This deliberately
+/// does not return a credential or copy any field into an error.  Empty
+/// `id_token` and `scope` are accepted because the provider emits them that
+/// way for some sessions; access/refresh tokens remain required and bounded.
+fn is_provider_managed_session(bytes: &[u8]) -> bool {
+    const FIELDS: [&str; 6] = [
+        "access_token",
+        "expiry_date",
+        "id_token",
+        "refresh_token",
+        "scope",
+        "token_type",
+    ];
+
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    let Some(document) = value.as_object() else {
+        return false;
+    };
+    if document.len() != FIELDS.len()
+        || document
+            .keys()
+            .any(|field| !FIELDS.contains(&field.as_str()))
+    {
+        return false;
+    }
+
+    let bounded_nonempty = |field: &str| {
+        document
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= crate::core::credential::MAX_CREDENTIAL_FIELD_BYTES
+            })
+    };
+    let bounded_maybe_empty = |field: &str| {
+        document
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() <= crate::core::credential::MAX_CREDENTIAL_FIELD_BYTES)
+    };
+
+    bounded_nonempty("access_token")
+        && document
+            .get("expiry_date")
+            .and_then(Value::as_u64)
+            .is_some()
+        && bounded_maybe_empty("id_token")
+        && bounded_nonempty("refresh_token")
+        && bounded_maybe_empty("scope")
+        && document
+            .get("token_type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "Bearer")
 }
 
 fn read_import_source(path: &Path) -> Result<Vec<u8>> {
