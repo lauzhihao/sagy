@@ -2216,37 +2216,54 @@ pub(crate) fn move_same_dir(
 #[cfg(windows)]
 fn windows_replace_file(prepared: &Path, target: &Path, target_exists: bool) -> io::Result<()> {
     use std::ptr::null_mut;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
     };
 
     let prepared_wide = wide_path(prepared);
     let target_wide = wide_path(target);
-    let succeeded = unsafe {
-        if target_exists {
-            // ReplaceFileW's flags=0 is followed by an explicit read/write
-            // handle sync, because write-through is not reliable on every FS.
-            ReplaceFileW(
-                target_wide.as_ptr(),
-                prepared_wide.as_ptr(),
-                std::ptr::null(),
-                0,
-                null_mut(),
-                null_mut(),
-            ) != 0
-        } else {
-            MoveFileExW(
-                prepared_wide.as_ptr(),
-                target_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            ) != 0
+    // Virus scanners and indexers may briefly open a newly written credential without
+    // FILE_SHARE_DELETE. A failed call with ERROR_SHARING_VIOLATION has not applied the
+    // rename, so a short bounded retry is safe. Every other error remains fail-closed.
+    const MAX_SHARING_RETRIES: usize = 50;
+    const SHARING_RETRY_DELAY: Duration = Duration::from_millis(10);
+    for attempt in 0..=MAX_SHARING_RETRIES {
+        let succeeded = unsafe {
+            if target_exists {
+                // ReplaceFileW's flags=0 is followed by an explicit read/write
+                // handle sync, because write-through is not reliable on every FS.
+                ReplaceFileW(
+                    target_wide.as_ptr(),
+                    prepared_wide.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    null_mut(),
+                    null_mut(),
+                ) != 0
+            } else {
+                // The destination was validated as absent. Omitting REPLACE_EXISTING makes a
+                // racing destination fail instead of overwriting an unrecognized file.
+                MoveFileExW(
+                    prepared_wide.as_ptr(),
+                    target_wide.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                ) != 0
+            }
+        };
+        if succeeded {
+            return Ok(());
         }
-    };
-    if succeeded {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION as i32)
+            || attempt == MAX_SHARING_RETRIES
+        {
+            return Err(error);
+        }
+        std::thread::sleep(SHARING_RETRY_DELAY);
     }
+    unreachable!("bounded Windows sharing retry loop always returns")
 }
 
 #[cfg(windows)]
@@ -2594,6 +2611,49 @@ mod tests {
         assert_eq!(
             fs::metadata(&root).unwrap().permissions().mode() & 0o777,
             root_mode_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_move_retries_a_transient_non_delete_sharing_handle() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::Duration;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = root_path(&temp, "windows-sharing");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("unrelated.bin"), b"keep").unwrap();
+        let normalized = NormalizedStoreRoot::normalize(&root).unwrap();
+        let lock = SafeRelativePath::new(Path::new(".sagy-external.lock")).unwrap();
+        let capability = ExternalDirectoryCapability::claim_or_adopt(normalized, lock).unwrap();
+        let source = SafeRelativePath::new(Path::new("source.bin")).unwrap();
+        let destination = SafeRelativePath::new(Path::new("destination.bin")).unwrap();
+        let mut staged = capability.create_new(&source).unwrap();
+        std::io::Write::write_all(&mut staged, b"credential").unwrap();
+        staged.sync_all().unwrap();
+        drop(staged);
+
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(root.join("source.bin"))
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+
+        capability.move_file(&source, &destination).unwrap();
+        release.join().unwrap();
+        assert!(capability.inspect(&source, true).unwrap().is_none());
+        assert_eq!(
+            capability
+                .read_bounded(&destination, 32)
+                .unwrap()
+                .as_deref(),
+            Some(&b"credential"[..])
         );
     }
 
