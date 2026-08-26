@@ -7,12 +7,15 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 
-use crate::adapters::antigravity::account::{ActiveHomeAdoption, MutationResult, ascii_console};
+use crate::adapters::antigravity::account::{
+    ActiveHomeAdoption, MutationResult, ascii_console, has_provider_managed_session,
+};
+use crate::adapters::antigravity::native_session;
 use crate::adapters::antigravity::{AntigravityAdapter, LaunchDiagnostic, ProcessTermination};
 use crate::core::atomic_io::NormalizedStoreRoot;
 use crate::core::health::{ProbeOutcome, ProbeSubject, reduce_usage_observed};
 use crate::core::state::{AccountRecord, CredentialRef, CredentialRefKind};
-use crate::core::state_store::{MigrationStatus, StateSession};
+use crate::core::state_store::{MigrationStatus, StateSession, StateStore};
 use crate::core::storage;
 use crate::core::ui;
 use crate::core::update;
@@ -117,6 +120,10 @@ where
     // Update 只依赖 updater 自身，不应被损坏的账号 state 阻断恢复路径。
     if let Command::Update(args) = &command {
         return run_update(&state_dir, args.force, ui, &update_fn);
+    }
+
+    if let Some(code) = maybe_run_native_session(&state_dir, &command)? {
+        return Ok(code);
     }
 
     let mut session = StateSession::open(&state_dir)?;
@@ -399,6 +406,52 @@ fn prepare_existing_session(
         }
     }
     Ok(None)
+}
+
+/// Route provider-native launches before `StateSession::open`. Opening a
+/// session hardens legacy permissions, which is a state-side effect even when
+/// the eventual command only wants to run the provider runtime.
+fn maybe_run_native_session(state_dir: &Path, command: &Command) -> Result<Option<i32>> {
+    let (extra_args, resume, no_import_known, dry_run, no_launch) = match command {
+        Command::Launch(args) => (
+            args.extra_args.as_slice(),
+            !args.no_resume,
+            args.no_import_known,
+            args.dry_run,
+            args.no_launch,
+        ),
+        Command::Passthrough(args) => (args.as_slice(), true, false, false, false),
+        _ => return Ok(None),
+    };
+    if no_import_known
+        || dry_run
+        || no_launch
+        || !native_session::has_noninteractive_prompt(extra_args)
+    {
+        return Ok(None);
+    }
+
+    let read = StateStore::open(state_dir)?.read()?;
+    if read.recovery_pending
+        || !read.state.accounts.is_empty()
+        || !matches!(
+            read.migration,
+            MigrationStatus::Missing | MigrationStatus::None
+        )
+        || !has_provider_managed_session()?
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        match native_session::launch_native_session(extra_args, resume) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("[sagy] {error}");
+                1
+            }
+        },
+    ))
 }
 
 fn ensure_current_session(

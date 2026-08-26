@@ -4,8 +4,7 @@
 
 `sagy say hi` 的 argv bug 已修复：开头的裸 prompt 现在变成 `agy -p "say hi"`，不再与隐式
 `--continue` 组合。直接运行真实用户 HOME/Keychain 下的 `agy -p "say hi"` 已返回 greeting；
-撤回前的诊断构建也曾通过 sagy 返回 greeting，用于排除 argv 问题，但不作为最终 commit 的成功
-smoke。最终安全版本会在 child spawn 前拒绝当前 provider-managed session。
+最终 release 构建也已通过受保护的 local-only native passthrough 返回 greeting。
 
 进一步实测确认，当前 `agy` 的有效认证权威高置信位于操作系统 credential store，而不是可通过
 复制 `~/.gemini` 携带的两个文件。此前把两个 provider 文件建模为独立、可 repo 同步、可切换账号
@@ -28,31 +27,34 @@ smoke。最终安全版本会在 child spawn 前拒绝当前 provider-managed se
 ## 安全决策
 
 - 不直接 CRUD provider 的 Keychain item，不读取 secret，不复制 login keychain，不执行
-  `security ... -w`。
+  `security ... -w`。preflight 只用 Security.framework 检查默认 Keychain 的 unlocked/readable
+  状态以及 `service=gemini`、`account=antigravity` 的 item 元数据。
 - strict six-field provider session 进入 `import-known` 时 fail-closed：state 与 active-home 不变，
   不 spawn `agy`，提示当前 session 可能由 system credential store 管理并建议直接运行 `agy`。
 - 旧 Google `authorized_user`、用户显式 raw token、API key 与 Vertex 行为保持不变。
-- 后续只有取得 provider 支持的非交互 auth status、file-token-store override、有效身份确认和
-  no-browser-login 契约，才能设计 local-only provider session；不得进入 repo sync，也不得仅凭
-  `say hi` 声称账号切换成功。
+- 空账号池、macOS、非交互 print prompt 可以走 local-only native passthrough；它不导入、不切换、
+  不写 state/active-home，也不进入 repo sync。Keychain unavailable/missing/locked/timeout 会在 spawn
+  前退出。
+- preflight 与 spawn 无法原子化；native child 额外设置 `BROWSER=/usr/bin/false`，并在双流中检测
+  provider 授权证据。命中后 kill/reap 整个 process group、抑制授权 URL 且不重试。这是竞态遏制，
+  在 provider 没有 no-browser-login 契约时不声称浏览器绝不会短暂出现。
 
-## 取证 smoke 的隔离方式
+## 最终 smoke 的隔离方式
 
-撤回前的诊断 smoke 保留真实 `HOME=/Users/liuzhihao` 以允许 `agy` 访问当前 Keychain，同时把
-`SAGY_HOME`、`GEMINI_HOME`、`ANTIGRAVITY_CONFIG_DIR` 与 `--state-dir` 全部指向一次性目录。
-临时目录中的两份 fixture 与真实源逐字节一致，运行后确认：
+最终 release smoke 保留真实 HOME 和 Gemini runtime 路径，使 provider marker 与 `agy` 当前
+Keychain 会话保持一致；只用 `--state-dir` 指向一次性空目录。运行前后在不输出摘要值的前提下
+比较真实 `oauth_creds.json` 与 companion token 的 digest、mtime 和 size，并比较 `agy` PID 集合：
 
 ```text
-sagy selected account                         PASS
-agy returned a greeting                       PASS
+target/release/sagy say hi returned greeting  PASS
 process exit code                             0
-real credential file digests                  unchanged
-temporary credential/state directory          removed
+real credential digests/mtime/size            unchanged
+temporary state directory                     unchanged and empty
+new lingering agy process                     none
 ```
 
-该诊断 smoke 只证明 argv 与当前系统 session 可用，不证明 OAuth 多账号切换已生效，也不代表
-最终 fail-closed build 能导入该 session。后者在 provider 提供身份 postcondition 之前明确不作
-承诺；最终 build 的验收是拒绝导入、文件不变且不 spawn `agy`。
+该 smoke 只证明当前本机 provider session 的 local-only launch 可用，不证明 OAuth 多账号切换；
+`import-known` 仍按 fail-closed 规则拒绝这个 session。
 
 ## 最终本地验收
 
@@ -63,7 +65,8 @@ temporary credential/state directory          removed
 cargo fmt --all -- --check                              PASS
 cargo check --all-targets --locked                      PASS
 cargo clippy --all-targets --locked -- -D warnings      PASS
-cargo test --all-targets --locked                       24 个 executable / 496 项 / 0 失败
+cargo test --all-targets --locked                       24 个 executable / 504 项 / 0 失败
+native_session unit tests                               8/8 PASS
 p1_provider_managed_session                             3/3 PASS
 p1_bare_prompt                                          5/5 PASS
 backlog/verify/t*.sh                                     7 个脚本 / 72 项断言 / 全部 PASS

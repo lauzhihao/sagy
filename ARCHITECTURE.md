@@ -130,9 +130,23 @@ The active authentication authority of recent provider CLIs may be an operating-
 store rather than either managed file. In particular, a strict six-field provider session
 (`access_token`, `expiry_date`, `id_token`, `refresh_token`, `scope`, `token_type`) is not sufficient
 evidence of a portable account or a successful account switch. Known-source discovery rejects this
-shape before any State or active-home mutation and before spawning `agy`. sagy does not inspect or
-modify Keychain, Secret Service, or Credential Manager; native-session support requires a stable
-provider contract for non-interactive auth override and effective-identity verification.
+shape before any State or active-home mutation and before spawning `agy`.
+
+macOS print-mode launch has one deliberately narrower exception. When State is missing or contains
+no managed accounts, a strict provider marker may enter a local-only native-session state machine:
+the parent runs a bounded helper that asks Security.framework for the default Keychain's unlocked,
+readable status and the `gemini` / `antigravity` generic-password metadata with authentication UI
+forbidden. The item secret is never requested. Only a usable result permits an immediate child
+spawn; locked, missing, unavailable, ambiguous, failed, and timed-out results all fail closed. No
+Keychain material is copied through IPC, persisted, used for identity claims, or admitted into
+account and repo schemas. Non-macOS and interactive launches remain unsupported.
+
+The native child is a single supervised launch with both output streams observed. Provider
+authorization evidence kills and reaps the entire child process group without retrying or relaying
+the authorization URL. This bounds repeated background login waiters. It does not make the
+Security.framework check and child spawn atomic, and without a provider-supported no-authorization
+flag cannot prove that LaunchServices will never open a browser in that narrow race. The native
+child also receives `BROWSER=/usr/bin/false` as best-effort containment.
 
 ## 5. Account Selection & Cooldown Policy
 

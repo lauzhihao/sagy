@@ -3,6 +3,7 @@ pub(crate) mod active_home;
 pub mod auth;
 pub mod launch_observation;
 pub mod launcher;
+pub(crate) mod native_session;
 pub mod paths;
 pub mod repo_bundle;
 pub mod repo_sync;

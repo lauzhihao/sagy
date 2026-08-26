@@ -305,6 +305,33 @@ impl super::AntigravityAdapter {
     }
 }
 
+/// Build a provider-native command without consulting sagy's account pool or
+/// publishing either active-home slot.  The child inherits the caller's real
+/// `HOME`, `GEMINI_HOME`, and `ANTIGRAVITY_CONFIG_DIR`; only authentication
+/// override variables are removed by the same deny-list used by managed
+/// launches.
+pub(crate) fn build_native_command(
+    extra_args: &[OsString],
+    resume: bool,
+) -> std::result::Result<Command, LaunchError> {
+    let agy_bin = find_agy_bin(None).ok_or(LaunchError::BinaryNotFound)?;
+    let mut command = Command::new(agy_bin);
+    let inherited_region = std::env::var(REGION_ENV_VAR).ok();
+    configure_auth_environment(
+        &mut command,
+        &LaunchAuth::OAuth,
+        None,
+        inherited_region.as_deref(),
+    );
+    // Print-mode native passthrough never needs a browser. This is a second
+    // containment layer for the narrow race where the Keychain becomes
+    // unavailable after the preflight but before agy restores its token.
+    #[cfg(target_os = "macos")]
+    command.env("BROWSER", "/usr/bin/false");
+    append_launch_args(&mut command, extra_args, resume);
+    Ok(command)
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum HomeLeaseSlot {
     Token,

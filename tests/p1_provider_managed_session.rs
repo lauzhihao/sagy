@@ -199,24 +199,24 @@ fn import_known_rejects_provider_session_without_mutation() {
 }
 
 #[test]
-fn launch_auto_discovery_fails_before_spawning_agy() {
+fn no_import_known_skips_native_session_and_does_not_spawn_agy() {
     let fixture = Fixture::new();
     fixture.oauth_creds(&provider_session());
     fixture.companion_token();
 
-    let output = fixture.run(&["say", "hi"]);
+    let output = fixture.run(&["launch", "--no-import-known", "say", "hi"]);
     let text = combined(&output);
     assert!(
         !output.status.success(),
         "launch unexpectedly succeeded: {text}"
     );
     assert!(
-        text.contains("provider-managed session"),
+        text.contains("No account is currently selectable"),
         "unexpected error: {text}"
     );
     assert!(
         !fixture.spawn_marker.exists(),
-        "fake agy was spawned despite provider-session rejection"
+        "fake agy was spawned despite --no-import-known"
     );
 }
 

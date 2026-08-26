@@ -13,6 +13,10 @@ pub fn main_entry() {
 }
 
 fn run() -> anyhow::Result<i32> {
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    if adapters::antigravity::native_session::is_probe_invocation(&raw_args) {
+        return Ok(adapters::antigravity::native_session::run_probe_helper());
+    }
     let cli = cli::Cli::parse_args();
     cli::run(cli)
 }

@@ -1061,6 +1061,22 @@ fn scan_known_oauth_source() -> Result<Option<(PortableCredential, Vec<u8>, Stri
     Ok(Some((credential, material, email)))
 }
 
+/// Detect the provider-native session marker without importing it or touching
+/// the account/state stores.  The launch path uses this only as a routing hint;
+/// Keychain state and item presence are checked separately by the native-session
+/// helper without requesting the secret.
+pub(crate) fn has_provider_managed_session() -> Result<bool> {
+    let Some(home) = default_gemini_home() else {
+        return Ok(false);
+    };
+    let path = home.join("oauth_creds.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let bytes = read_import_source(&path)?;
+    Ok(is_provider_managed_session(&bytes))
+}
+
 /// A provider-native Gemini session is not an authorized-user document.  Its
 /// refresh lifecycle may be owned by the provider's system credential store,
 /// so treating it as portable OAuth would either lose the owner metadata or

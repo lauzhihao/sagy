@@ -92,8 +92,14 @@ sagy 同样不会拿 `refresh_token` 去换新的 access token。`authorized_use
 新版 `agy` 可以把真正生效的登录态保存在操作系统 credential store（macOS Keychain 及其它平台
 对应的系统 vault）中。因此，`~/.gemini/oauth_creds.json` 里的严格六字段 provider session 不会
 被当作可携带、可独立切换的账号：`import-known` 会 fail-closed，不改文件，也不启动 `agy`。
-这类当前 provider-managed session 请直接运行 `agy`。只有 provider 提供稳定的非交互 storage
-override 与身份验证 postcondition 后，sagy 才会加入 native-session 支持。
+在 macOS 上，如果 sagy 账号池为空、请求又是非交互 print prompt，sagy 可以把这一次请求交给
+当前本机 `agy` session。启动前只检查 Keychain 状态和 provider item 元数据，不请求 secret，并且
+整个检查有时限、禁止 UI；Keychain 被锁、缺失、不可用或超时都会在 spawn `agy` 前退出。这条
+local-only 路径不会被导入、切换或 repo sync。
+
+Keychain 检查与 child spawn 无法成为原子操作，因为 `agy` 没有公开受支持的“绝不发起授权”开关。
+sagy 还会监督 child；一旦识别到 provider 授权流程，就 kill 整个 child process group，避免残留
+等待登录的进程。第二道保护是竞态遏制，不承诺极窄的检查后竞态中浏览器绝不会短暂出现。
 
 Google `authorized_user` JSON 必须包含 `client_id`、`client_secret` 与 `refresh_token`。
 `token_uri` 可以省略；sagy 会在内部将其规范化为
@@ -163,8 +169,9 @@ sagy 绝不静默覆盖不是自己写的凭据。它在 active home 里纳管�
 两种情况被区别对待，只有第二种需要你动手：
 
 严格六字段 provider-managed session 会先于这两种情况处理：sagy 不接管也不覆盖它，因为真正的
-secret 可能只存在于操作系统 credential store。命令会以明确的 unsupported-session 错误停止，
-并提示直接运行 `agy`。
+secret 可能只存在于操作系统 credential store。`import-known` 与账号切换命令会以明确的
+unsupported-session 错误停止；符合上述条件的 macOS print launch 可以改走受保护的 local-only
+passthrough。
 
 1. 文件里的内容**就是**某个已登记账号的凭据（逐字节一致）：sagy 就地接管，一个字节都不改写。
    已经在用 Antigravity 的机器上第一次跑 `sagy` 属于这一类，不需要任何参数。
