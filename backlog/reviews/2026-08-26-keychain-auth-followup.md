@@ -3,8 +3,9 @@
 ## 结论
 
 `sagy say hi` 的 argv bug 已修复：开头的裸 prompt 现在变成 `agy -p "say hi"`，不再与隐式
-`--continue` 组合。本地 release 已在真实用户 HOME/Keychain 下返回 `Hi! How can I help you
-today?`，退出码 0，真实两份 credential file 的 digest 未变化。
+`--continue` 组合。直接运行真实用户 HOME/Keychain 下的 `agy -p "say hi"` 已返回 greeting；
+撤回前的诊断构建也曾通过 sagy 返回 greeting，用于排除 argv 问题，但不作为最终 commit 的成功
+smoke。最终安全版本会在 child spawn 前拒绝当前 provider-managed session。
 
 进一步实测确认，当前 `agy` 的有效认证权威高置信位于操作系统 credential store，而不是可通过
 复制 `~/.gemini` 携带的两个文件。此前把两个 provider 文件建模为独立、可 repo 同步、可切换账号
@@ -35,9 +36,9 @@ today?`，退出码 0，真实两份 credential file 的 digest 未变化。
   no-browser-login 契约，才能设计 local-only provider session；不得进入 repo sync，也不得仅凭
   `say hi` 声称账号切换成功。
 
-## 真实 smoke 的隔离方式
+## 取证 smoke 的隔离方式
 
-最终 smoke 保留真实 `HOME=/Users/liuzhihao` 以允许 `agy` 访问当前 Keychain，同时把
+撤回前的诊断 smoke 保留真实 `HOME=/Users/liuzhihao` 以允许 `agy` 访问当前 Keychain，同时把
 `SAGY_HOME`、`GEMINI_HOME`、`ANTIGRAVITY_CONFIG_DIR` 与 `--state-dir` 全部指向一次性目录。
 临时目录中的两份 fixture 与真实源逐字节一致，运行后确认：
 
@@ -49,8 +50,9 @@ real credential file digests                  unchanged
 temporary credential/state directory          removed
 ```
 
-该 smoke 证明 argv 与当前系统 session 可用，不证明 OAuth 多账号切换已生效；后者在 provider
-提供身份 postcondition 之前明确不作承诺。
+该诊断 smoke 只证明 argv 与当前系统 session 可用，不证明 OAuth 多账号切换已生效，也不代表
+最终 fail-closed build 能导入该 session。后者在 provider 提供身份 postcondition 之前明确不作
+承诺；最终 build 的验收是拒绝导入、文件不变且不 spawn `agy`。
 
 ## 最终本地验收
 
