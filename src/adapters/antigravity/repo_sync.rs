@@ -190,18 +190,10 @@ fn credential_ref_kind(kind: CredentialKind) -> CredentialRefKind {
         CredentialKind::OAuthAuthorizedUser => CredentialRefKind::OauthAuthorizedUser,
         CredentialKind::ApiKey => CredentialRefKind::ApiKey,
         CredentialKind::VertexServiceAccount => CredentialRefKind::VertexServiceAccount,
-        CredentialKind::AntigravityToken => CredentialRefKind::AntigravityToken,
-        CredentialKind::GeminiOAuthSession => CredentialRefKind::GeminiOauthSession,
     }
 }
 
 fn credential_material(credential: &PortableCredential) -> Result<Vec<u8>> {
-    // Provider-native sources are deliberately retained byte-for-byte.  The
-    // active-home file is consumed by the provider itself, so canonicalizing
-    // JSON here would be a lossy repository round-trip.
-    if let Some(source) = credential.source_bytes() {
-        return Ok(source.to_vec());
-    }
     if credential.kind() == CredentialKind::OAuthAccessToken {
         return credential
             .access_token()
@@ -555,49 +547,6 @@ fn metadata_for_account(account: &AccountRecord) -> Result<repo_bundle::BundleAc
     .map_err(anyhow::Error::new)
 }
 
-fn credential_identity_key(credential: &PortableCredential) -> String {
-    format!(
-        "{}:{}",
-        credential.kind().as_str(),
-        credential.identity_fingerprint()
-    )
-}
-
-fn credential_ref_identity_key(reference: &CredentialRef, identity: &str) -> String {
-    format!("{}:{identity}", credential_ref_kind_name(reference.kind))
-}
-
-const fn credential_ref_kind_name(kind: CredentialRefKind) -> &'static str {
-    match kind {
-        CredentialRefKind::OauthAccessToken => "oauth_access_token",
-        CredentialRefKind::OauthAuthorizedUser => "oauth_authorized_user",
-        CredentialRefKind::ApiKey => "api_key",
-        CredentialRefKind::VertexServiceAccount => "vertex_service_account",
-        CredentialRefKind::AntigravityToken => "antigravity_token",
-        CredentialRefKind::GeminiOauthSession => "gemini_oauth_session",
-    }
-}
-
-fn metadata_for_account_credential(
-    account: &AccountRecord,
-    credential: &PortableCredential,
-) -> Result<repo_bundle::BundleAccountMetadata> {
-    let mut metadata = metadata_for_account(account)?;
-    // Older state records did not carry identity_fingerprint.  Populate it
-    // only for provider-native kinds, whose domain value explicitly defines
-    // an identity independent from the exact source bytes. Existing kinds
-    // retain their historical metadata and fingerprint behavior.
-    if metadata.identity_fingerprint.is_none()
-        && matches!(
-            credential.kind(),
-            CredentialKind::AntigravityToken | CredentialKind::GeminiOAuthSession
-        )
-    {
-        metadata.identity_fingerprint = Some(credential.identity_fingerprint());
-    }
-    Ok(metadata)
-}
-
 /// One local account that could not be exported into the bundle.
 #[derive(Debug, Clone)]
 struct SkippedAccount {
@@ -632,7 +581,7 @@ fn duplicate_fingerprint_error(
         (account.id.as_str(), owner.id.as_str())
     };
     anyhow!(
-        "local state holds the same credential twice: account {} ({}) and account {} ({}) share credential identity fingerprint {}.\n\
+        "local state holds the same credential twice: account {} ({}) and account {} ({}) share credential fingerprint {}.\n\
          An account pool cannot carry one credential under two account ids.\n\
          Recovery: keep {} (added first) and run `sagy rm {}`, then run `sagy push` again.",
         owner.id,
@@ -700,25 +649,21 @@ fn load_v2_bundle_accounts(
             });
             continue;
         }
-        let identity_key = credential_identity_key(&stored.credential);
-        if let Some(owner) = fingerprints.get(&identity_key) {
+        let fingerprint = stored.credential.fingerprint();
+        if let Some(owner) = fingerprints.get(&fingerprint) {
             // 重复凭据是歧义而不是"坏账号": 静默跳过会让用户永远不知道池子里
             // 少了一个账号, 所以这里仍然硬失败, 但必须点名两个账号。
-            return Err(duplicate_fingerprint_error(
-                owner,
-                &account,
-                &stored.credential.identity_fingerprint(),
-            ));
+            return Err(duplicate_fingerprint_error(owner, &account, &fingerprint));
         }
         fingerprints.insert(
-            identity_key,
+            fingerprint,
             FingerprintOwner {
                 id: account.id.clone(),
                 email: account.email.clone(),
                 added_at: account.added_at,
             },
         );
-        let metadata = match metadata_for_account_credential(&account, &stored.credential) {
+        let metadata = match metadata_for_account(&account) {
             Ok(metadata) => metadata,
             Err(error) => {
                 skipped.push(SkippedAccount {
@@ -1246,21 +1191,12 @@ fn deduplicate_by_fingerprint(
     outcome: &mut MergeOutcome,
 ) -> Result<()> {
     for item in incoming {
-        let incoming_identity_key = credential_identity_key(&item.credential);
         let duplicates: Vec<String> = candidate
             .credential_refs
             .iter()
             .filter(|(id, reference)| {
-                if id.as_str() == item.account_id {
-                    return false;
-                }
-                let identity = candidate
-                    .accounts
-                    .iter()
-                    .find(|account| account.id.as_str() == id.as_str())
-                    .and_then(|account| account.identity_fingerprint.as_deref())
-                    .unwrap_or(reference.fingerprint.as_str());
-                credential_ref_identity_key(reference, identity) == incoming_identity_key
+                id.as_str() != item.account_id
+                    && reference.fingerprint == item.credential_ref.fingerprint
             })
             .map(|(id, _)| id.clone())
             .collect();
