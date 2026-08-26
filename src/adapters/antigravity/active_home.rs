@@ -93,6 +93,22 @@ pub(crate) enum ActiveHomeTarget {
     Vertex,
 }
 
+/// Evidence captured by the State transaction before a first-run dual-source
+/// adoption. It contains only references and byte digests; active-home never
+/// trusts a caller-provided path or secret value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KnownSlotProof {
+    pub(crate) account_id: String,
+    pub(crate) reference: CredentialRef,
+    pub(crate) material_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KnownHomeProof {
+    pub(crate) token: KnownSlotProof,
+    pub(crate) document: KnownSlotProof,
+}
+
 impl ActiveHomeTarget {
     #[cfg(test)]
     fn expected_layout(self, material_digest: Option<String>) -> ManagedLayout {
@@ -227,6 +243,7 @@ pub(crate) struct ActiveHomeStore {
     token_root: HomeRoot,
     document_root: HomeRoot,
     scope_id: String,
+    known_home_proof: Option<KnownHomeProof>,
 }
 
 impl ActiveHomeStore {
@@ -300,11 +317,17 @@ impl ActiveHomeStore {
             token_root,
             document_root,
             scope_id: expected_scope,
+            known_home_proof: None,
         };
         // 两个 home root 的 fixed lock 和 State 锁都已在手，此刻磁盘上不存在
         // 其它进程的在途事务，是清理孤儿 stage 明文的唯一安全时机。
         store.sweep_orphan_stages()?;
         Ok(store)
+    }
+
+    pub(crate) fn with_known_home_proof(mut self, proof: Option<KnownHomeProof>) -> Self {
+        self.known_home_proof = proof;
+        self
     }
 
     /// Strict mode permits only an empty profile or an exact State-advertised
@@ -348,6 +371,20 @@ impl ActiveHomeStore {
         // 凭据与目标逐字节一致"这一种情形下才成立；其余一律降级回 Strict，
         // 否则普通账号切换会静默漏写凭据。
         let effective_mode = match mode {
+            AdoptionMode::Adopt
+                if self.before_profile.is_none()
+                    && self.known_home_proof.as_ref().is_some_and(|proof| {
+                        known_home_proof_matches(
+                            proof,
+                            &baseline,
+                            &target_layout,
+                            self.target_profile.as_ref(),
+                            self.target_ref.as_ref(),
+                        )
+                    }) =>
+            {
+                AdoptionMode::AdoptKnown
+            }
             AdoptionMode::Adopt
                 if self.before_profile.is_none()
                     && !baseline.is_absent()
@@ -495,8 +532,12 @@ impl ActiveHomeStore {
             return Ok(HomeLayoutBytes::absent());
         };
         let target = match self.target_ref.as_ref().map(|reference| reference.kind) {
-            Some(CredentialRefKind::OauthAccessToken) => ActiveHomeTarget::RawOauth,
-            Some(CredentialRefKind::OauthAuthorizedUser) => ActiveHomeTarget::AuthorizedUser,
+            Some(CredentialRefKind::OauthAccessToken | CredentialRefKind::AntigravityToken) => {
+                ActiveHomeTarget::RawOauth
+            }
+            Some(
+                CredentialRefKind::OauthAuthorizedUser | CredentialRefKind::GeminiOauthSession,
+            ) => ActiveHomeTarget::AuthorizedUser,
             Some(CredentialRefKind::ApiKey) => ActiveHomeTarget::Api,
             Some(CredentialRefKind::VertexServiceAccount) => ActiveHomeTarget::Vertex,
             None if profile.managed_layout == ManagedLayout::default() => ActiveHomeTarget::Api,
@@ -571,12 +612,56 @@ fn validate_first_profile_layout(
         target_profile.is_some_and(|profile| profile.managed_layout == baseline.managed_layout());
     match mode {
         AdoptionMode::Adopt if target_matches => Ok(()),
+        AdoptionMode::AdoptKnown => Ok(()),
         AdoptionMode::Takeover => Ok(()),
         _ => bail!(
             "active-home already holds {TOKEN_FILENAME} / {DOCUMENT_FILENAME} that do not belong to any sagy-managed account; {}",
             takeover_hint()
         ),
     }
+}
+
+fn known_home_proof_matches(
+    proof: &KnownHomeProof,
+    baseline: &HomeLayoutBytes,
+    target_layout: &HomeLayoutBytes,
+    target_profile: Option<&ActiveProfile>,
+    target_ref: Option<&CredentialRef>,
+) -> bool {
+    let Some(token) = baseline.token.digest.as_ref() else {
+        return false;
+    };
+    let Some(document) = baseline.document.digest.as_ref() else {
+        return false;
+    };
+    if proof.token.reference.kind != CredentialRefKind::AntigravityToken
+        || proof.document.reference.kind != CredentialRefKind::GeminiOauthSession
+        || proof.token.material_digest != *token
+        || proof.document.material_digest != *document
+    {
+        return false;
+    }
+    let Some(target_profile) = target_profile else {
+        return false;
+    };
+    let Some(target_ref) = target_ref else {
+        return false;
+    };
+    let selected = if target_ref == &proof.token.reference {
+        (&proof.token, &target_layout.token, &target_layout.document)
+    } else if target_ref == &proof.document.reference {
+        (
+            &proof.document,
+            &target_layout.document,
+            &target_layout.token,
+        )
+    } else {
+        return false;
+    };
+    selected.0.account_id == target_profile.account_id
+        && selected.1.digest.as_deref() == Some(selected.0.material_digest.as_str())
+        && selected.2.digest.is_none()
+        && target_profile.managed_layout == target_layout.managed_layout()
 }
 
 /// active home 里躺着一份 sagy 不认识的凭据时，用户唯一可执行的下一步。
@@ -595,6 +680,7 @@ fn takeover_hint() -> String {
 enum AdoptionMode {
     Strict,
     Adopt,
+    AdoptKnown,
     Takeover,
 }
 
@@ -603,6 +689,7 @@ impl AdoptionMode {
         match self {
             Self::Strict => "strict",
             Self::Adopt => "adopt",
+            Self::AdoptKnown => "adopt_known",
             Self::Takeover => "takeover",
         }
     }
@@ -1298,6 +1385,7 @@ fn layout_value(profile: &Option<ActiveProfile>) -> Value {
 fn journal_adoption_mode(mode: &str) -> AdoptionMode {
     match mode {
         "takeover" => AdoptionMode::Takeover,
+        "adopt_known" => AdoptionMode::AdoptKnown,
         "adopt" => AdoptionMode::Adopt,
         _ => AdoptionMode::Strict,
     }
@@ -1416,11 +1504,7 @@ pub(crate) fn recover_pending(
     }
     match authority {
         ActiveHomeRecoveryAuthority::Legacy(_) => {
-            let mode = if before_layout.managed_layout() == after_layout.managed_layout() {
-                AdoptionMode::Adopt
-            } else {
-                AdoptionMode::Takeover
-            };
+            let mode = journal_adoption_mode(recovery_proof.adoption_mode());
             let txn = ActiveHomeTxn {
                 store,
                 txid,
@@ -1468,11 +1552,7 @@ pub(crate) fn recover_pending(
             } else if proof.active_profile() == before.as_ref()
                 && current_revision.generation == base_revision.generation
             {
-                let mode = if before_layout.managed_layout() == after_layout.managed_layout() {
-                    AdoptionMode::Adopt
-                } else {
-                    AdoptionMode::Takeover
-                };
+                let mode = journal_adoption_mode(recovery_proof.adoption_mode());
                 let txn = ActiveHomeTxn {
                     store,
                     txid,
@@ -1858,6 +1938,7 @@ mod tests {
         for mode in [
             AdoptionMode::Strict,
             AdoptionMode::Adopt,
+            AdoptionMode::AdoptKnown,
             AdoptionMode::Takeover,
         ] {
             assert_eq!(journal_adoption_mode(mode.as_str()), mode);
