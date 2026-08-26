@@ -209,6 +209,17 @@ impl BundleAccount {
         validate_account_id(&self.id)?;
         self.metadata.validate()?;
         validate_credential_pair(self.metadata.account_type, &self.credential)?;
+        if matches!(
+            self.credential.kind(),
+            CredentialKind::AntigravityToken | CredentialKind::GeminiOAuthSession
+        ) && self
+            .metadata
+            .identity_fingerprint
+            .as_deref()
+            .is_some_and(|identity| identity != self.credential.identity_fingerprint())
+        {
+            return Err(BundleError::InvalidMetadata);
+        }
         Ok(())
     }
 }
@@ -458,13 +469,19 @@ impl BundleV2 {
         }
 
         let mut ids = HashSet::<String>::with_capacity(self.accounts.len());
-        let mut fingerprints = HashSet::with_capacity(self.accounts.len());
+        let mut credential_identities = HashSet::with_capacity(self.accounts.len());
         for account in &self.accounts {
             account.validate()?;
             if !ids.insert(account.id.clone()) {
                 return Err(BundleError::DuplicateAccountId);
             }
-            if !fingerprints.insert(account.credential.fingerprint()) {
+            // New provider-native sources can be byte-distinct while still
+            // representing the same provider identity (for example a
+            // refreshed Gemini session). Keep the historical exact
+            // fingerprint semantics for old kinds, while using the explicit
+            // identity fingerprint plus kind for the new sources.
+            let identity = credential_identity_key(&account.credential);
+            if !credential_identities.insert(identity) {
                 return Err(BundleError::DuplicateCredentialFingerprint);
             }
         }
@@ -790,7 +807,10 @@ fn validate_credential_pair(
     let compatible = match account_type {
         AccountType::OAuth => matches!(
             credential.kind(),
-            CredentialKind::OAuthAccessToken | CredentialKind::OAuthAuthorizedUser
+            CredentialKind::OAuthAccessToken
+                | CredentialKind::OAuthAuthorizedUser
+                | CredentialKind::AntigravityToken
+                | CredentialKind::GeminiOAuthSession
         ),
         AccountType::ApiKey => credential.kind() == CredentialKind::ApiKey,
         AccountType::Vertex => credential.kind() == CredentialKind::VertexServiceAccount,
@@ -800,6 +820,14 @@ fn validate_credential_pair(
     } else {
         Err(BundleError::CredentialKindMismatch)
     }
+}
+
+fn credential_identity_key(credential: &PortableCredential) -> String {
+    format!(
+        "{}:{}",
+        credential.kind().as_str(),
+        credential.identity_fingerprint()
+    )
 }
 
 fn validate_credential_fingerprint(value: &str) -> Result<(), BundleError> {
