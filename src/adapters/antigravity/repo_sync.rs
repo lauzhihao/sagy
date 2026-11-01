@@ -1373,6 +1373,126 @@ struct TempCheckout {
     _lock: fs::File,
 }
 
+/// Ephemeral encrypted repository access shared by multiple account-pool formats.
+/// The decrypted payload is returned to the caller and is never written to Git.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct EncryptedRepo {
+    _checkout: TempCheckout,
+    bundle_root: PathBuf,
+    bundle_path: PathBuf,
+    git_bin: PathBuf,
+    password: String,
+    identity_file: Option<PathBuf>,
+    insecure_host_key: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl EncryptedRepo {
+    pub(crate) fn open(
+        state_root: &Path,
+        repo: &str,
+        bundle_dir: &str,
+        identity_file: Option<&Path>,
+        insecure_host_key: bool,
+    ) -> Result<Self> {
+        validate_bundle_dir(bundle_dir)?;
+        let git_bin = find_git_bin().ok_or_else(|| anyhow!("git binary not found in PATH"))?;
+        let password = resolve_bundle_key()?;
+        let checkout = clone_repo(&git_bin, state_root, repo, identity_file, insecure_host_key)?;
+        let (bundle_root, bundle_path) =
+            prepare_bundle_paths(&checkout.checkout_dir, bundle_dir, false)?;
+        Ok(Self {
+            _checkout: checkout,
+            bundle_root,
+            bundle_path,
+            git_bin,
+            password,
+            identity_file: identity_file.map(Path::to_path_buf),
+            insecure_host_key,
+        })
+    }
+
+    pub(crate) fn read(&self) -> Result<Option<Vec<u8>>> {
+        let Some(encoded) = read_bounded_file(&self.bundle_path, MAX_ENCRYPTED_PAYLOAD_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let payload = EncryptedBundlePayload::decode_strict(&encoded)?;
+        let plaintext = decrypt_bytes(&payload, &self.password)?;
+        if plaintext.len() > repo_bundle::MAX_BUNDLE_PLAINTEXT_BYTES {
+            bail!("bundle plaintext exceeds the 8 MiB limit");
+        }
+        Ok(Some(plaintext))
+    }
+
+    /// Publish one encrypted file and push it only after the Git commit succeeds.
+    /// No other checked-out files are staged or rewritten.
+    pub(crate) fn publish(&self, plaintext: &[u8], message: &str) -> Result<bool> {
+        if plaintext.len() > repo_bundle::MAX_BUNDLE_PLAINTEXT_BYTES {
+            bail!("bundle plaintext exceeds the 8 MiB limit");
+        }
+        if self.read()?.as_deref() == Some(plaintext) {
+            return Ok(false);
+        }
+
+        let encrypted = encrypt_bytes(plaintext, &self.password)?;
+        let encoded = serde_json::to_vec(&encrypted)?;
+        if encoded.len() > MAX_ENCRYPTED_PAYLOAD_BYTES {
+            bail!("encrypted bundle envelope exceeds the size limit");
+        }
+        storage::create_secure_dir_all(&self.bundle_root)?;
+        validate_secret_target(&self._checkout.checkout_dir, &self.bundle_path)?;
+        storage::write_secret_file(&self.bundle_path, &encoded)?;
+
+        // 只暂存已校验的 bundle 文件，避免把仓库中其它改动一起提交。
+        let bundle_dir = self
+            .bundle_path
+            .strip_prefix(&self._checkout.checkout_dir)
+            .context("bundle path escaped its checkout")?;
+        let bundle_file = path_for_git(bundle_dir);
+        git_cmd(
+            &self.git_bin,
+            &self._checkout.checkout_dir,
+            &["add", "--", &bundle_file],
+            self.identity_file.as_deref(),
+            self.insecure_host_key,
+        )?;
+        let status = git_cmd(
+            &self.git_bin,
+            &self._checkout.checkout_dir,
+            &["status", "--porcelain"],
+            self.identity_file.as_deref(),
+            self.insecure_host_key,
+        )?;
+        if status.stdout.is_empty() {
+            return Ok(false);
+        }
+        git_cmd(
+            &self.git_bin,
+            &self._checkout.checkout_dir,
+            &[
+                "-c",
+                "user.name=sagy-agent",
+                "-c",
+                "user.email=sagy@local",
+                "commit",
+                "-m",
+                message,
+            ],
+            self.identity_file.as_deref(),
+            self.insecure_host_key,
+        )?;
+        git_cmd(
+            &self.git_bin,
+            &self._checkout.checkout_dir,
+            &["push", "origin", "HEAD"],
+            self.identity_file.as_deref(),
+            self.insecure_host_key,
+        )?;
+        Ok(true)
+    }
+}
+
 impl Drop for TempCheckout {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.checkout_dir);
@@ -2376,6 +2496,8 @@ fn git_cmd(
     let mut cmd = Command::new(git_bin);
     cmd.current_dir(cwd);
     cmd.args(args);
+    // 加密口令不应传给 Git hook 或凭据助手。
+    cmd.env_remove(BUNDLE_KEY_ENV);
 
     if let Some(ssh_cmd) = build_ssh_command(identity_file, insecure_host_key)? {
         if insecure_host_key {
@@ -2632,6 +2754,171 @@ mod tests {
         fs::create_dir_all(path).expect("bare repo dir");
         run_git(path, &["init", "--bare", "."]);
         path.to_str().expect("utf-8 repo path").to_string()
+    }
+
+    fn seed_plain_file(temp: &Path, remote: &str, relative: &str, content: &[u8]) {
+        let seed = temp.join(format!("encrypted-repo-seed-{}", Uuid::new_v4()));
+        let file = seed.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, content).unwrap();
+        run_git(&seed, &["init"]);
+        run_git(&seed, &["config", "user.email", "test@example.test"]);
+        run_git(&seed, &["config", "user.name", "repo-test"]);
+        run_git(&seed, &["add", "--", "."]);
+        run_git(&seed, &["commit", "-m", "seed"]);
+        run_git(&seed, &["remote", "add", "origin", remote]);
+        run_git(&seed, &["push", "origin", "HEAD"]);
+    }
+
+    fn remote_file(remote: &str, revision_path: &str) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(remote)
+            .args(["show", &format!("HEAD:{revision_path}")])
+            .output()
+            .expect("git show");
+        assert!(
+            output.status.success(),
+            "git show failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn remote_head(remote: &str) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(remote)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn open_encrypted_repo(state: &Path, remote: &str) -> EncryptedRepo {
+        ensure_test_bundle_key();
+        EncryptedRepo::open(state, remote, ".sagy-native-profiles", None, false).unwrap()
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn encrypted_repo_roundtrips_private_payload_and_noop_does_not_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&temp.path().join("remote.git"));
+        seed_plain_file(temp.path(), &remote, "notes/readme.txt", b"keep this file");
+        let state = temp.path().join("sagy-state");
+        fs::create_dir_all(&state).unwrap();
+
+        let repo = open_encrypted_repo(&state, &remote);
+        assert_eq!(repo.read().unwrap(), None);
+        let plaintext = br#"{"profile":"alice@example.com","refresh_token":"test-secret-value"}"#;
+        assert!(repo.publish(plaintext, "sync native profiles").unwrap());
+        let head = remote_head(&remote);
+        assert_eq!(repo.read().unwrap().as_deref(), Some(plaintext.as_slice()));
+        assert!(!repo.publish(plaintext, "noop").unwrap());
+        assert_eq!(remote_head(&remote), head);
+        assert_eq!(remote_file(&remote, "notes/readme.txt"), b"keep this file");
+        let stored = remote_file(&remote, ".sagy-native-profiles/bundle.enc.json");
+        assert!(
+            !stored
+                .windows(b"test-secret-value".len())
+                .any(|window| window == b"test-secret-value")
+        );
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn encrypted_repo_refuses_malformed_remote_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&temp.path().join("remote.git"));
+        let malformed = br#"{"algorithm":"unsupported","nonce":"AA==","ciphertext":"AA=="}"#;
+        seed_plain_file(
+            temp.path(),
+            &remote,
+            ".sagy-native-profiles/bundle.enc.json",
+            malformed,
+        );
+        let state = temp.path().join("sagy-state");
+        fs::create_dir_all(&state).unwrap();
+        let repo = open_encrypted_repo(&state, &remote);
+        assert!(repo.read().is_err());
+        assert!(
+            repo.publish(b"new secret", "must not replace an invalid bundle")
+                .is_err()
+        );
+        assert_eq!(
+            remote_file(&remote, ".sagy-native-profiles/bundle.enc.json"),
+            malformed
+        );
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn encrypted_repo_rejects_bundle_encrypted_with_another_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&temp.path().join("remote.git"));
+        let encrypted = encrypt_bytes(b"private native profile", "a-different-pool-key").unwrap();
+        seed_plain_file(
+            temp.path(),
+            &remote,
+            ".sagy-native-profiles/bundle.enc.json",
+            &serde_json::to_vec(&encrypted).unwrap(),
+        );
+        let state = temp.path().join("sagy-state");
+        fs::create_dir_all(&state).unwrap();
+        let repo = open_encrypted_repo(&state, &remote);
+        assert!(repo.read().is_err());
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn encrypted_repo_rejects_symlink_bundle_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&temp.path().join("remote.git"));
+        let seed = temp.path().join("symlink-seed");
+        fs::create_dir_all(&seed).unwrap();
+        fs::create_dir_all(temp.path().join("escape")).unwrap();
+        symlink("../escape", seed.join(".sagy-native-profiles")).unwrap();
+        run_git(&seed, &["init"]);
+        run_git(&seed, &["config", "user.email", "test@example.test"]);
+        run_git(&seed, &["config", "user.name", "repo-test"]);
+        run_git(&seed, &["add", "--", "."]);
+        run_git(&seed, &["commit", "-m", "symlink"]);
+        run_git(&seed, &["remote", "add", "origin", &remote]);
+        run_git(&seed, &["push", "origin", "HEAD"]);
+
+        let state = temp.path().join("sagy-state");
+        fs::create_dir_all(&state).unwrap();
+        ensure_test_bundle_key();
+        assert!(
+            EncryptedRepo::open(&state, &remote, ".sagy-native-profiles", None, false).is_err()
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn git_child_does_not_inherit_bundle_encryption_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        ensure_test_bundle_key();
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("key-was-inherited");
+        let executable = temp.path().join("git-shim");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ -n \"$SAGY_POOL_KEY\" ]; then touch {}; fi\n",
+                shell_quote_for_git(marker.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+        git_cmd(&executable, temp.path(), &[], None, false).unwrap();
+        assert!(!marker.exists());
     }
 
     /// Publish a hand-built bundle as the repository's only commit.

@@ -41,6 +41,8 @@ cargo build --release
 
 ## 2. Installed Binaries
 
+The following command tables describe the portable-credential CLI. When using the macOS native subscription installer below, invoke these commands as `sagy-legacy`.
+
 `sagy` installs convenient entrypoints in `$SAGY_HOME/bin`:
 
 | Binary | Target Model & Mode |
@@ -116,6 +118,56 @@ serialization uses the canonical endpoint.
 If a timeout, DNS failure, connection refusal, proxy failure, or gateway failure makes only the
 probe channel unreachable, a locally validated credential remains selectable in the lowest
 `Degraded` tier. An explicit credential rejection from the service remains ineligible.
+
+### Personal subscription profiles on macOS
+
+Run the installer from the repository root. It builds one Rust executable for `sagy`, `sagy-profile`, and the portable-pool CLI `sagy-legacy`. Re-run the same installer to update this shared executable. Existing native profiles retain their HOME directories, sessions, and login state. Authorize only new subscriptions in their own profiles. Check the Google email in the browser, finish the sign-in as directed by `agy`, and enter `/exit` in that session before enrolling the next profile.
+
+```bash
+./scripts/install-profiles.sh
+sagy-profile login work@example.com
+sagy-profile login personal@example.com
+```
+
+When this launcher is installed under the executable name `sagy`, invoking it with no arguments runs `sagy-profile auto --model gemini-3.8-flash-high --dangerously-skip-permissions`. `sagy -p "prompt"` uses the same defaults for a single noninteractive request. Subcommands pass through to the profile CLI, including `sagy login work@example.com` and `sagy list`.
+
+Quota probes and model requests inherit the caller’s proxy environment. With no HTTP, HTTPS, or ALL proxy set, they default to `http://127.0.0.1:10808` and preserve any `NO_PROXY` rules.
+
+`sagy-profile auto` queries native `/usage` for idle profiles before launch. It compares the Gemini group by default and the Claude/GPT group for explicit Claude or GPT model IDs. The score is the lower remaining percentage across the five-hour and weekly windows. Ties rotate. Unknown quota is a fallback. Exhausted and cooling profiles, and profiles with known weekly quota below 5% for the selected model group, are skipped. Exactly 5% remains eligible. Use `sagy use work@example.com` to open a new instance with a specific account, Gemini 3.8 Flash High, and auto-approved tools, without implicit resume. Additional agy arguments pass through. `sagy use 1` selects the first account in the current cached list order (one-based). Quota updates can change that order; check `sagy list` before choosing. Numeric arguments are list indexes; numeric labels remain accessible through `sagy run LABEL`. The weekly floor only applies to automatic selection; `use` can explicitly select a low-quota account. Use `sagy-profile run work@example.com` for an unmodified launch, or run `sagy-profile run personal@example.com` in another terminal to use both at once. Use `sagy-profile list` to see local labels. Repeat the corresponding `login` if authorization is revoked.
+
+`sagy list` reads Gemini quota snapshots from `~/.local/share/sagy-profiles/quota.json` without network requests. The `Quota age` column shows the age of each sample; missing samples show `--`. These are the latest values reported by agy and may lag usage in other clients or server updates. Failed probes retain the last successful values and their original timestamp.
+
+Interactive sessions use agy's native `statusLine` state callback to detect completed responses, then refresh Gemini quota in the background using a separate temporary HOME. A temporary copy of the current credential is used; the running session's credential is never written back, and the temporary directory is cleaned up. Each session permits one probe at a time and coalesces subsequent completed turns. Existing custom status-line commands retain their original input and output. The override is session-only and does not rewrite settings files. Repeated UI updates do not trigger more probes. Restart existing sessions once to activate the bridge; changing `/statusline` during a session may replace the callback. Background probes wait up to 25 seconds. Snapshots update after the probe succeeds, typically a few seconds after the response finishes; failures retain the last values and timestamp.
+
+Built-in lifecycle hooks refresh the selected account after successful login and normal `run` or `auto` session exit, adding up to eight seconds at exit. Signal exits skip the hook. Gemini probes made before `auto` launches also update the snapshot. Hook failures do not change the session exit code. To refresh immediately or integrate an external hook, use:
+
+```bash
+sagy refresh                    # Refresh idle accounts in parallel
+sagy refresh work@example.com   # Refresh one account
+sagy list                       # Read the snapshot without waiting for network
+```
+
+`refresh` waits up to 25 seconds per account and skips busy accounts. `auto` still selects accounts using fresh probes rather than the list snapshot. With `SAGY_PROFILE_ROOT` set, the snapshot is stored in that directory instead.
+
+The launcher verifies the executable digest of the tested macOS arm64 build of `agy 1.4.12`. Each process gets its own `HOME`, where the SSH sign-in mode in `agy` stores and refreshes its credentials. Profiles default to `~/.local/share/sagy-profiles`. Processes share the current working directory. Conversation history, settings, and tools that consult `~` use the selected home. In a terminal, bare `auto` and invocations with only model or effort options can switch on a native model execution 429 from the current process log. The profile cools down for five minutes. An available alternate opens a fresh interactive session; without one the current session stays open. History and unfinished work stay with the original profile. Print, piped input and explicit conversation/resume requests only record cooldown to avoid replaying work.
+
+### Syncing native subscription profiles
+
+The native `sagy push` / `sagy pull` commands synchronize the accounts shown by `sagy list`. Set `SAGY_POOL_KEY` to an encryption passphrase shared by the participating machines. Supply the account repository on the first call; subsequent calls can reuse it. `SAGY_POOL_REPO` can also supply the repository:
+
+```bash
+sagy push git@github.com:you/private-sagy-accounts.git
+sagy pull git@github.com:you/private-sagy-accounts.git
+# After remembering the repository
+sagy push
+sagy pull
+```
+
+Only ciphertext is written to `.sagy-native-profiles/bundle.enc.json`, using Argon2id and XChaCha20-Poly1305. The bundle contains profile labels and complete native agy credentials, without local paths, conversation history, settings, or quota snapshots. The passphrase is not saved in the repository or passed to agy or Git children. `--path` selects a relative repository directory; `-i` selects an SSH private key. Supply these options on each invocation.
+
+`push` merges local and remote profiles, retaining remote-only entries. A label with a different saved login is a conflict and stops the push. Busy profiles stop export explicitly; exit their sessions before pushing. `pull` imports only missing labels and reports existing ones as skipped, preserving their login files and never deleting accounts. Run `sagy refresh` afterward to fetch quotas. Imported credentials remain usable without signing in again while their authorization is valid.
+
+This format is separate from the legacy pool. `sagy-legacy push/pull` continue using the portable-credential protocol; the native entrypoint does not import legacy bundles as subscription profiles.
 
 ### Session Resume
 

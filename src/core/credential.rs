@@ -848,7 +848,7 @@ fn parse_strict_json(input: &str) -> Result<Value, CredentialError> {
     Ok(value)
 }
 
-struct StrictValue(Value);
+pub(crate) struct StrictValue(pub(crate) Value);
 
 impl<'de> Deserialize<'de> for StrictValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

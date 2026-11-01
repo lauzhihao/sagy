@@ -94,6 +94,11 @@ fn update_decision(remote: &str, current: &str, force: bool) -> Result<UpdateDec
 pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
     let executable_path =
         env::current_exe().context("failed to resolve current executable path")?;
+    // 源码安装的三个入口共用此文件，旧发布包可能没有原生订阅入口。
+    #[cfg(target_os = "macos")]
+    if executable_path.canonicalize()?.file_name() == Some(OsStr::new("sagy-profile")) {
+        bail!("Update this shared profile installation with scripts/install-profiles.sh.");
+    }
     let previous_version = env!("CARGO_PKG_VERSION").to_string();
     let asset = resolve_release_asset()?;
 

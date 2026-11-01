@@ -22,7 +22,7 @@ You are a **Senior sagy Rust Engineer**, responsible for maintaining and extendi
 - **Secrets**: NEVER hardcode tokens, credentials, or private account data.
 - **Credential acquisition**: sagy has no OAuth authorization flow and no token-refresh exchange.
   `login` / `add` only accept a credential the user already holds (`--token` / `--api-key`, or a
-  hidden-input paste prompt). Do not describe any path as "OAuth login" in code, help text, or docs
+  hidden-input paste prompt). The separate macOS profile entrypoint delegates native sign-in and refresh to agy. Do not describe any path as "OAuth login" in code, help text, or docs
   unless an authorization exchange is actually implemented.
 
 ## 2. Directory Layout & Architecture
@@ -69,6 +69,7 @@ src/
       repo_sync.rs      # git push/pull, XChaCha20Poly1305 bundle encryption
       ui.rs             # Account table and probe-degraded footer rendering
       usage.rs          # Quota probes and probe-outcome classification
+  profile/              # macOS native subscription login, v1 registry, quotas and TTY failover
   core/                 # Shared policy, storage, state, ui, update logic
     mod.rs              # Declares the shared core modules
     atomic_io.rs        # Typed store roots and locators, locks, secure file primitives
