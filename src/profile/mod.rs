@@ -1,7 +1,9 @@
 //! 本机订阅账号池沿用 agy 的独立 HOME 和已有 v1 注册表。
 mod cache;
+mod cli;
 mod observer;
 mod quota;
+mod remove;
 mod repo_sync;
 mod runtime;
 mod statusline;
@@ -18,24 +20,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use runtime::Binary;
 use store::State;
-
-const USAGE: &str = "Usage:
-  sagy                         Start auto with Gemini 3.8 Flash High and auto-approved tools
-  sagy -p PROMPT [options]     Print one response with those defaults
-  sagy-profile login NAME
-  sagy-profile run NAME [agy arguments...]
-  sagy use NAME|INDEX [agy arguments...]  Open an account by label/email or list number
-  sagy-profile auto [agy arguments...]
-  sagy-profile list             Read the local quota snapshot
-  sagy-profile refresh [NAME]   Refresh quota snapshots (parallel across accounts)
-  sagy push [REPO] [options]    Push encrypted native profiles
-  sagy pull [REPO] [options]    Import missing native profiles
-
-NAME can be a short label or an email address. After sign-in in agy, enter /exit.
-auto prefers the highest available model-group quota and switches fresh interactive sessions on HTTP 429.
-auto excludes profiles with known weekly quota below 5%.
-Quota snapshots follow live native status updates and refresh after login/normal exit (up to 8 seconds).
-SAGY_PROFILE_ROOT and AGY_BIN accept absolute paths.";
 
 fn now() -> f64 {
     SystemTime::now()
@@ -325,7 +309,7 @@ fn refresh_after_exit(root: &Path, binary: &Binary, name: &str, home: &Path, cod
     }
 }
 
-fn refresh(root: &Path, binary: &Binary, name: Option<String>) -> Result<i32> {
+fn refresh(root: &Path, binary: &Binary, name: Option<String>, strict: bool) -> Result<i32> {
     let state = snapshot(root)?;
     let names = if let Some(name) = name {
         if !state.profiles.contains(&name) {
@@ -335,6 +319,9 @@ fn refresh(root: &Path, binary: &Binary, name: Option<String>) -> Result<i32> {
     } else {
         state.profiles.clone()
     };
+    if names.is_empty() && strict {
+        bail!("No profiles are available to refresh.");
+    }
     if !names.is_empty() {
         let _signals = observer::SignalGuard::install()?;
         let results = measurements(
@@ -346,6 +333,32 @@ fn refresh(root: &Path, binary: &Binary, name: Option<String>) -> Result<i32> {
             Duration::from_secs(25),
         )?;
         record_measurements(root, &state, &results)?;
+        if strict {
+            let unavailable = results
+                .iter()
+                .filter(|(_, result)| result.windows.iter().any(Option::is_none))
+                .map(|(name, result)| {
+                    let missing = result
+                        .windows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| {
+                            value.is_none().then_some(["5h", "weekly"][index])
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" and ");
+                    format!("{name} ({missing}, {})", result.status)
+                })
+                .collect::<Vec<_>>();
+            let table = list(root)?;
+            if !unavailable.is_empty() {
+                bail!(
+                    "Strict refresh did not get both quota windows in this attempt for: {}.",
+                    unavailable.join(", ")
+                );
+            }
+            return Ok(table);
+        }
     }
     list(root)
 }
@@ -695,12 +708,11 @@ fn interrupt_exit(result: Result<i32>) -> Result<i32> {
 }
 
 fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -> Result<i32> {
-    // 与原启动器一致，agy 及其子工具生成的文件默认只供当前用户访问。
-    unsafe {
-        libc::umask(0o077);
+    if let Some(code) = cli::help_or_version(args) {
+        return Ok(code);
     }
     let expanded;
-    let args = if shortcut && (args.is_empty() || args.first().is_some_and(|arg| arg == "-p")) {
+    let args = if shortcut && (args.is_empty() || cli::is_print_invocation(args)) {
         expanded = [
             "auto",
             "--model",
@@ -715,12 +727,16 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
     } else {
         args
     };
+    // 与原启动器一致，agy 及其子工具生成的文件默认只供当前用户访问。
+    unsafe {
+        libc::umask(0o077);
+    }
     let Some((action, rest)) = args.split_first() else {
-        eprintln!("{USAGE}");
+        cli::print_root_help();
         return Ok(0);
     };
     if rest.is_empty() && ["-h", "--help", "help"].iter().any(|flag| action == flag) {
-        eprintln!("{USAGE}");
+        cli::print_root_help();
         return Ok(0);
     }
     match (action.to_str(), rest) {
@@ -728,10 +744,14 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
             repo_sync::run(&store::root_directory()?, action == "push", extra)
         }
         (Some("list"), []) => list(&store::root_directory()?),
-        (Some("refresh"), []) => refresh(&store::root_directory()?, &verify()?, None),
-        (Some("refresh"), [label]) => {
+        (Some("refresh"), extra) => {
+            let (strict, raw_name) = cli::refresh_options(extra)?;
+            let name = raw_name.as_deref().map(name).transpose()?;
+            refresh(&store::root_directory()?, &verify()?, name, strict)
+        }
+        (Some("rm"), [label]) => {
             let label = name(label)?;
-            refresh(&store::root_directory()?, &verify()?, Some(label))
+            remove::run(&store::root_directory()?, label)
         }
         (Some("login"), [label]) => {
             let label = name(label)?;

@@ -169,6 +169,7 @@ pub(super) fn lock_registry(root: &Path) -> Result<File> {
     let lock = open_private_file(&root.join(".lock"), true)?;
     lock.lock_exclusive()
         .context("failed to lock profile registry")?;
+    super::remove::recover(root)?;
     Ok(lock)
 }
 

@@ -48,7 +48,7 @@ pub(super) fn checked_arguments(args: &[OsString]) -> Result<&[OsString]> {
     })
 }
 
-fn takes_value(flag: &str) -> bool {
+pub(super) fn takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "add-dir"

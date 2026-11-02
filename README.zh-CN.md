@@ -123,6 +123,10 @@ sagy-profile login personal@example.com
 
 将同一启动器以可执行文件名 `sagy` 安装后，单独运行 `sagy` 等同于 `sagy-profile auto --model gemini-3.8-flash-high --dangerously-skip-permissions`。`sagy -p "提示词"` 使用相同默认配置执行一次非交互请求。子命令原样交给 profile 命令，例如 `sagy login work@example.com`、`sagy list`。
 
+自动化可以写 `sagy --print "提示词"`，也可以把选项放在提示词之前，例如 `sagy --output-format json -p "提示词"`。用 `sagy help 命令` 或 `sagy 命令 --help` 查看该命令的参数，用 `sagy --version` 查看启动器版本。
+
+`sagy rm work@example.com` 按准确标签（或邮箱）移出本机账号池，并显示私有归档路径。归档中保留该账号的登录凭据和对话。正在使用的账号需要先退出会话。纯数字按标签处理；列表序号只用于 `use`。如果远端仓库还有该标签，再次 `pull` 会重新导入它。
+
 额度查询和模型请求沿用调用方的代理环境变量。若未设置 HTTP、HTTPS 或 ALL 代理，则默认使用 `http://127.0.0.1:10808`；已有的 `NO_PROXY` 规则仍生效。
 
 `sagy-profile auto` 在启动前向每个空闲账号查询原生 `/usage`。默认比较 Gemini 组，显式指定 `--model claude-sonnet-4-6` 或 GPT 模型时比较 Claude/GPT 组。每个账号以 5 小时和每周两个窗口中较低的剩余百分比参与排序，同分时轮换。查不到额度的账号作为备选，确认耗尽、正在冷却或所选模型组周额度低于 5% 的账号会被跳过；周额度恰好 5% 仍可选。用 `sagy use work@example.com` 可指定账号打开新实例，默认 Gemini 3.8 Flash High 和最高权限，不自动续接；也可追加 agy 参数。`sagy use 1` 按执行时本地快照的列表顺序打开第一个账号，序号从 1 开始；额度更新后排序可能改变，可先运行 `sagy list` 确认。纯数字参数优先作为序号，纯数字标签仍可用 `sagy run 标签` 启动。周额度门槛仅用于自动选号，`use` 允许手动指定低额度账号。用 `sagy-profile run work@example.com` 可原样启动某个账号，在第二个终端用 `sagy-profile run personal@example.com` 可同时使用另一个账号。`sagy-profile list` 列出本地标签。账号被撤销授权时，重新运行对应的 `login`。
@@ -136,6 +140,7 @@ sagy-profile login personal@example.com
 ```bash
 sagy refresh                    # 并行刷新所有空闲账号
 sagy refresh work@example.com   # 只刷新指定账号
+sagy refresh --strict work@example.com  # 本次获取两个额度窗口才成功
 sagy list                       # 读取快照，不等待网络
 ```
 

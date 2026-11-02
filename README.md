@@ -131,6 +131,10 @@ sagy-profile login personal@example.com
 
 When this launcher is installed under the executable name `sagy`, invoking it with no arguments runs `sagy-profile auto --model gemini-3.8-flash-high --dangerously-skip-permissions`. `sagy -p "prompt"` uses the same defaults for a single noninteractive request. Subcommands pass through to the profile CLI, including `sagy login work@example.com` and `sagy list`.
 
+Automation can use `sagy --print "prompt"` or place options before the prompt, for example `sagy --output-format json -p "prompt"`. Use `sagy help COMMAND` or `sagy COMMAND --help` for command-specific help and `sagy --version` for the launcher version.
+
+`sagy rm work@example.com` removes an exact label or email from the local pool and prints the private archive path. The archive retains its credentials and conversations. Close any active session first. Digits are treated as a literal label; only `use` takes list numbers. A later `pull` can reimport the label if the remote pool still contains it.
+
 Quota probes and model requests inherit the caller’s proxy environment. With no HTTP, HTTPS, or ALL proxy set, they default to `http://127.0.0.1:10808` and preserve any `NO_PROXY` rules.
 
 `sagy-profile auto` queries native `/usage` for idle profiles before launch. It compares the Gemini group by default and the Claude/GPT group for explicit Claude or GPT model IDs. The score is the lower remaining percentage across the five-hour and weekly windows. Ties rotate. Unknown quota is a fallback. Exhausted and cooling profiles, and profiles with known weekly quota below 5% for the selected model group, are skipped. Exactly 5% remains eligible. Use `sagy use work@example.com` to open a new instance with a specific account, Gemini 3.8 Flash High, and auto-approved tools, without implicit resume. Additional agy arguments pass through. `sagy use 1` selects the first account in the current cached list order (one-based). Quota updates can change that order; check `sagy list` before choosing. Numeric arguments are list indexes; numeric labels remain accessible through `sagy run LABEL`. The weekly floor only applies to automatic selection; `use` can explicitly select a low-quota account. Use `sagy-profile run work@example.com` for an unmodified launch, or run `sagy-profile run personal@example.com` in another terminal to use both at once. Use `sagy-profile list` to see local labels. Repeat the corresponding `login` if authorization is revoked.
@@ -144,6 +148,7 @@ Built-in lifecycle hooks refresh the selected account after successful login and
 ```bash
 sagy refresh                    # Refresh idle accounts in parallel
 sagy refresh work@example.com   # Refresh one account
+sagy refresh --strict work@example.com  # Require both quota windows from this probe
 sagy list                       # Read the snapshot without waiting for network
 ```
 

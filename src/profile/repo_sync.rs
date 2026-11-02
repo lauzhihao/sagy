@@ -35,6 +35,27 @@ struct Arguments {
     sync: RepoSyncArgs,
 }
 
+/// Parse repository help without creating the native profile directory or reading its registry.
+pub(super) fn help(push: bool, args: &[OsString]) -> Option<i32> {
+    let action = if push { "sagy push" } else { "sagy pull" };
+    let parsed = Arguments::try_parse_from(
+        std::iter::once(OsString::from(action)).chain(args.iter().cloned()),
+    );
+    match parsed {
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            let code = error.exit_code();
+            let _ = error.print();
+            Some(code)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Bundle {

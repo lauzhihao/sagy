@@ -504,6 +504,38 @@ if is_rate_limited:
         self.invoke("refresh")
         self.assertEqual(self.quota_snapshot()["alpha"]["windows"], [0.8, 0.8])
 
+    def test_strict_refresh_requires_both_windows_from_this_attempt(self):
+        self.add_quota_profile("complete", "complete", gemini=(0.8, 0.7))
+        incomplete_home = self.add_quota_profile(
+            "incomplete", "incomplete", gemini=(0.6, None)
+        )
+
+        result = self.invoke("refresh", "--strict", expected=1)
+        self.assertIn("Strict refresh did not get both quota windows", result.stderr)
+        self.assertIn("incomplete (weekly, ready)", result.stderr)
+        self.assertEqual(self.quota_snapshot()["complete"]["windows"], [0.8, 0.7])
+        self.assertEqual(self.quota_snapshot()["incomplete"]["windows"], [0.6, None])
+
+        usage_path = incomplete_home / ".gemini/antigravity-cli/profile-test-usage.json"
+        usage_path.write_text(json.dumps(self.usage_document(gemini=(0.6, 0.5))))
+        self.invoke("refresh", "--strict")
+        self.assertEqual(self.quota_snapshot()["incomplete"]["windows"], [0.6, 0.5])
+
+        empty_root = self.root / "empty-profiles"
+        env = self.clean_environment()
+        env["SAGY_PROFILE_ROOT"] = str(empty_root)
+        env["SAGY_FIXTURE_ARGS"] = json.dumps(["refresh", "--strict"])
+        result = subprocess.run(
+            [TEST_EXE, "--exact", "profile::tests::fixture_dispatch", "--ignored", "--nocapture"],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("No profiles are available to refresh", result.stderr)
+
     def test_exit_hook_refreshes_only_selected_profile_and_failure_keeps_old_sample(self):
         self.add_quota_profile("alpha", "alpha", gemini=0.8)
         self.add_quota_profile("beta", "beta", gemini=0.6)
@@ -940,6 +972,14 @@ if is_rate_limited:
         self.assertEqual(events[-1]["args"][-5:], ["--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions", "-p", "change production config"])
         state = json.loads((self.profile_root / "state.json").read_text())
         self.assertIn("alpha", state["cooldowns"])
+
+    def test_long_print_with_leading_options_uses_auto_defaults(self):
+        self.add_quota_profile("alpha", "alpha", gemini=0.9)
+        options = ["--output-format", "json", "--print", "literal prompt"]
+        self.invoke(*options, shortcut=True)
+        self.assertEqual(self.session_events()[-1]["args"][-(3 + len(options)):], [
+            "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions", *options
+        ])
 
     def test_bare_text_prompt_is_not_replayed_after_429(self):
         self.add_quota_profile("alpha", "alpha", gemini=0.95, third_party=0.9, rate_limited=True)
