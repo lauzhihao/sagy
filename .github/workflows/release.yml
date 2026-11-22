@@ -116,6 +116,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Cargo build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify Linux release uses the native profile protocol
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          target/${{ matrix.target }}/release/sagy --version
+          target/${{ matrix.target }}/release/sagy pull --help | grep -F '.sagy-native-profiles'
       - name: Package archive (unix)
         if: runner.os != 'Windows'
         run: |
