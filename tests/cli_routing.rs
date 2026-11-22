@@ -341,7 +341,7 @@ mod unix_tests {
         let output = fixture.run(&["add", "--help"]);
         assert_success(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Usage: sagy add"));
+        assert!(stdout.contains("Usage: sagy-legacy add"));
         assert!(stdout.contains("--api-key <API_KEY>"));
         assert!(stdout.contains("--switch"));
         assert_eq!(
@@ -356,7 +356,7 @@ mod unix_tests {
         let fixture = Fixture::new();
         let output = fixture.run(&["help", "launch"]);
         assert_success(&output);
-        assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: sagy launch"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: sagy-legacy launch"));
         assert!(!fixture.argv_log.exists());
     }
 }

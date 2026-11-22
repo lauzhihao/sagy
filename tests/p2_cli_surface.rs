@@ -505,14 +505,14 @@ mod unix_tests {
         let topic = fixture.run(&["help", "launch"]);
         assert_success(&topic);
         let topic_stdout = stdout_of(&topic);
-        assert!(topic_stdout.contains("Usage: sagy launch"));
+        assert!(topic_stdout.contains("Usage: sagy-legacy launch"));
         assert!(topic_stdout.contains("--no-resume"));
         assert!(topic_stdout.contains("--dry-run"));
 
         let push = fixture.run(&["push", "--help"]);
         assert_success(&push);
         let push_stdout = stdout_of(&push);
-        assert!(push_stdout.contains("Usage: sagy push"));
+        assert!(push_stdout.contains("Usage: sagy-legacy push"));
         assert!(push_stdout.contains("--path <REPO_PATH>"));
         assert!(push_stdout.contains("-i <IDENTITY_FILE>"));
         assert!(push_stdout.contains("--insecure-host-key"));
@@ -556,7 +556,7 @@ mod unix_tests {
             "`launch -- --help` was intercepted by sagy: {agy_args:?}"
         );
         assert!(
-            !stdout_of(&output).contains("Usage: sagy launch"),
+            !stdout_of(&output).contains("Usage: sagy-legacy launch"),
             "sagy printed its own help for `launch -- --help`"
         );
     }
