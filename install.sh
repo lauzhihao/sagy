@@ -326,7 +326,12 @@ install_native_aliases() {
       echo "Cannot replace directory: ${INSTALL_BIN}/${alias}" >&2
       return 1
     fi
-    ln -sfn sagy "${INSTALL_BIN}/${alias}"
+    # 先在本次安装的目录中创建链接，再原子替换，避免并发 ln 的删除/创建竞态。
+    ln -s sagy "${WORK_DIR}/${alias}"
+    case "$(uname -s)" in
+      Darwin) mv -fh "${WORK_DIR}/${alias}" "${INSTALL_BIN}/${alias}" ;;
+      Linux) mv -fT "${WORK_DIR}/${alias}" "${INSTALL_BIN}/${alias}" ;;
+    esac
   done
 }
 
