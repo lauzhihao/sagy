@@ -12,13 +12,11 @@ pub fn resolve_repo_sync_repo(state_dir: &Path, repo_arg: Option<&str>) -> Resul
 
     if let Some(repo) = repo_arg {
         let trimmed = repo.trim().to_string();
-        if !trimmed.is_empty() {
-            validate_repo_location(&trimmed)?;
-            config.last_repo = Some(trimmed.clone());
-            save_repo_sync_config(state_dir, &config)
-                .context("failed to save repository sync configuration")?;
-            return Ok(trimmed);
-        }
+        validate_repo_location(&trimmed)?;
+        config.last_repo = Some(trimmed.clone());
+        save_repo_sync_config(state_dir, &config)
+            .context("failed to save repository sync configuration")?;
+        return Ok(trimmed);
     }
 
     if let Some(last_repo) = config.last_repo {
