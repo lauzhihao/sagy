@@ -80,7 +80,7 @@ impl Fixture {
     }
 
     fn run(&self, extra: &[&str]) -> Output {
-        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_sagy")));
+        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_sagy-legacy")));
         command.arg("--state-dir").arg(&self.state_dir);
         command.args(extra);
         command.output().expect("run sagy")
@@ -88,7 +88,7 @@ impl Fixture {
 
     /// `parent_env` 模拟用户父 shell 里已经导出的变量。
     fn run_with_parent_env(&self, extra: &[&str], parent_env: &[(&str, &str)]) -> Output {
-        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_sagy")));
+        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_sagy-legacy")));
         for (name, value) in parent_env {
             command.env(name, value);
         }
@@ -99,7 +99,7 @@ impl Fixture {
 
     /// 与 [`Self::run`] 相同, 但不等待结束: 用来制造两个并发的 launch。
     fn spawn(&self, extra: &[&str]) -> Child {
-        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_sagy")));
+        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_sagy-legacy")));
         command.arg("--state-dir").arg(&self.state_dir);
         command.args(extra);
         command
@@ -508,7 +508,7 @@ fn pty_command(fixture: &Fixture) -> Command {
         &wrapper,
         format!(
             "#!/bin/sh\nexec {} --state-dir {} launch --no-import-known --no-resume\n",
-            shell_quote(env!("CARGO_BIN_EXE_sagy")),
+            shell_quote(env!("CARGO_BIN_EXE_sagy-legacy")),
             shell_quote(&fixture.state_dir.to_string_lossy())
         ),
     )
@@ -557,7 +557,7 @@ exit 7
 "
     );
     let fixture = Fixture::new(&one_account(), &body);
-    let mut command = fixture.command(Path::new(env!("CARGO_BIN_EXE_sagy")));
+    let mut command = fixture.command(Path::new(env!("CARGO_BIN_EXE_sagy-legacy")));
     command.arg("--state-dir").arg(&fixture.state_dir);
     command.args(["launch", "--no-import-known", "--no-resume"]);
     command.stdout(Stdio::piped());
@@ -593,7 +593,7 @@ exit 7
 "
     );
     let fixture = Fixture::new(&one_account(), &body);
-    let mut command = fixture.command(Path::new(env!("CARGO_BIN_EXE_sagy")));
+    let mut command = fixture.command(Path::new(env!("CARGO_BIN_EXE_sagy-legacy")));
     command.arg("--state-dir").arg(&fixture.state_dir);
     command.args(["launch", "--no-import-known", "--no-resume"]);
     // 两条真实的管道, 读端在 spawn sagy 之前就已经随 helper 进程退出而关闭。

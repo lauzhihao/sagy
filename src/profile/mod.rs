@@ -6,6 +6,7 @@ mod quota;
 mod remove;
 mod repo_sync;
 mod runtime;
+mod session_settings;
 mod statusline;
 mod store;
 
@@ -15,11 +16,13 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, atomic::AtomicBool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use runtime::Binary;
 use store::State;
+
+const DEFAULT_MODEL: &str = "Gemini 3.8 Flash (High)";
 
 fn now() -> f64 {
     SystemTime::now()
@@ -114,6 +117,10 @@ pub(crate) fn statusline_helper(args: &[OsString]) -> Option<i32> {
     statusline::helper_invocation(args)
 }
 
+pub(crate) fn title_helper(args: &[OsString]) -> Option<i32> {
+    session_settings::helper_invocation(args)
+}
+
 fn run_named(root: &Path, binary: &Binary, name: String, args: &[OsString]) -> Result<i32> {
     let (home, _lease) = {
         let _registry = store::lock_registry(root)?;
@@ -122,7 +129,9 @@ fn run_named(root: &Path, binary: &Binary, name: String, args: &[OsString]) -> R
             bail!("This profile has not completed login.");
         }
         let home = store::profile_home(root, &state, &name, false)?;
-        let lock = lease(&home)?;
+        let lock = store::try_shared_lease(&home)?.ok_or_else(|| {
+            anyhow!("The selected profile is being managed; retry when that operation finishes.")
+        })?;
         (home, lock)
     };
     if !store::token_ready(&home)? {
@@ -131,8 +140,11 @@ fn run_named(root: &Path, binary: &Binary, name: String, args: &[OsString]) -> R
     note(format!("Using profile {name}."));
     let mut bridge = live_bridge(root, &home, &name, binary);
     let mut command = runtime::command(binary, &home)?;
-    if let Some(bridge) = &bridge {
-        bridge.configure(&mut command);
+    if let Err(error) = session_settings::configure(&mut command, bridge.as_ref(), &home) {
+        note(format!("Could not apply session settings: {error}"));
+        if let Some(bridge) = &bridge {
+            bridge.configure(&mut command);
+        }
     }
     let code = runtime::launch_with_poll(command, args, || {
         if let Some(bridge) = &mut bridge {
@@ -188,7 +200,7 @@ fn measure(
         }
         other => other?,
     };
-    let Some(_lock) = store::try_lease(&home)? else {
+    let Some(_lock) = store::try_shared_lease(&home)? else {
         return Ok(Measurement {
             status: "busy",
             windows: [None; 2],
@@ -199,9 +211,10 @@ fn measure(
     if !store::token_ready(&home)? {
         return Ok(missing);
     }
-    let windows = binary
-        .zip(group)
-        .map_or([None; 2], |(bin, g)| quota::probe(bin, &home, g, timeout));
+    let windows = binary.zip(group).map_or([None; 2], |(binary, group)| {
+        statusline::probe_snapshot(root, &home, binary, group, timeout, &AtomicBool::new(false))
+            .map_or([None; 2], |sample| sample.windows)
+    });
     Ok(Measurement {
         status: "ready",
         windows,
@@ -275,25 +288,31 @@ fn record_measurements(
     cache::merge(root, updates)
 }
 
-// 调用方仍持有原 lease，不能再次 try_lease；缓存失败不改变会话退出码。
+// 调用方仍持有账号锁；独立副本查询避免覆盖其他并发会话的凭据。
 fn refresh_after_exit(root: &Path, binary: &Binary, name: &str, home: &Path, code: i32) {
     if code >= 128 {
         return;
     }
     let result = (|| -> Result<()> {
         let _signals = observer::SignalGuard::install()?;
-        let started_at = now();
-        let windows = quota::probe(binary, home, "gemini", Duration::from_secs(8));
+        let sample = statusline::probe_snapshot(
+            root,
+            home,
+            binary,
+            "gemini",
+            Duration::from_secs(8),
+            &AtomicBool::new(false),
+        )?;
         observer::check_interrupted()?;
-        let finished_at = now();
+        let windows = sample.windows;
         cache::merge(
             root,
             [cache::Update {
                 name: name.into(),
                 directory: physical_directory(home)?,
                 windows,
-                started_at,
-                finished_at,
+                started_at: sample.started_at,
+                finished_at: sample.finished_at,
                 result: if windows.iter().any(Option::is_some) {
                     cache::Outcome::Ready
                 } else {
@@ -558,7 +577,7 @@ fn select(
             }
             result => result?,
         };
-        let Some(lock) = store::try_lease(&home)? else {
+        let Some(lock) = store::try_shared_lease(&home)? else {
             continue;
         };
         if !store::token_ready(&home)? {
@@ -631,8 +650,11 @@ fn auto(root: &Path, binary: &Binary, args: &[OsString]) -> Result<i32> {
         let mut successor = None;
         let mut bridge = live_bridge(root, &home, &name, binary);
         let mut command = runtime::command(binary, &home)?;
-        if let Some(bridge) = &bridge {
-            bridge.configure(&mut command);
+        if let Err(error) = session_settings::configure(&mut command, bridge.as_ref(), &home) {
+            note(format!("Could not apply session settings: {error}"));
+            if let Some(bridge) = &bridge {
+                bridge.configure(&mut command);
+            }
         }
         let code = observer::launch_observed_with_poll(
             command,
@@ -695,7 +717,7 @@ fn auto(root: &Path, binary: &Binary, args: &[OsString]) -> Result<i32> {
 }
 
 pub(crate) fn run(args: &[OsString], shortcut: bool) -> Result<i32> {
-    interrupt_exit(dispatch(args, shortcut, runtime::verified_binary))
+    interrupt_exit(dispatch(args, shortcut, runtime::resolve_binary))
 }
 
 fn interrupt_exit(result: Result<i32>) -> Result<i32> {
@@ -716,7 +738,7 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
         expanded = [
             "auto",
             "--model",
-            "gemini-3.8-flash-high",
+            DEFAULT_MODEL,
             "--dangerously-skip-permissions",
         ]
         .map(OsString::from)
@@ -768,15 +790,11 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
             let root = store::root_directory()?;
             let label = use_name(&root, label)?;
             let extra = quota::checked_arguments(extra)?;
-            let args: Vec<OsString> = [
-                "--model",
-                "gemini-3.8-flash-high",
-                "--dangerously-skip-permissions",
-            ]
-            .map(OsString::from)
-            .into_iter()
-            .chain(extra.iter().cloned())
-            .collect();
+            let args: Vec<OsString> = ["--model", DEFAULT_MODEL, "--dangerously-skip-permissions"]
+                .map(OsString::from)
+                .into_iter()
+                .chain(extra.iter().cloned())
+                .collect();
             let binary = verify()?;
             run_named(&root, &binary, label, &args)
         }
@@ -794,7 +812,7 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    // 测试进程使用临时目录内的假 agy，正式二进制始终校验真实 agy 的摘要。
+    // 测试进程使用临时目录内的假 agy，也可走正式的可执行文件解析路径。
     #[test]
     #[ignore = "entry point used only by the isolated subprocess tests"]
     fn fixture_dispatch() {
@@ -803,12 +821,12 @@ mod tests {
         };
         let args: Vec<String> = serde_json::from_str(&raw).unwrap();
         let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
-        let verify: fn() -> Result<Binary> = if std::env::var_os("SAGY_FIXTURE_CHECK_PIN").is_some()
-        {
-            runtime::verified_binary
-        } else {
-            || Binary::fixture(PathBuf::from(std::env::var_os("AGY_BIN").unwrap()))
-        };
+        let verify: fn() -> Result<Binary> =
+            if std::env::var_os("SAGY_FIXTURE_RESOLVE_BINARY").is_some() {
+                runtime::resolve_binary
+            } else {
+                || Binary::fixture(PathBuf::from(std::env::var_os("AGY_BIN").unwrap()))
+            };
         match interrupt_exit(dispatch(
             &args,
             std::env::var_os("SAGY_FIXTURE_SHORTCUT").is_some(),

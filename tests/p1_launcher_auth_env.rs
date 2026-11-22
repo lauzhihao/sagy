@@ -137,7 +137,7 @@ impl Harness {
     fn run_with_parent_env(&self, parent_env: &[(&str, &str)]) -> Output {
         let _ = fs::remove_file(&self.observed_env);
         let _ = fs::remove_file(&self.observed_dump);
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
         for (name, value) in parent_env {
             command.env(name, value);
         }

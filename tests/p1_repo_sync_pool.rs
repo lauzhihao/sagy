@@ -513,7 +513,7 @@ fn cli_and_adapter_share_one_repo_url_trust_boundary() {
 /// `use` 会发布 active home, 必须把 HOME / GEMINI_HOME 全部指到临时目录里,
 /// 否则测试会写到开发者真实的 ~/.gemini。
 fn run_sagy(state_dir: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
     command
         .env("SAGY_POOL_KEY", "p1-repo-sync-pool-regression-key")
         .env("HOME", home)

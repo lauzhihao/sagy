@@ -29,6 +29,8 @@ const MAX_EVENT: u64 = 4096;
 struct Event {
     state: String,
     conversation: Option<String>,
+    #[serde(default)]
+    conversation_title: Option<String>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
 }
@@ -61,6 +63,19 @@ fn event(raw: &[u8]) -> Option<Event> {
         Some(Value::String(id)) if id.len() <= 128 => Some(id.clone()),
         _ => return None,
     };
+    let conversation_title = match value.get("conversation_title") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(title)) => {
+            let title: String = title
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(256)
+                .collect();
+            let title = title.trim().to_owned();
+            if title.is_empty() { None } else { Some(title) }
+        }
+        _ => None,
+    };
     let token_count = |key| match value.pointer(key) {
         None | Some(Value::Null) => Some(None),
         Some(value) => value.as_u64().map(Some),
@@ -68,6 +83,7 @@ fn event(raw: &[u8]) -> Option<Event> {
     Some(Event {
         state: state.into(),
         conversation,
+        conversation_title,
         input_tokens: token_count("/context_window/total_input_tokens")?,
         output_tokens: token_count("/context_window/total_output_tokens")?,
     })
@@ -101,10 +117,10 @@ fn original_status_line(home: &Path) -> Result<Value> {
     Ok(settings.get("statusLine").cloned().unwrap_or(Value::Null))
 }
 
-struct ProbeSample {
-    windows: [Option<f64>; 2],
-    started_at: f64,
-    finished_at: f64,
+pub(super) struct ProbeSample {
+    pub(super) windows: [Option<f64>; 2],
+    pub(super) started_at: f64,
+    pub(super) finished_at: f64,
 }
 
 struct Flight {
@@ -112,10 +128,12 @@ struct Flight {
     cancel: Arc<AtomicBool>,
 }
 
-fn probe_snapshot(
+pub(super) fn probe_snapshot(
     root: &Path,
     home: &Path,
     binary: &Binary,
+    group: &str,
+    timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<ProbeSample> {
     if cancel.load(Ordering::Relaxed) {
@@ -162,13 +180,7 @@ fn probe_snapshot(
             out.write_all(&raw)?;
         }
     }
-    let windows = quota::probe_cancellable(
-        binary,
-        &probe_home,
-        "gemini",
-        Duration::from_secs(25),
-        cancel,
-    );
+    let windows = quota::probe_cancellable(binary, &probe_home, group, timeout, cancel);
     if cancel.load(Ordering::Relaxed) {
         bail!("Quota update cancelled.");
     }
@@ -275,6 +287,10 @@ impl SessionBridge {
         })
     }
 
+    pub(super) fn settings_json(&self) -> &str {
+        &self.settings
+    }
+
     pub(super) fn configure(&self, command: &mut Command) {
         command.args(["--settings", &self.settings]);
     }
@@ -302,7 +318,13 @@ impl SessionBridge {
         let StrictValue(value) =
             serde_json::from_slice::<StrictValue>(&bounded_read(file, MAX_EVENT)?)?;
         let next: Event = serde_json::from_value(value)?;
-        if next.state.len() > 32 || next.conversation.as_ref().is_some_and(|id| id.len() > 128) {
+        if next.state.len() > 32
+            || next.conversation.as_ref().is_some_and(|id| id.len() > 128)
+            || next
+                .conversation_title
+                .as_ref()
+                .is_some_and(|title| title.len() > 256)
+        {
             bail!("Invalid quota callback event.");
         }
         if completed_turn(self.previous.as_ref(), &next) {
@@ -347,8 +369,16 @@ impl SessionBridge {
             let binary = self.binary.try_clone()?;
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = cancel.clone();
-            let handle =
-                thread::spawn(move || probe_snapshot(&root, &home, &binary, &worker_cancel));
+            let handle = thread::spawn(move || {
+                probe_snapshot(
+                    &root,
+                    &home,
+                    &binary,
+                    "gemini",
+                    Duration::from_secs(25),
+                    &worker_cancel,
+                )
+            });
             self.flight = Some(Flight { handle, cancel });
             self.pending = false;
         }
@@ -367,6 +397,31 @@ impl SessionBridge {
         if let Err(error) = self.poll_inner() {
             self.warn(error);
         }
+        self.publish_title();
+    }
+
+    fn publish_title(&self) {
+        let Some(path) = std::env::var_os(super::session_settings::TITLE_FILE_ENV)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let Some(event) = self.previous.as_ref() else {
+            return;
+        };
+        let Some(id) = event.conversation.as_deref().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let title = super::session_settings::intent_title_for_conversation(
+            &self.home,
+            id,
+            event.conversation_title.as_deref(),
+        );
+        if title.is_empty() {
+            return;
+        }
+        let _ = super::session_settings::publish_intent_title(&path, &title);
     }
 
     pub(super) fn finish(&mut self) {
@@ -519,6 +574,7 @@ mod tests {
         let mut payload = Event {
             state: "idle".into(),
             conversation: Some("conversation".into()),
+            conversation_title: None,
             input_tokens: Some(1),
             output_tokens: Some(1),
         };

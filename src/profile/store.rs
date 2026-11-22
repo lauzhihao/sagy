@@ -258,11 +258,25 @@ pub(super) fn profile_home(
 }
 
 pub(super) fn try_lease(home: &Path) -> Result<Option<File>> {
+    try_profile_lease(home, false)
+}
+
+pub(super) fn try_shared_lease(home: &Path) -> Result<Option<File>> {
+    try_profile_lease(home, true)
+}
+
+fn try_profile_lease(home: &Path, shared: bool) -> Result<Option<File>> {
     let profile = home
         .parent()
         .ok_or_else(|| anyhow!("profile home has no parent"))?;
     let file = open_private_file(&profile.join(".lock"), true)?;
-    match file.try_lock_exclusive() {
+    // 会话共享账号目录；登录、归档和导出需等待全部会话释放共享锁。
+    let result = if shared {
+        FileExt::try_lock_shared(&file)
+    } else {
+        FileExt::try_lock_exclusive(&file)
+    };
+    match result {
         Ok(()) => Ok(Some(file)),
         Err(error)
             if error.kind() == fs2::lock_contended_error().kind()
@@ -531,6 +545,22 @@ mod tests {
         assert!(try_lease(&home).unwrap().is_none());
         drop(held);
         assert!(try_lease(&home).unwrap().is_some());
+    }
+
+    #[test]
+    fn shared_sessions_coexist_and_management_waits_for_every_session() {
+        let temp = private_root();
+        let home = prepare_profile(temp.path(), "alpha");
+        let first = try_shared_lease(&home).unwrap().expect("first session");
+        let second = try_shared_lease(&home).unwrap().expect("second session");
+        assert!(try_lease(&home).unwrap().is_none());
+        drop(first);
+        assert!(try_lease(&home).unwrap().is_none());
+        drop(second);
+        let management = try_lease(&home).unwrap().expect("exclusive management");
+        assert!(try_shared_lease(&home).unwrap().is_none());
+        drop(management);
+        assert!(try_shared_lease(&home).unwrap().is_some());
     }
 
     #[test]

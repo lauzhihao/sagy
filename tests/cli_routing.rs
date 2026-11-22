@@ -100,7 +100,7 @@ mod unix_tests {
             let home = self.root.path().join("home");
             let gemini_home = self.root.path().join("gemini");
             let antigravity_home = self.root.path().join("antigravity");
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
             command
                 .args(args)
                 .env("HOME", home)
@@ -156,7 +156,7 @@ mod unix_tests {
         let state_dir = root.path().join("state");
         let fake_log = root.path().join("fake-argv.log");
         let command = |args: &[&str]| {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
             command
                 .args(args)
                 .env("HOME", root.path().join("home"))

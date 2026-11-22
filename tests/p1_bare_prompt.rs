@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use chrono::Utc;
+use sagy::adapters::antigravity::launcher::DEFAULT_MODEL_ID;
 use sagy::core::state::{AccountRecord, AccountType};
 use sagy::core::storage;
 use tempfile::TempDir;
@@ -90,7 +91,7 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
         command
             .arg("--state-dir")
             .arg(&self.state_dir)
@@ -151,7 +152,7 @@ fn bare_prompt_is_compacted_and_does_not_resume() {
     assert_success(&output);
     assert_eq!(
         fixture.argv(),
-        bytes(&["--model", "gemini-3.7-flash-high", "-p", "say hi"])
+        bytes(&["--model", DEFAULT_MODEL_ID, "-p", "say hi"])
     );
 }
 
@@ -162,14 +163,7 @@ fn unknown_flag_tail_is_preserved_without_guessing_its_value() {
     assert_success(&output);
     assert_eq!(
         fixture.argv(),
-        bytes(&[
-            "--model",
-            "gemini-3.7-flash-high",
-            "-p",
-            "say hi",
-            "--foo",
-            "bar",
-        ])
+        bytes(&["--model", DEFAULT_MODEL_ID, "-p", "say hi", "--foo", "bar",])
     );
 }
 
@@ -180,7 +174,7 @@ fn flag_leading_and_explicit_prompt_inputs_are_forwarded_verbatim() {
     assert_success(&output);
     assert_eq!(
         fixture.argv(),
-        bytes(&["--model", "gemini-3.7-flash-high", "--foo", "say", "hi"])
+        bytes(&["--model", DEFAULT_MODEL_ID, "--foo", "say", "hi"])
     );
 
     let fixture = Fixture::new();
@@ -188,7 +182,7 @@ fn flag_leading_and_explicit_prompt_inputs_are_forwarded_verbatim() {
     assert_success(&output);
     assert_eq!(
         fixture.argv(),
-        bytes(&["--model", "gemini-3.7-flash-high", "-p", "say hi"])
+        bytes(&["--model", DEFAULT_MODEL_ID, "-p", "say hi"])
     );
 }
 
@@ -199,7 +193,7 @@ fn router_delimiter_list_shorthand_becomes_a_new_print_prompt() {
     assert_success(&output);
     assert_eq!(
         fixture.argv(),
-        bytes(&["--model", "gemini-3.7-flash-high", "-p", "list"])
+        bytes(&["--model", DEFAULT_MODEL_ID, "-p", "list"])
     );
 }
 
@@ -215,7 +209,7 @@ fn non_utf8_unix_prompt_bytes_survive_compaction() {
         fixture.argv(),
         vec![
             b"--model".to_vec(),
-            b"gemini-3.7-flash-high".to_vec(),
+            DEFAULT_MODEL_ID.as_bytes().to_vec(),
             b"-p".to_vec(),
             b"say\x80 hi\xff".to_vec(),
         ]

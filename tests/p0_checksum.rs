@@ -621,10 +621,10 @@ fn unix_installer_enforces_download_size_limits() {
     );
 }
 
-/// AC-3.1 / AC-3.3：安装后动作失败必须可见，并且如实反映在退出码上。
+/// 原生订阅安装不再读取旧版默认凭据。
 #[test]
 #[cfg(unix)]
-fn unix_installer_surfaces_post_install_failures() {
+fn unix_installer_does_not_import_legacy_credentials() {
     let fixture = TempDir::new().expect("fixture tempdir");
     let (archive, hash) = build_archive(
         fixture.path(),
@@ -648,37 +648,10 @@ fn unix_installer_surfaces_post_install_failures() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    assert!(
-        !output.status.success(),
-        "installer reported success after a failed post-install step:\n{stdout}"
-    );
-    assert!(
-        stderr.contains("import-known"),
-        "post-install failure did not name the failing step: {stderr}"
-    );
-    assert!(
-        stderr.contains("fake import-known failure"),
-        "post-install failure swallowed the underlying output: {stderr}"
-    );
-    assert!(
-        !stdout.contains("Installed passthrough helper"),
-        "installer kept printing the success summary after a failed step:\n{stdout}"
-    );
-
-    // 成功路径仍然必须报告导入成功。
-    let ok_home = fixture.path().join("post-install-ok");
-    fs::create_dir_all(ok_home.join(".gemini")).expect("create gemini home");
-    let ok_run = installer_run(ok_home, &fake_bin, "valid", &archive, &hash, &asset);
-    let ok_output = ok_run.run();
-    assert!(
-        ok_output.status.success(),
-        "successful post-install step was reported as failure: {}",
-        String::from_utf8_lossy(&ok_output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&ok_output.stdout).contains("Imported current Antigravity"),
-        "successful import was not reported"
-    );
+    assert!(output.status.success(), "native install failed: {stderr}");
+    assert!(!stdout.contains("Imported current Antigravity"));
+    assert!(!stderr.contains("import-known"));
+    assert!(stdout.contains("Installed to"));
 }
 
 /// AC-R7-4.1：Ctrl-C 之后脚本必须停下来，而不是带着已删除的工作目录继续跑。

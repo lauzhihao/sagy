@@ -23,7 +23,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("list", "sagy list\nShow local profiles and cached quota."),
     (
         "refresh",
-        "sagy refresh [--strict] [NAME]\nRefresh quota for idle profiles.",
+        "sagy refresh [--strict] [NAME]\nRefresh quota, including profiles with active sessions.",
     ),
     (
         "push",
@@ -69,7 +69,7 @@ pub(super) fn help_or_version(args: &[OsString]) -> Option<i32> {
 
 pub(super) fn print_root_help() {
     eprintln!(
-        "Usage:\n  sagy                         Start auto with Gemini 3.8 Flash High and auto-approved tools\n  sagy -p PROMPT [options]     Print one response with those defaults\n  sagy --print PROMPT [options] Print one response with those defaults\n  sagy-profile <COMMAND>       Manage native subscription profiles\n\nCommands:"
+        "Usage:\n  sagy                         Start auto with Gemini 3.8 Flash (High) and auto-approved tools\n  sagy -p PROMPT [options]     Print one response with those defaults\n  sagy --print PROMPT [options] Print one response with those defaults\n  sagy-profile <COMMAND>       Manage native subscription profiles\n\nCommands:"
     );
     for (name, usage) in COMMANDS {
         let summary = usage.lines().nth(1).unwrap_or_default();

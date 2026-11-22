@@ -14,8 +14,9 @@ use crate::core::atomic_io::{ExternalDirectoryCapability, NormalizedStoreRoot, S
 use crate::core::state::{AccountType, CredentialRefKind, ManagedLayout, SlotState};
 use crate::core::state_store::{StateSession, StateStore};
 
-// agy models 的真实标识。effort 烧在 ID 内, 不再单独传 --effort。
-pub const DEFAULT_MODEL_ID: &str = "gemini-3.7-flash-high";
+// agy 1.5.x accepts the user-facing slug with effort in the name.
+// `--effort` is not supported for this model and would warn at launch.
+pub const DEFAULT_MODEL_ID: &str = "Gemini 3.8 Flash (High)";
 
 const CREDENTIAL_LOCK_FILENAME: &str = ".sagy-credential.lock";
 const ACTIVE_HOME_LOCK_FILENAME: &str = ".sagy-active-home.lock";

@@ -160,7 +160,7 @@ child also receives `BROWSER=/usr/bin/false` as best-effort containment.
 `launcher::final_launch_args` builds the exact argv appended after the resolved `agy` executable,
 from three independent decisions plus the user's own arguments:
 
-1. **Default model**: `--model gemini-3.7-flash-high` is prepended unless the user already passed
+1. **Default model**: `--model "Gemini 3.8 Flash (High)"` is prepended unless the user already passed
    `--model` / `-m` (long or `=` form).
 2. **Session resume**: `--continue` is prepended only when both rules below allow it - the caller
    still asked to resume, and the `agy` arguments carry no session intent of their own.

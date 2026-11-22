@@ -41,13 +41,13 @@ cargo build --release
 
 ## 二、安装的二进制命令
 
-下面的命令表针对发布版的可携带凭据入口。在 macOS 上使用本文的原生订阅安装方式时，请用 `sagy-legacy` 执行这些命令。
+从 v0.3.0 起，Linux/macOS 的 `sagy` 默认使用下文的原生订阅账号池。下面的命令表介绍独立的可携带凭据入口 `sagy-legacy`，可从源码构建该入口。Windows 发布版目前继续使用此入口。
 
 安装后，`sagy` 会在 `$SAGY_HOME/bin` 中提供以下便捷入口：
 
 | 命令 | 对应模型与行为 |
 | :--- | :--- |
-| **`sagy`** | 默认主命令，智能优选最佳账号后启动 `agy`（默认注入 `gemini-3.7-flash-high`；切换其它模型请在 agy 界面内操作） |
+| **`sagy`** | 默认主命令，智能优选最佳账号后启动 `agy`（默认注入 `--model "Gemini 3.8 Flash (High)"`；切换其它模型请在 agy 界面内操作） |
 | **`sagy-original`** | 到底层官方 `agy` 二进制的透明直通辅助命令 |
 
 ---
@@ -111,7 +111,7 @@ Google `authorized_user` JSON 必须包含 `client_id`、`client_secret` 与 `re
 若 timeout、DNS 失败、连接拒绝、代理失败或网关失败仅说明探测通道不可达，且凭据已在本地校验，
 该账号仍可在最低的 `Degraded` 等级参与选择；服务端明确拒绝凭据时仍不可选。
 
-### macOS 上切换个人订阅账号
+### Linux 和 macOS 上切换个人订阅账号
 
 在项目根目录运行安装脚本，会编译一份 Rust 程序。`sagy` 和 `sagy-profile` 使用原生订阅账号池，`sagy-legacy` 提供原有可携带凭据命令。后续更新也使用同一安装脚本。已有 profile 会继续使用原目录和登录态，下面的 `login` 仅用于新增账号。每次授权时核对浏览器显示的 Google 邮箱，回到终端按 `agy` 的提示完成，进入会话后输入 `/exit` 退出。
 
@@ -121,7 +121,7 @@ sagy-profile login work@example.com
 sagy-profile login personal@example.com
 ```
 
-将同一启动器以可执行文件名 `sagy` 安装后，单独运行 `sagy` 等同于 `sagy-profile auto --model gemini-3.8-flash-high --dangerously-skip-permissions`。`sagy -p "提示词"` 使用相同默认配置执行一次非交互请求。子命令原样交给 profile 命令，例如 `sagy login work@example.com`、`sagy list`。
+将同一启动器以可执行文件名 `sagy` 安装后，单独运行 `sagy` 等同于 `sagy-profile auto --model "Gemini 3.8 Flash (High)" --dangerously-skip-permissions`。`sagy -p "提示词"` 使用相同默认配置执行一次非交互请求。子命令原样交给 profile 命令，例如 `sagy login work@example.com`、`sagy list`。
 
 自动化可以写 `sagy --print "提示词"`，也可以把选项放在提示词之前，例如 `sagy --output-format json -p "提示词"`。用 `sagy help 命令` 或 `sagy 命令 --help` 查看该命令的参数，用 `sagy --version` 查看启动器版本。
 
@@ -129,7 +129,7 @@ sagy-profile login personal@example.com
 
 额度查询和模型请求沿用调用方的代理环境变量。若未设置 HTTP、HTTPS 或 ALL 代理，则默认使用 `http://127.0.0.1:10808`；已有的 `NO_PROXY` 规则仍生效。
 
-`sagy-profile auto` 在启动前向每个空闲账号查询原生 `/usage`。默认比较 Gemini 组，显式指定 `--model claude-sonnet-4-6` 或 GPT 模型时比较 Claude/GPT 组。每个账号以 5 小时和每周两个窗口中较低的剩余百分比参与排序，同分时轮换。查不到额度的账号作为备选，确认耗尽、正在冷却或所选模型组周额度低于 5% 的账号会被跳过；周额度恰好 5% 仍可选。用 `sagy use work@example.com` 可指定账号打开新实例，默认 Gemini 3.8 Flash High 和最高权限，不自动续接；也可追加 agy 参数。`sagy use 1` 按执行时本地快照的列表顺序打开第一个账号，序号从 1 开始；额度更新后排序可能改变，可先运行 `sagy list` 确认。纯数字参数优先作为序号，纯数字标签仍可用 `sagy run 标签` 启动。周额度门槛仅用于自动选号，`use` 允许手动指定低额度账号。用 `sagy-profile run work@example.com` 可原样启动某个账号，在第二个终端用 `sagy-profile run personal@example.com` 可同时使用另一个账号。`sagy-profile list` 列出本地标签。账号被撤销授权时，重新运行对应的 `login`。
+`sagy-profile auto` 在启动前向每个账号查询原生 `/usage`。默认比较 Gemini 组，显式指定 `--model claude-sonnet-4-6` 或 GPT 模型时比较 Claude/GPT 组。每个账号以 5 小时和每周两个窗口中较低的剩余百分比参与排序，同分时轮换。查不到额度的账号作为备选，确认耗尽、正在冷却或所选模型组周额度低于 5% 的账号会被跳过；周额度恰好 5% 仍可选。用 `sagy use work@example.com` 可指定账号打开新实例，默认 Gemini 3.8 Flash (High) 和最高权限，不自动续接；也可追加 agy 参数。`sagy use 1` 按执行时本地快照的列表顺序打开第一个账号，序号从 1 开始；额度更新后排序可能改变，可先运行 `sagy list` 确认。纯数字参数优先作为序号，纯数字标签仍可用 `sagy run 标签` 启动。周额度门槛仅用于自动选号，`use` 允许手动指定低额度账号。用 `sagy-profile run work@example.com` 可原样启动某个账号，在第二个终端用 `sagy-profile run personal@example.com` 可同时使用另一个账号。`sagy-profile list` 列出本地标签。账号被撤销授权时，重新运行对应的 `login`。
 
 `sagy list` 只读取本地 `~/.local/share/sagy-profiles/quota.json` 中的 Gemini 额度快照，不发起网络查询。表格的 `Quota age` 显示采样距今多久；没有快照时显示 `--`。快照是 agy 最近报告的额度，在其他客户端使用账号或服务端数据尚未同步时可能滞后。查询失败时保留上次成功值及其原始时间。
 
@@ -138,15 +138,21 @@ sagy-profile login personal@example.com
 启动器内置更新 hook：登录成功、`run` 或 `auto` 会话正常退出时，查询并更新该账号的 Gemini 快照，退出阶段最多额外等待 8 秒；信号退出会跳过。`auto` 启动前的 Gemini 实时查询也会更新快照。更新失败不会改变会话退出码。需要立即更新或接入自己的 hook 时可调用：
 
 ```bash
-sagy refresh                    # 并行刷新所有空闲账号
+sagy refresh                    # 并行刷新所有账号
 sagy refresh work@example.com   # 只刷新指定账号
 sagy refresh --strict work@example.com  # 本次获取两个额度窗口才成功
 sagy list                       # 读取快照，不等待网络
 ```
 
-`refresh` 每个账号最多等待 25 秒，忙碌账号会跳过。`auto` 仍按实时查询结果选择账号，不依赖列表快照。设置 `SAGY_PROFILE_ROOT` 时，快照跟随该目录保存。
+`run`、`use` 和 `auto` 支持同一账号并发运行多个会话。正在使用的账号在列表中仍为 `ready`，也会参与自动选号。同账号会话共用已保存的登录和设置。`busy` 表示账号正处于重新登录、导出或归档等独占管理操作。
 
-这个入口适用于已验证的 macOS arm64 版 `agy 1.4.12`，会校验可执行文件摘要。它让每个进程使用独立的 `HOME`，由 `agy` 的 SSH 登录模式自行保存和刷新凭据。默认目录为 `~/.local/share/sagy-profiles`。工作目录沿用当前项目，对话、设置以及依赖 `~` 的工具配置则按 profile 隔离。在终端用裸 `auto` 或仅带模型、effort 选项启动时，若本次进程日志报告原生模型执行 429，当前账号会冷却 5 分钟。有空闲备号时自动打开新的交互会话；没有备号时留在当前会话。原账号的历史和未完成任务留在原处。`-p`、管道输入、显式续接或指定对话等调用只记录冷却，以免重复执行工作。
+`refresh` 每个账号最多等待 25 秒，可以查询正在运行会话的账号。所有额度查询均使用独立临时 HOME 中的凭据副本。账号管理操作需要先结束该账号的活跃会话。`auto` 仍按实时查询结果选择账号，不依赖列表快照。设置 `SAGY_PROFILE_ROOT` 时，快照跟随该目录保存。
+
+这个 Linux/macOS 入口使用本机安装的 agy，支持独立升级 agy。它让每个账号使用独立的 `HOME`，由 `agy` 的 SSH 登录模式自行保存和刷新凭据。默认目录为 `~/.local/share/sagy-profiles`。工作目录沿用当前项目，对话、设置以及依赖 `~` 的工具配置则按 profile 隔离。在终端用裸 `auto` 或仅带模型、effort 选项启动时，若本次进程日志报告原生模型执行 429，当前账号会冷却 5 分钟。有可用备号时自动打开新的交互会话；没有备号时留在当前会话。原账号的历史和未完成任务留在原处。`-p`、管道输入、显式续接或指定对话等调用只记录冷却，以免重复执行工作。
+
+Linux 通过账号专属 HOME/XDG 和 SSH 文件登录模式运行 agy，并清除继承的桌面钥匙串连接变量。Linux 的隔离范围是进程环境和数据目录。macOS 还使用系统 sandbox 限制对其他账号目录的访问。
+
+从 Linux v0.2.0 升级，可先运行 `sagy update --force` 获取最新版。首次拉取时提供与 Mac 推送时相同的仓库地址，或设置 `SAGY_POOL_REPO`，并设置相同的 `SAGY_POOL_KEY`。例如 `sagy pull git@github.com:you/private-sagy-accounts.git`。新版统一使用原生订阅格式。
 
 ### 同步原生订阅账号
 

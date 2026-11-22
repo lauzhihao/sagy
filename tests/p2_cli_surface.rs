@@ -341,7 +341,7 @@ mod unix_tests {
         }
 
         fn run(&self, args: &[&str]) -> Output {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
             command
                 .args(args)
                 .env("HOME", self.root.path().join("home"))

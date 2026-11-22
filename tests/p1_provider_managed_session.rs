@@ -91,7 +91,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sagy"))
+        Command::new(env!("CARGO_BIN_EXE_sagy-legacy"))
             .args(args)
             .env("HOME", &self.home)
             .env("SAGY_HOME", &self.state)

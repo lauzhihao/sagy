@@ -15,7 +15,7 @@ import unittest
 TEST_EXE = os.environ.get("SAGY_NATIVE_TEST_EXE")
 
 
-@unittest.skipUnless(sys.platform == "darwin" and TEST_EXE, "run via cargo test profile::tests")
+@unittest.skipUnless(sys.platform in ("darwin", "linux") and TEST_EXE, "run via cargo test profile::tests")
 class SagyProfileTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="sagy-profile-test-")
@@ -136,6 +136,14 @@ event = {
 with open(os.environ["PROFILE_FIXTURE_LOG"], "a") as stream:
     stream.write(json.dumps(event) + "\n")
 print(token, flush=True)
+if os.environ.get("PROFILE_FIXTURE_SESSION_BARRIER"):
+    barrier = Path(os.environ["PROFILE_FIXTURE_SESSION_BARRIER"])
+    (barrier / str(os.getpid())).touch()
+    limit = time.monotonic() + 20
+    while not (barrier / "release").exists():
+        if time.monotonic() > limit:
+            raise SystemExit(29)
+        time.sleep(0.02)
 if os.environ.get("PROFILE_FIXTURE_LIVE_EVENTS"):
     import subprocess
     events = json.loads(os.environ["PROFILE_FIXTURE_LIVE_EVENTS"])
@@ -187,7 +195,7 @@ if is_rate_limited:
 
     def invoke(
         self, *arguments, expected=0, fixture_token=None, fixture_fail=False,
-        fixture_usage=None, shortcut=False, check_pin=False, controlling_tty=False,
+        fixture_usage=None, shortcut=False, resolve_binary=False, controlling_tty=False,
         fixture_session_signal=None, fixture_wait_probe=None,
     ):
         env = self.clean_environment()
@@ -204,8 +212,8 @@ if is_rate_limited:
         env["SAGY_FIXTURE_ARGS"] = json.dumps(arguments)
         if shortcut:
             env["SAGY_FIXTURE_SHORTCUT"] = "1"
-        if check_pin:
-            env["SAGY_FIXTURE_CHECK_PIN"] = "1"
+        if resolve_binary:
+            env["SAGY_FIXTURE_RESOLVE_BINARY"] = "1"
         if controlling_tty:
             env["PROFILE_FIXTURE_CONTROLLING_TTY"] = "1"
 
@@ -409,6 +417,7 @@ if is_rate_limited:
         if state_path.exists():
             self.assertEqual(json.loads(state_path.read_text())["profiles"], [])
 
+    @unittest.skipUnless(sys.platform == "darwin", "requires the macOS profile sandbox")
     def test_child_cannot_read_sibling_credential_or_registry(self):
         self.invoke("login", "alpha", fixture_token="alpha-fixture")
         self.invoke("login", "beta", fixture_token="beta-fixture")
@@ -482,7 +491,7 @@ if is_rate_limited:
         probe_log = self.root / "usage-events.jsonl"
         before = probe_log.read_bytes()
         self.fake_agy.unlink()
-        result = self.invoke("list", check_pin=True)
+        result = self.invoke("list", resolve_binary=True)
         self.assertIn("90.00%", result.stderr)
         self.assertIn("30.00%", result.stderr)
         self.assertIn("Quota age", result.stderr)
@@ -493,12 +502,12 @@ if is_rate_limited:
         path = self.profile_root / "quota.json"
         before = (self.root / "usage-events.jsonl").read_bytes()
         path.unlink()
-        result = self.invoke("list", check_pin=True)
+        result = self.invoke("list", resolve_binary=True)
         self.assertNotIn("80.00%", result.stderr)
         self.assertNotIn("Cached Gemini quotas", result.stderr)
         path.write_text("invalid JSON")
         path.chmod(0o600)
-        result = self.invoke("list", check_pin=True)
+        result = self.invoke("list", resolve_binary=True)
         self.assertIn("snapshot is invalid", result.stderr)
         self.assertEqual((self.root / "usage-events.jsonl").read_bytes(), before)
         self.invoke("refresh")
@@ -656,13 +665,14 @@ if is_rate_limited:
                                 break
                         time.sleep(0.03)
                     self.assertTrue(all(value in shown for value in expected), shown)
-                    self.assertIn("busy", shown)
+                    self.assertNotIn("busy", shown)
                     self.assertIn("95.00%", shown)
                     usage_rows = [json.loads(line) for line in (self.root / "usage-events.jsonl").read_text().splitlines()]
                     new_rows = usage_rows[len(baseline_usage.splitlines()):]
                     self.assertEqual(len(new_rows), index + 1)
                     self.assertTrue(all(".sagy-quota-probe-" in row["home"] for row in new_rows))
-                    self.assertTrue(all(row["forbidden_read_allowed"] is False for row in new_rows))
+                    if sys.platform == "darwin":
+                        self.assertTrue(all(row["forbidden_read_allowed"] is False for row in new_rows))
                     self.assertTrue(all(row["home"] != str(self.profile_root / "profiles/alpha/home") for row in new_rows))
                     bridge_files = list((self.profile_root / "profiles/alpha/home").glob(".sagy-statusline-*/event.json"))
                     self.assertEqual(len(bridge_files), 1)
@@ -913,7 +923,7 @@ if is_rate_limited:
         self.invoke("use", "Alice@Example.COM", shortcut=True)
         event = self.read_events()[-1]
         self.assertEqual(event["token"], "alice")
-        defaults = ["--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions"]
+        defaults = ["--model", "Gemini 3.8 Flash (High)", "--dangerously-skip-permissions"]
         self.assertEqual(event["args"], defaults)
         self.invoke("use", "alice@example.com", "--", "-p", "literal prompt", shortcut=True)
         self.assertEqual(self.read_events()[-1]["args"], defaults + ["-p", "literal prompt"])
@@ -969,7 +979,7 @@ if is_rate_limited:
         result = self.invoke("-p", "change production config", expected=1, shortcut=True)
         events = self.session_events()
         self.assertEqual([event["token"] for event in events], ["alpha"])
-        self.assertEqual(events[-1]["args"][-5:], ["--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions", "-p", "change production config"])
+        self.assertEqual(events[-1]["args"][-5:], ["--model", "Gemini 3.8 Flash (High)", "--dangerously-skip-permissions", "-p", "change production config"])
         state = json.loads((self.profile_root / "state.json").read_text())
         self.assertIn("alpha", state["cooldowns"])
 
@@ -978,7 +988,7 @@ if is_rate_limited:
         options = ["--output-format", "json", "--print", "literal prompt"]
         self.invoke(*options, shortcut=True)
         self.assertEqual(self.session_events()[-1]["args"][-(3 + len(options)):], [
-            "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions", *options
+            "--model", "Gemini 3.8 Flash (High)", "--dangerously-skip-permissions", *options
         ])
 
     def test_bare_text_prompt_is_not_replayed_after_429(self):
@@ -991,6 +1001,53 @@ if is_rate_limited:
         self.assertEqual(events[-1]["args"][-3:], ["change", "production", "config"])
         state = json.loads((self.profile_root / "state.json").read_text())
         self.assertIn("alpha", state["cooldowns"])
+
+    def test_same_profile_allows_concurrent_run_use_auto_and_print(self):
+        home = self.add_quota_profile("alpha", "alpha", gemini=0.9)
+        barrier = self.root / "session-barrier"
+        barrier.mkdir()
+        command = [TEST_EXE, "--exact", "profile::tests::fixture_dispatch", "--ignored", "--nocapture"]
+        processes = []
+        try:
+            for arguments in [
+                ["run", "alpha"], ["use", "alpha"],
+                ["auto", "-p", "concurrent auto"], ["-p", "concurrent shortcut"],
+            ]:
+                env = self.clean_environment()
+                env.update(SAGY_FIXTURE_ARGS=json.dumps(arguments),
+                           SAGY_FIXTURE_SHORTCUT="1",
+                           PROFILE_FIXTURE_SESSION_BARRIER=str(barrier))
+                processes.append(subprocess.Popen(command, cwd=self.root, env=env,
+                                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                deadline = time.monotonic() + 10
+                while len(list(barrier.iterdir())) < len(processes):
+                    for process in processes:
+                        if process.poll() is not None:
+                            stdout, stderr = process.communicate()
+                            self.fail(f"Concurrent launch exited early: {stdout!r} {stderr!r}")
+                    self.assertLess(time.monotonic(), deadline, "Concurrent launch did not start")
+                    time.sleep(0.02)
+            self.assertNotIn("busy", self.invoke("list").stderr)
+            self.invoke("refresh", "--strict", "alpha")
+            self.invoke("rm", "alpha", expected=1)
+            self.invoke("login", "alpha", expected=1)
+            remote = self.sync_remote()
+            self.assertIn("busy", self.sync_invoke("push", str(remote), expected=1).stderr)
+            self.assertEqual(len(self.read_events()), 5)  # login plus four live sessions
+            self.assertEqual({event["home"] for event in self.read_events()}, {str(home)})
+            (barrier / "release").touch()
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, (stdout, stderr))
+            self.assertEqual(list((self.profile_root / "profiles").glob(".sagy-quota-probe-*")), [])
+            self.invoke("rm", "alpha")
+            self.assertNotIn("alpha", self.invoke("list").stderr)
+        finally:
+            (barrier / "release").touch()
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    process.communicate(timeout=10)
 
     def test_auto_skips_a_busy_profile(self):
         import fcntl
@@ -1005,11 +1062,10 @@ if is_rate_limited:
         self.invoke("login", "incomplete", expected=1)
         self.assertFalse((self.profile_root / "state.json").exists())
 
-    def test_unknown_binary_does_not_start(self):
-        result = self.invoke("login", "alpha", expected=1, check_pin=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("has not been verified", result.stderr)
-        self.assertFalse(self.log.exists())
+    def test_local_binary_is_accepted_without_a_version_pin(self):
+        self.invoke("login", "alpha", resolve_binary=True, fixture_token="unversioned-fixture")
+        self.assertTrue(self.log.exists())
+        self.assertIn("alpha", json.loads((self.profile_root / "state.json").read_text())["profiles"])
 
     def test_profile_name_validation_rejects_path_traversal(self):
         result = self.invoke("login", "../outside", expected=1)

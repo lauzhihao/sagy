@@ -101,8 +101,8 @@ pub(super) fn group(args: &[OsString]) -> Option<&'static str> {
     }
     match model.as_deref() {
         None => Some("gemini"),
-        Some(model) if model.starts_with("gemini-") => Some("gemini"),
-        Some(model) if model.starts_with("claude-") || model.starts_with("gpt-") => Some("3p"),
+        Some(model) if model.starts_with("gemini") => Some("gemini"),
+        Some(model) if model.starts_with("claude") || model.starts_with("gpt") => Some("3p"),
         Some(_) => None,
     }
 }
@@ -318,15 +318,6 @@ fn bounded_output_cancellable(
     }
 }
 
-pub(super) fn probe(
-    binary: &runtime::Binary,
-    home: &Path,
-    group: &str,
-    timeout: Duration,
-) -> [Option<f64>; 2] {
-    probe_cancellable(binary, home, group, timeout, &AtomicBool::new(false))
-}
-
 pub(super) fn probe_cancellable(
     binary: &runtime::Binary,
     home: &Path,
@@ -377,6 +368,14 @@ mod tests {
             );
         }
         assert_eq!(group(&args(&["--model=gpt-oss-120b"])), Some("3p"));
+        assert_eq!(
+            group(&args(&["--model", "Gemini 3.8 Flash"])),
+            Some("gemini")
+        );
+        assert_eq!(
+            group(&args(&["--model", "Claude Sonnet 5.5 (Medium)"])),
+            Some("3p")
+        );
         assert_eq!(
             group(&args(&["-p", "--model=claude-sonnet-4.5"])),
             Some("gemini")

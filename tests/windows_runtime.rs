@@ -12,7 +12,7 @@ use std::process::Command;
 use serde_json::Value;
 
 fn run_list(state_dir: &Path, home: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_sagy"))
+    Command::new(env!("CARGO_BIN_EXE_sagy-legacy"))
         .env("HOME", home)
         .env("SAGY_HOME", state_dir)
         .env("ANTIGRAVITY_CONFIG_DIR", home.join("antigravity"))

@@ -1375,7 +1375,7 @@ struct TempCheckout {
 
 /// Ephemeral encrypted repository access shared by multiple account-pool formats.
 /// The decrypted payload is returned to the caller and is never written to Git.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) struct EncryptedRepo {
     _checkout: TempCheckout,
     bundle_root: PathBuf,
@@ -1386,7 +1386,7 @@ pub(crate) struct EncryptedRepo {
     insecure_host_key: bool,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl EncryptedRepo {
     pub(crate) fn open(
         state_root: &Path,

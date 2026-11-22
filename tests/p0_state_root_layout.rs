@@ -47,7 +47,7 @@ impl Sandbox {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
         command
             .env("HOME", &self.home)
             .env("SAGY_HOME", &self.state_dir)

@@ -12,6 +12,7 @@ VERSION="${SAGY_VERSION:-}"
 CURL_CONNECT_TIMEOUT="${SAGY_CURL_CONNECT_TIMEOUT:-10}"
 CURL_MAX_TIME="${SAGY_CURL_MAX_TIME:-120}"
 WORK_DIR=""
+STAGED_WRAPPER_PATH=""
 
 # 下载体积上限（字节）。超时只能挡住"慢"，挡不住"大"，因此每条下载都必须显式限量，
 # 超限一律 fail-closed，绝不落盘后再处理。
@@ -27,6 +28,9 @@ need_cmd() {
 }
 
 cleanup_workspace() {
+  if [[ -n "${STAGED_WRAPPER_PATH}" && -e "${STAGED_WRAPPER_PATH}" ]]; then
+    rm -f -- "${STAGED_WRAPPER_PATH}"
+  fi
   if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
     rm -rf -- "${WORK_DIR}"
   fi
@@ -283,7 +287,14 @@ download_and_install() {
   fi
 
   mkdir -p "${INSTALL_BIN}"
-  install -m 0755 "${extracted_path}" "${WRAPPER_PATH}"
+  STAGED_WRAPPER_PATH="$(mktemp "${INSTALL_BIN}/.sagy.XXXXXX")"
+  install -m 0755 "${extracted_path}" "${STAGED_WRAPPER_PATH}"
+  case "$(uname -s)" in
+    Darwin) mv -fh "${STAGED_WRAPPER_PATH}" "${WRAPPER_PATH}" ;;
+    Linux) mv -fT "${STAGED_WRAPPER_PATH}" "${WRAPPER_PATH}" ;;
+    *) echo "Unsupported platform for atomic installation." >&2; return 1 ;;
+  esac
+  STAGED_WRAPPER_PATH=""
 }
 
 # sagy-original resolution order: AGY_BIN -> ~/.gemini/antigravity-cli/bin/agy -> PATH agy.
@@ -308,6 +319,17 @@ EOF
   chmod 0755 "${ORIGINAL_WRAPPER_PATH}"
 }
 
+install_native_aliases() {
+  local alias
+  for alias in sagy-profile sagy-legacy; do
+    if [[ -d "${INSTALL_BIN}/${alias}" && ! -L "${INSTALL_BIN}/${alias}" ]]; then
+      echo "Cannot replace directory: ${INSTALL_BIN}/${alias}" >&2
+      return 1
+    fi
+    ln -sfn sagy "${INSTALL_BIN}/${alias}"
+  done
+}
+
 remove_legacy_aliases() {
   local legacy
   for legacy in flash pro think; do
@@ -316,22 +338,6 @@ remove_legacy_aliases() {
       echo "Removed legacy model alias ${INSTALL_BIN}/${legacy}"
     fi
   done
-}
-
-# 安装后动作不得吞掉失败：把子命令的输出原样转给用户，并让脚本退出码如实反映结果。
-post_install_import() {
-  local import_log status=0
-  if [[ ! -d "${HOME}/.gemini" ]]; then
-    return 0
-  fi
-  import_log="${WORK_DIR}/import-known.log"
-  "${WRAPPER_PATH}" import-known >"${import_log}" 2>&1 || status=$?
-  if [[ "${status}" -ne 0 ]]; then
-    echo "Install failed: '${WRAPPER_PATH} import-known' exited with status ${status}." >&2
-    cat "${import_log}" >&2
-    return 1
-  fi
-  echo "Imported current Antigravity credentials into sagy state."
 }
 
 print_next_steps() {
@@ -352,7 +358,7 @@ setup_workspace
 TARGET="$(detect_target)"
 VERSION="$(resolve_version)"
 download_and_install "${VERSION}" "${TARGET}"
+install_native_aliases
 install_original_wrapper
 remove_legacy_aliases
-post_install_import
 print_next_steps

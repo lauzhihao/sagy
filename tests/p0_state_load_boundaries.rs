@@ -120,7 +120,7 @@ impl Fixture {
 
     /// 驱动真实生产读路径：`sagy list` 是最短的一条"打开 state 并读完"的命令。
     fn run_list_in(&self, state_dir: &Path) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sagy"))
+        Command::new(env!("CARGO_BIN_EXE_sagy-legacy"))
             .env("HOME", &self.home_dir)
             .env("SAGY_HOME", state_dir)
             .env("ANTIGRAVITY_CONFIG_DIR", self.home_dir.join("antigravity"))

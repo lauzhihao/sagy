@@ -51,7 +51,7 @@ impl Harness {
     fn run(&self, args: &[&str]) -> Output {
         const RUN_DEADLINE: Duration = Duration::from_secs(20);
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
         command
             .env("HOME", &self.home_dir)
             .env("SAGY_HOME", &self.state_dir)

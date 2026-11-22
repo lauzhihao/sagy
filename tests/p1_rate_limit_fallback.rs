@@ -45,7 +45,7 @@ impl Fixture {
     }
 
     fn run(&self) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_sagy"))
+        Command::new(env!("CARGO_BIN_EXE_sagy-legacy"))
             .args([
                 "--state-dir",
                 self.state_dir.to_str().expect("UTF-8 state path"),

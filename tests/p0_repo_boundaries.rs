@@ -144,7 +144,7 @@ fn account_credential_target_symlink_is_rejected_before_write() {
 fn push_round_trip_uses_a_disposable_local_bare_repository() {
     let git_bin =
         sagy::adapters::antigravity::paths::find_git_bin().expect("integration test requires git");
-    let sagy_bin = env!("CARGO_BIN_EXE_sagy");
+    let sagy_bin = env!("CARGO_BIN_EXE_sagy-legacy");
 
     let temp = tempfile::tempdir().expect("tempdir");
     let remote = temp.path().join("remote.git");
@@ -230,7 +230,7 @@ fn black_box_unsafe_path_does_not_modify_victim() {
     fs::write(&victim, b"unchanged").expect("victim");
     let nonexistent_repo = temp.path().join("not-a-repository");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sagy"))
+    let output = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"))
         .env("SAGY_POOL_KEY", "test-pool-key")
         .env("HOME", temp.path().join("home"))
         .env("ANTIGRAVITY_CONFIG_DIR", temp.path().join("gemini"))
@@ -370,7 +370,7 @@ fn black_box_rejected_repo_has_no_secret_in_output_or_config() {
     for (index, repo) in cases.iter().enumerate() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_dir = temp.path().join(format!("state-{index}"));
-        let output = Command::new(env!("CARGO_BIN_EXE_sagy"))
+        let output = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"))
             .env("HOME", temp.path().join("home"))
             .env("ANTIGRAVITY_CONFIG_DIR", temp.path().join("gemini"))
             .env("GEMINI_HOME", temp.path().join("gemini"))

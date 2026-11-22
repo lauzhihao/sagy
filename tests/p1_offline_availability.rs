@@ -192,7 +192,7 @@ impl Harness {
     }
 
     fn run_with_probe_channel(&self, subcommand: &str, channel: ProbeChannel) -> Output {
-        let mut process = Command::new(env!("CARGO_BIN_EXE_sagy"));
+        let mut process = Command::new(env!("CARGO_BIN_EXE_sagy-legacy"));
         process
             .args([
                 "--state-dir",

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
+#[cfg(target_os = "macos")]
+use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -11,35 +12,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 
 use super::store;
 
-const VERIFIED_AGY_SHA256: &str =
-    "34423fc9b0af3841e7646aa72a2d40ffeab8218b22d1cb99eac7355f9eba31e3";
+#[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-// 保留已验证文件的句柄；跨账号重启前确认路径仍然指向同一份构建。
+// 每次启动检查当前路径，允许 agy 独立升级后继续使用同一启动器。
 pub(super) struct Binary {
     path: PathBuf,
-    file: File,
-    generation: (i64, i64, u64),
 }
 
 impl Binary {
-    fn generation(meta: &fs::Metadata) -> (i64, i64, u64) {
-        (meta.ctime(), meta.ctime_nsec(), meta.len())
-    }
-
     pub(super) fn check(&self) -> Result<()> {
-        let current = fs::symlink_metadata(&self.path)?;
-        let original = self.file.metadata()?;
-        if !current.is_file()
-            || (original.dev(), original.ino()) != (current.dev(), current.ino())
-            || Self::generation(&current) != self.generation
-        {
-            bail!("The verified agy executable changed; restart the launcher to verify it again.");
+        let metadata = fs::metadata(&self.path)
+            .context("AGY_BIN must identify an executable regular file.")?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            bail!("AGY_BIN must identify an executable regular file.");
         }
         Ok(())
     }
@@ -48,61 +38,54 @@ impl Binary {
         self.check()?;
         Ok(Self {
             path: self.path.clone(),
-            file: self.file.try_clone()?,
-            generation: self.generation,
         })
     }
 
     #[cfg(test)]
     pub(super) fn fixture(path: PathBuf) -> Result<Self> {
-        let file = File::open(&path)?;
-        let generation = Self::generation(&file.metadata()?);
-        Ok(Self {
-            path,
-            file,
-            generation,
-        })
+        let binary = Self { path };
+        binary.check()?;
+        Ok(binary)
     }
 }
 
-pub(super) fn verified_binary() -> Result<Binary> {
-    let binary = std::env::var_os("AGY_BIN")
-        .map(PathBuf::from)
-        .unwrap_or(store::real_home()?.join(".local/bin/agy"));
-    if !binary.is_absolute() {
+pub(super) fn resolve_binary() -> Result<Binary> {
+    let path = if let Some(path) = std::env::var_os("AGY_BIN") {
+        PathBuf::from(path)
+    } else {
+        installed_binary(&store::real_home()?, std::env::var_os("PATH").as_deref())
+            .context("agy was not found. Install agy or set AGY_BIN to its absolute path.")?
+    };
+    if !path.is_absolute() {
         bail!("AGY_BIN must be an absolute path.");
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&binary)
-        .context("AGY_BIN must identify an executable regular file.")?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        bail!("AGY_BIN must identify an executable regular file.");
-    }
-    let mut digest = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    if format!("{:x}", digest.finalize()) != VERIFIED_AGY_SHA256 {
-        bail!("This agy binary has not been verified for isolated profiles; launch was stopped.");
-    }
+    #[cfg(target_os = "macos")]
     if !Path::new(SANDBOX_EXEC).is_file() {
         bail!("The required macOS sandbox launcher is unavailable.");
     }
-    let binary = Binary {
-        path: binary,
-        file,
-        generation: Binary::generation(&metadata),
-    };
+    let binary = Binary { path };
     binary.check()?;
     Ok(binary)
+}
+
+fn installed_binary(home: &Path, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    let candidates = [
+        home.join(".local/bin/agy"),
+        home.join(".gemini/antigravity-cli/bin/agy"),
+    ];
+    candidates
+        .into_iter()
+        .chain(
+            search_path
+                .into_iter()
+                .flat_map(std::env::split_paths)
+                .map(|directory| directory.join("agy")),
+        )
+        .find_map(|path| {
+            let binary = Binary { path };
+            binary.check().ok()?;
+            fs::canonicalize(binary.path).ok()
+        })
 }
 
 fn child_environment(
@@ -135,6 +118,21 @@ fn child_environment(
                 && !excluded.contains(&name.as_ref())
         })
         .collect::<BTreeMap<_, _>>();
+    #[cfg(target_os = "linux")]
+    {
+        // SSH 文件认证不继承调用方显式指定的桌面 keyring 连接。
+        environment.retain(|key, _| {
+            !matches!(
+                key.to_str(),
+                Some(
+                    "DBUS_SESSION_BUS_ADDRESS"
+                        | "DBUS_SESSION_BUS_PID"
+                        | "GNOME_KEYRING_CONTROL"
+                        | "GNOME_KEYRING_PID"
+                )
+            )
+        });
+    }
     let proxy_keys = [
         "http_proxy",
         "HTTP_PROXY",
@@ -164,6 +162,7 @@ fn child_environment(
     environment
 }
 
+#[cfg(target_os = "macos")]
 fn resolved_path(path: &Path) -> Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(resolved) => Ok(resolved),
@@ -180,6 +179,7 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn sandbox_policy(home: &Path, real_home: &Path) -> Result<String> {
     let root = home
         .ancestors()
@@ -206,11 +206,17 @@ fn sandbox_policy(home: &Path, real_home: &Path) -> Result<String> {
 
 pub(super) fn command(binary: &Binary, home: &Path) -> Result<Command> {
     binary.check()?;
-    let mut command = Command::new(SANDBOX_EXEC);
-    command
-        .arg("-p")
-        .arg(sandbox_policy(home, &store::real_home()?)?)
-        .arg(&binary.path);
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new(SANDBOX_EXEC);
+        command
+            .arg("-p")
+            .arg(sandbox_policy(home, &store::real_home()?)?)
+            .arg(&binary.path);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = Command::new(&binary.path);
     command
         .env_clear()
         .envs(child_environment(home, std::env::vars_os()));
@@ -321,16 +327,52 @@ mod tests {
     }
 
     #[test]
-    fn executable_replaced_between_profile_launches_is_rejected() {
+    fn executable_updates_are_accepted_but_invalid_paths_are_rejected() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("agy");
         fs::write(&path, b"first").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let verified = Binary::fixture(path.clone()).unwrap();
         verified.check().unwrap();
         let replacement = root.path().join("new-agy");
         fs::write(&replacement, b"second").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
         fs::rename(&replacement, &path).unwrap();
+        verified.check().unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(verified.check().is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(verified.check().is_err());
+    }
+
+    #[test]
+    fn executable_search_prefers_local_then_vendor_then_path() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let local = home.join(".local/bin/agy");
+        let vendor = home.join(".gemini/antigravity-cli/bin/agy");
+        let on_path = root.path().join("path/agy");
+        for path in [&local, &vendor, &on_path] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"fixture executable").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let search_path = on_path.parent().unwrap().as_os_str();
+        assert_eq!(
+            installed_binary(&home, Some(search_path)),
+            Some(fs::canonicalize(&local).unwrap())
+        );
+        fs::remove_file(&local).unwrap();
+        assert_eq!(
+            installed_binary(&home, Some(search_path)),
+            Some(fs::canonicalize(&vendor).unwrap())
+        );
+        fs::set_permissions(&vendor, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            installed_binary(&home, Some(search_path)),
+            Some(fs::canonicalize(&on_path).unwrap())
+        );
+        assert!(installed_binary(&home, None).is_none());
     }
 
     #[test]
@@ -369,6 +411,7 @@ mod tests {
         assert!(!env.contains_key(OsStr::new("http_proxy")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_excludes_other_profiles_and_real_credentials() {
         let temp = tempfile::tempdir().unwrap();
@@ -378,6 +421,35 @@ mod tests {
         assert!(policy.contains("require-not (subpath"));
         assert!(policy.contains(home.to_str().unwrap()));
         assert!(policy.contains("Library/Keychains"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_uses_the_profile_home_without_inheriting_desktop_keyring_connections() {
+        let env = environment(&[
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("DBUS_SESSION_BUS_PID", "123"),
+            ("GNOME_KEYRING_CONTROL", "/run/user/1000/keyring"),
+            ("GNOME_KEYRING_PID", "456"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ]);
+        for key in [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DBUS_SESSION_BUS_PID",
+            "GNOME_KEYRING_CONTROL",
+            "GNOME_KEYRING_PID",
+        ] {
+            assert!(!env.contains_key(OsStr::new(key)));
+        }
+        assert_eq!(env.get(OsStr::new("HOME")).unwrap(), "/profiles/a/home");
+        assert_eq!(
+            env.get(OsStr::new("SSH_CONNECTION")).unwrap(),
+            "127.0.0.1 0 127.0.0.1 0"
+        );
+        assert_eq!(
+            env.get(OsStr::new("XDG_RUNTIME_DIR")).unwrap(),
+            "/run/user/1000"
+        );
     }
 
     #[test]
