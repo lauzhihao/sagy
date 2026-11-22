@@ -536,7 +536,9 @@ pub(super) fn launch_observed_with_poll(
             limited = true;
             if consult_limit(&mut child, &mut on_limit)? {
                 let status = child.stop()?;
-                switched = child.stopped || status.code().is_some_and(|code| code > 0);
+                // 最后一次 poll 与停止之间仍可能正常退出；成功状态不能触发请求重放。
+                switched = !status.success()
+                    && (child.stopped || status.code().is_some_and(|code| code > 0));
                 break status;
             }
         }
@@ -665,8 +667,27 @@ mod tests {
 
     #[test]
     fn completed_success_with_429_only_records_cooldown() {
+        let mut child = ObservedChild::spawn(&mut fake_command("exit 0")).unwrap();
+        assert!(child.child.wait().unwrap().success());
+        child.reaped = true;
+        child.completed = true;
+        let mut calls = Vec::new();
+        let restart = consult_limit(&mut child, &mut |allow| {
+            calls.push(allow);
+            Ok(true)
+        })
+        .unwrap();
+        assert!(!restart);
+        assert_eq!(calls, vec![false]);
+    }
+
+    #[test]
+    fn successful_exit_while_stopping_does_not_replay_the_request() {
         let home = tempfile::tempdir().unwrap();
-        let script = native_log_script("exit 0");
+        let script = format!(
+            "trap 'exit 0' TERM\n{}",
+            native_log_script("while :; do /bin/sleep 0.1; done")
+        );
         let mut calls = Vec::new();
         let code = launch_observed(fake_command(&script), home.path(), &[], |allow| {
             calls.push(allow);
@@ -674,7 +695,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(code, (0, false));
-        assert_eq!(calls, vec![false]);
+        assert_eq!(calls, vec![true]);
     }
 
     #[test]
