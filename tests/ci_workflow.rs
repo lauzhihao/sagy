@@ -103,6 +103,8 @@ fn pull_request_and_main_quality_workflow_is_isolated_and_complete() {
         "cargo clippy --all-targets --locked -- -D warnings",
         "cargo test --all-targets --locked",
         "cargo build --release --locked",
+        "runs-on: macos-latest",
+        "--test native_desktop",
         "runs-on: windows-latest",
         "cargo test --test windows_runtime --locked",
     ] {
@@ -113,6 +115,7 @@ fn pull_request_and_main_quality_workflow_is_isolated_and_complete() {
     }
     assert!(workflow.contains("permissions:\n  contents: read"));
     assert_sandbox_is_wired_before_cargo(&workflow, "quality");
+    assert_sandbox_is_wired_before_cargo(&workflow, "macos-profiles");
     assert_sandbox_is_wired_before_cargo(&workflow, "windows-runtime");
 }
 
@@ -129,12 +132,15 @@ fn release_workflow_has_version_guard_minimal_permissions_and_single_quality_job
         "version-guard:",
         "cargo metadata --no-deps --format-version 1 --locked",
         "expected_tag=\"v${package_version}\"",
-        "needs: [version-guard, quality, windows-runtime]",
+        "needs: [version-guard, quality, macos-profiles, windows-runtime]",
         "permissions:\n      contents: write",
         "cargo fmt --all -- --check",
         "cargo check --all-targets --locked",
         "cargo test --all-targets --locked",
+        "--test native_desktop",
         "cargo test --test windows_runtime --locked",
+        "aarch64-unknown-linux-musl",
+        "cargo build --release --locked --bin sagy --target ${{ matrix.target }}",
     ] {
         assert!(
             workflow.contains(required),
@@ -164,7 +170,13 @@ fn release_workflow_has_version_guard_minimal_permissions_and_single_quality_job
         declared_scopes, 1,
         "the publish job requests scopes beyond contents: write"
     );
-    for job in ["version-guard", "quality", "windows-runtime", "build"] {
+    for job in [
+        "version-guard",
+        "quality",
+        "macos-profiles",
+        "windows-runtime",
+        "build",
+    ] {
         assert_sandbox_is_wired_before_cargo(&workflow, job);
     }
     assert!(
@@ -191,6 +203,7 @@ fn sandbox_action_sets_all_isolated_homes_on_both_platforms() {
     for variable in [
         "HOME=",
         "SAGY_HOME=",
+        "SAGY_PROFILE_ROOT=",
         "GEMINI_HOME=",
         "ANTIGRAVITY_CONFIG_DIR=",
         "CARGO_HOME=",

@@ -1,23 +1,24 @@
 # sagy Project Map
-> Generated: Wed Aug 26 19:39:34 CST 2026
+> Generated: Mon Nov 23 11:51:18 AM UTC 2026
 > Strategy: Source Focused (src expanded, build outputs omitted)
 
 ## Package
 
 - name: sagy
-- version: 0.1.0
+- version: 0.3.5
 - edition: 2024
 - description: Cross-platform account-aware launcher and scheduler for Google Antigravity CLI (agy).
-- dependencies (20): anyhow, argon2, base64, chacha20poly1305, chrono, clap, directories, flate2, fs2, reqwest, rpassword, serde, serde_json, semver, self-replace, sha2, tar, unicode-width, uuid, zip
+- dependencies (19): anyhow, argon2, base64, chacha20poly1305, chrono, clap, directories, flate2, fs2, reqwest, rpassword, serde, serde_json, semver, sha2, tar, unicode-width, uuid, zip
 
 ## Rust Modules
 
-- crate root: lib, main
+- crate root: legacy_main, lib, main
 - adapters: mod
-- adapters::antigravity: account, active_home, auth, launch_observation, launcher, mod, paths, repo_bundle, repo_sync, ui, usage
+- adapters::antigravity: account, active_home, auth, launch_observation, launcher, mod, native_session, paths, repo_bundle, repo_sync, ui, usage
 - adapters::antigravity::account: credential_store
 - cli: args, help, launch, mod, repo_sync, router
 - core: atomic_io, atomic_store, credential, health, mod, policy, state, state_store, storage, ui, update
+- profile: cache, cli, desktop, desktop_history, desktop_import, desktop_sync, mod, observer, quota, remove, repo_sync, runtime, session_settings, statusline, store, util
 
 ## Directory Structure
 ```text
@@ -108,6 +109,7 @@
 |   |   -- [F] t7-cli.sh
 |   -- [F] README.md
 |-- [D] scripts/
+|   |-- [F] install-profiles.sh
 |   -- [F] map_project.py
 |-- [D] src/
 |   |-- [D] adapters/
@@ -120,6 +122,7 @@
 |   |   |   |-- [F] launch_observation.rs
 |   |   |   |-- [F] launcher.rs
 |   |   |   |-- [F] mod.rs
+|   |   |   |-- [F] native_session.rs
 |   |   |   |-- [F] paths.rs
 |   |   |   |-- [F] repo_bundle.rs
 |   |   |   |-- [F] repo_sync.rs
@@ -145,11 +148,33 @@
 |   |   |-- [F] storage.rs
 |   |   |-- [F] ui.rs
 |   |   -- [F] update.rs
+|   |-- [D] profile/
+|   |   |-- [F] cache.rs
+|   |   |-- [F] cli.rs
+|   |   |-- [F] desktop.rs
+|   |   |-- [F] desktop_history.rs
+|   |   |-- [F] desktop_import.rs
+|   |   |-- [F] desktop_sync.rs
+|   |   |-- [F] mod.rs
+|   |   |-- [F] observer.rs
+|   |   |-- [F] quota.rs
+|   |   |-- [F] remove.rs
+|   |   |-- [F] repo_sync.rs
+|   |   |-- [F] runtime.rs
+|   |   |-- [F] session_settings.rs
+|   |   |-- [F] statusline.rs
+|   |   |-- [F] store.rs
+|   |   -- [F] util.rs
+|   |-- [F] legacy_main.rs
 |   |-- [F] lib.rs
 |   -- [F] main.rs
 |-- [D] tests/
 |   |-- [F] ci_workflow.rs
 |   |-- [F] cli_routing.rs
+|   |-- [F] native_add.rs
+|   |-- [F] native_desktop.rs
+|   |-- [F] native_profiles.rs
+|   |-- [F] native_update.rs
 |   |-- [F] p0_checksum.ps1
 |   |-- [F] p0_checksum.rs
 |   |-- [F] p0_first_run_adoption.rs
@@ -170,6 +195,7 @@
 |   |-- [F] p1_repo_sync_pool.rs
 |   |-- [F] p2_cli_surface.rs
 |   |-- [F] p2_docs_consistency.rs
+|   |-- [F] test_sagy_profile.py
 |   -- [F] windows_runtime.rs
 |-- [F] AGENTS.md
 |-- [F] ARCHITECTURE.md

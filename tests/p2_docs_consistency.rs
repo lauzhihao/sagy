@@ -75,3 +75,73 @@ fn installation_docs_point_to_published_releases_and_preserve_source_instruction
     assert!(!README_EN.contains("No GitHub Release has been published yet"));
     assert!(!README_ZH.contains("尚未发布 GitHub Release"));
 }
+
+#[test]
+fn public_docs_describe_consistent_double_dash_separator_fresh_session_semantics() {
+    for (label, document) in [
+        ("README.md", README_EN),
+        ("README.zh-CN.md", README_ZH),
+        ("ARCHITECTURE.md", ARCHITECTURE),
+    ] {
+        for stale_claim in ["so they still resume", "仍会续接会话", "still resumes"] {
+            assert!(
+                !document.contains(stale_claim),
+                "{label} retains stale inverted `--` separator claim {stale_claim:?}"
+            );
+        }
+        assert!(
+            document.contains("router::route"),
+            "{label} omits router::route boundary translation for `--`"
+        );
+    }
+}
+
+#[test]
+fn readmes_document_opt_in_default_proxy_and_linux_arm64_release_target() {
+    for (label, document) in [("README.md", README_EN), ("README.zh-CN.md", README_ZH)] {
+        assert!(
+            document.contains("SAGY_DEFAULT_PROXY"),
+            "{label} omits SAGY_DEFAULT_PROXY"
+        );
+        assert!(
+            document.contains("aarch64-unknown-linux-musl"),
+            "{label} omits the Linux ARM64 prebuilt target"
+        );
+        assert!(
+            !document.contains("127.0.0.1:10808"),
+            "{label} still claims an unconditional default 127.0.0.1:10808 proxy"
+        );
+    }
+}
+
+#[test]
+fn developer_docs_list_current_entrypoints_and_profile_submodules() {
+    let claude = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/CLAUDE.md"));
+    for (label, document) in [("ARCHITECTURE.md", ARCHITECTURE), ("CLAUDE.md", claude)] {
+        for entry in [
+            "install-profiles.sh",
+            "legacy_main.rs",
+            "native_session.rs",
+            "cache.rs",
+            "cli.rs",
+            "desktop.rs",
+            "desktop_history.rs",
+            "desktop_import.rs",
+            "desktop_sync.rs",
+            "observer.rs",
+            "quota.rs",
+            "remove.rs",
+            "repo_sync.rs",
+            "runtime.rs",
+            "session_settings.rs",
+            "statusline.rs",
+            "store.rs",
+            "util.rs",
+        ] {
+            assert!(
+                document.contains(entry),
+                "{label} directory layout omits {entry}"
+            );
+        }
+    }
+}

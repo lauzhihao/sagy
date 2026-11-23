@@ -43,6 +43,7 @@ jobs:
       - name: Test native subscription profiles
         run: |
           cargo test --lib --locked profile::
+          cargo test --locked --test native_add --test native_desktop --test native_profiles --test native_update --test p1_provider_managed_session --test p2_docs_consistency
 
   windows-runtime:
     runs-on: windows-latest

@@ -8,7 +8,8 @@ if [[ "$(uname -s)" != Darwin && "$(uname -s)" != Linux ]]; then
 fi
 export ANTIGRAVITY_CONFIG_DIR=/tmp/sagy-canary
 export GEMINI_HOME=/tmp/sagy-canary
-bin_dir="${INSTALL_BIN:-$HOME/.local/bin}"
+sagy_home="${SAGY_HOME:-$HOME/.sagy}"
+bin_dir="${INSTALL_BIN:-$sagy_home/bin}"
 for name in sagy sagy-legacy sagy-profile; do
   path="$bin_dir/$name"
   if [[ -d "$path" && ! -L "$path" ]]; then
@@ -32,3 +33,9 @@ done
 # rm 删除旧链接本身，不会跟随指向外部文件或目录的链接。
 rm -f -- "$bin_dir/sagy-profile"
 printf 'Installed native profile launcher in %s\n' "$bin_dir"
+if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+  echo
+  echo "$bin_dir is not currently on PATH."
+  echo "Add this line to your shell profile (~/.zshrc or ~/.bashrc):"
+  echo "  export PATH=\"$bin_dir:\$PATH\""
+fi

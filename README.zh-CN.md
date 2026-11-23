@@ -29,7 +29,7 @@ irm https://raw.githubusercontent.com/lauzhihao/sagy/main/install.ps1 | iex
 ### 预编译支持平台：
 
 - macOS：`aarch64-apple-darwin`（仅 Apple Silicon）
-- Linux：`x86_64-unknown-linux-musl`
+- Linux：`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
 - Windows：`x86_64-pc-windows-msvc`
 
 ### 从源码编译：
@@ -128,7 +128,7 @@ sagy add personal@example.com
 
 `sagy rm work@example.com` 按准确标签（或邮箱）移出本机账号池，并显示私有归档路径。归档中保留该账号的登录凭据和对话。正在使用的账号需要先退出会话。纯数字按标签处理；列表序号只用于 `use`。如果远端仓库还有该标签，再次 `pull` 会重新导入它。
 
-额度查询和模型请求沿用调用方的代理环境变量。若未设置 HTTP、HTTPS 或 ALL 代理，则默认使用 `http://127.0.0.1:10808`；已有的 `NO_PROXY` 规则仍生效。
+额度查询与模型/桌面请求沿用调用方的代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 及其小写形式，保留已有的 `NO_PROXY` / `no_proxy` 规则）。当这些代理变量均未设置时，`sagy` 默认直连；仅在显式设置了 `SAGY_DEFAULT_PROXY` 时才将其作为可选兜底代理注入。
 
 `sagy auto` 在启动前向每个账号查询原生 `/usage`。默认比较 Gemini 组，显式指定 `--model claude-sonnet-4-6` 或 GPT 模型时比较 Claude/GPT 组。每个账号以 5 小时和每周两个窗口中较低的剩余百分比参与排序，同分时轮换。查不到额度的账号作为备选，确认耗尽、正在冷却或所选模型组周额度低于 5% 的账号会被跳过；周额度恰好 5% 仍可选。用 `sagy use work@example.com` 可指定账号打开新实例，默认 Gemini 3.8 Flash (High) 和最高权限，不自动续接；也可追加 agy 参数。`sagy use 1` 按执行时本地快照的列表顺序打开第一个账号，序号从 1 开始；额度更新后排序可能改变，可先运行 `sagy list` 确认。纯数字参数优先作为序号，纯数字标签仍可用 `sagy run 标签` 启动。周额度门槛仅用于自动选号，`use` 允许手动指定低额度账号。用 `sagy run work@example.com` 可原样启动某个账号，在第二个终端用 `sagy run personal@example.com` 可同时使用另一个账号。`sagy list` 列出本地标签。账号被撤销授权时，重新运行对应的 `sagy add 邮箱`。
 
@@ -197,10 +197,11 @@ sagy pull
    分隔符（该分隔符之后的内容同样计入）。
    `--model` / `-m` 后面跟的值属于 option value，不算裸 token。
 
-   开头的那个分隔符会被 sagy 自己的参数解析吃掉，根本到不了这项判定：
-   `sagy -- --help` 与 `sagy launch -- --help` 实际只按 `--help` 判定，因此仍会续接会话，
-   要开新会话请显式加 `--no-resume`。写在中间的分隔符（例如 `sagy --yolo -- --help`）
-   会原样传给 `agy`，这时才会关闭续接。
+   `--` 分隔符在所有可达路径上都统一开启新会话（`--no-resume`）：写在开头的边界分隔符
+   （`sagy -- --help`、`sagy <shortcut> -- --help` 或 `sagy launch [flags] -- --help`）会在
+   `clap` 剥离 `--` 之前由 `router::route` 改写为显式的 `--no-resume`；写在中间的分隔符
+   （例如 `sagy --yolo -- --help`）则会保留在 `extra_args` 中，由
+   `launcher::has_prompt_or_continue_args` 抑制追加 `--continue`。
 
 纯透传（`sagy <agy 参数...>`）遵循同一条规则：只有 `--no-resume` 能关闭续接，
 多带一个与会话无关的 flag 不会悄悄改变续接行为。
@@ -315,6 +316,7 @@ host key 校验**默认开启**：sagy 不会削弱 SSH 的默认行为，遇到
 | `ANTIGRAVITY_CONFIG_DIR` | CLI | 覆盖真实的 Antigravity CLI 目录，默认 `~/.gemini/antigravity-cli` |
 | `GEMINI_HOME` | CLI | 覆盖真实的 Gemini 目录，默认 `~/.gemini` |
 | `AGY_BIN` | `launch`、透传 | 显式指定 `agy` 二进制路径，优先于其它所有查找方式 |
+| `SAGY_DEFAULT_PROXY` | 原生 profile CLI、`desktop`、`refresh` | 可选兜底代理，仅在未设置 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`（及其小写形式）时生效；不会原样透传给子进程 |
 | `LC_ALL`、`LC_MESSAGES`、`LANG` | CLI | locale 为 `zh*.UTF-8` 时输出中文，否则输出英文 |
 
 仅安装脚本使用的变量：
@@ -323,7 +325,7 @@ host key 校验**默认开启**：sagy 不会削弱 SSH 的默认行为，遇到
 | :--- | :--- | :--- |
 | `SAGY_REPO` | `install.sh` | 下载来源的 GitHub `owner/repo`，默认 `lauzhihao/sagy` |
 | `SAGY_VERSION` | `install.sh` | 安装指定 tag 而不是最新 release |
-| `INSTALL_BIN` | `install.sh` | 二进制安装目录，默认 `$SAGY_HOME/bin` |
+| `INSTALL_BIN` | `install.sh`、`scripts/install-profiles.sh` | 二进制安装目录，默认 `$SAGY_HOME/bin` |
 | `SAGY_CURL_CONNECT_TIMEOUT` | `install.sh` | curl 连接超时（秒），默认 `10` |
 | `SAGY_CURL_MAX_TIME` | `install.sh` | curl 总超时（秒），默认 `120` |
 | `SAGY_DOWNLOAD_TIMEOUT_SEC` | `install.ps1` | 下载超时（秒），默认 `120` |
@@ -352,8 +354,9 @@ GOOGLE_OAUTH_ACCESS_TOKEN
 `GOOGLE_CLOUD_PROJECT`，父进程的 `GOOGLE_CLOUD_LOCATION` 只有通过 region 格式校验后才会写回。
 清单中的其它变量保持不存在。
 
-`ANTIGRAVITY_CONFIG_DIR` 与 `GEMINI_HOME` 同时也是开发期的凭据沙箱：跑 `cargo test`
-之前必须把两者指向临时目录，否则测试会覆盖你 `~/.gemini` 里的真实凭据。
+单元测试（`#[cfg(test)]`）已自动隔离默认的 active-home 查找路径，不会回退到 `~/.gemini`。
+在运行完整 `cargo test` 套件或手工调用二进制/子进程时，仍建议将 `ANTIGRAVITY_CONFIG_DIR` 与
+`GEMINI_HOME` 指向临时目录作为纵深防御，避免误触 `~/.gemini` 里的真实凭据。
 
 ---
 

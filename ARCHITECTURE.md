@@ -87,9 +87,13 @@ The following diagram describes the portable `sagy-legacy` engine.
 ## 2. Source Layout & Module Responsibilities
 
 ```text
+scripts/
+  install-profiles.sh      Source build installer for unified sagy + sagy-legacy alias
+  map_project.py           Project map generator (writes .project_map)
 src/
-  main.rs                  Binary entrypoint; calls sagy::main_entry
-  lib.rs                   Parses argv, runs the CLI, maps errors to an exit code
+  main.rs                  Default binary entrypoint; calls sagy::main_entry
+  legacy_main.rs           Portable-credential binary entrypoint; calls sagy::legacy_main_entry
+  lib.rs                   Parses argv, dispatches profile vs legacy CLI, maps errors to exit codes
   cli/
     mod.rs                 Command dispatch, StateSession lifecycle, exit codes
     router.rs              Pre-clap argv routing: sagy prefix vs agy passthrough
@@ -108,11 +112,29 @@ src/
       auth.rs              Login-mode vocabulary, hidden secret input, login dispatch
       launch_observation.rs Bounded parsing of agy stderr into launch diagnostics
       launcher.rs          Child env construction, agy argv assembly, subprocess run
+      native_session.rs    macOS Keychain-guarded local-only provider session passthrough
       paths.rs             agy/git discovery, active-home roots, scope IDs, path guards
       repo_bundle.rs       Encrypted v2 account-pool bundle schema
       repo_sync.rs         git push/pull plus bundle encryption and merge
       ui.rs                Account table and probe-degraded footer rendering
       usage.rs             Quota probes and probe-outcome classification
+  profile/
+    mod.rs                 Native subscription profile orchestration, auto selection, hooks
+    cache.rs               Atomic Gemini quota snapshot persistence outside registry locks
+    cli.rs                 Native profile CLI help, compatibility routing, argument parsing
+    desktop.rs             Shared-history Antigravity Desktop launcher and exclusive pool lock
+    desktop_history.rs     One-time read-only desktop conversation history import and staging
+    desktop_import.rs      Verified Google UserInfo identity check and desktop profile enrollment
+    desktop_sync.rs        Background credential watcher for managed desktop sign-ins
+    observer.rs            Live session log observer for native 429 cooldown and TTY failover
+    quota.rs               Isolated temporary-HOME `/usage` quota probing and parsing
+    remove.rs              Recoverable profile archival and registry removal
+    repo_sync.rs           Argon2id + XChaCha20-Poly1305 native profile bundle Git sync
+    runtime.rs             Profile HOME/XDG/proxy environment, agy discovery, macOS sandbox
+    session_settings.rs    Session-only `--settings` merge for theme and terminal title
+    statusline.rs          `statusLine` turn-completion bridge for background quota refresh
+    store.rs               Versioned profile registry, locks, shared session leases
+    util.rs                EPIPE-safe output, bounded reads, UTF-8 shell quoting helpers
   core/
     mod.rs                 Declares the shared core modules
     atomic_io.rs           Typed store roots and locators, locks, secure file primitives
@@ -125,7 +147,7 @@ src/
     storage.rs             State dir resolution, repo-sync config, legacy helpers
     ui.rs                  Locale detection, ANSI tables and messages
     update.rs              GitHub release download, checksum, self-replace
-tests/                     Integration tests (p0_*/p1_*/p2_*, cli_routing, ci_workflow)
+tests/                     Integration tests (native_*, p0_*/p1_*/p2_*, cli_routing, ci_workflow)
 ```
 
 ## 3. Runtime Directory Layout & State Resolution
@@ -224,10 +246,12 @@ from three independent decisions plus the user's own arguments:
      `-`, or a `--` separator present in `extra_args` together with everything after it. The value
      following `--model` / `-m` is consumed as an option value and is therefore not treated as a
      bare prompt token.
-     Note the asymmetry of the separator: `router::route` strips a *leading* `--` before building
-     `Route::Passthrough`, and clap strips it again for `launch -- <args>`, so `sagy -- --help`
-     reaches `has_prompt_or_continue_args` as just `["--help"]` and still resumes. A separator in a
-     later position (`sagy --yolo -- --help`) survives into `extra_args` and does suppress resuming.
+     A `--` separator consistently starts a fresh session (`--no-resume`) across every reachable
+     path: when written as a leading boundary (`sagy -- --help`, `sagy <shortcut> -- --help`, or
+     `sagy launch [flags] -- --help`), `router::route` translates the boundary into an explicit
+     `--no-resume` before `clap` strips `--`, while a mid-argv separator (`sagy --yolo -- --help`)
+     survives into `extra_args` and suppresses `--continue` in
+     `launcher::has_prompt_or_continue_args`.
 3. **Bare prompt shorthand**: when the first forwarded argument is positional,
    `compact_bare_prompt` joins the consecutive positional run before the first option into one
    `-p` value. Thus `sagy say hi` produces `agy --model <default> -p "say hi"` with no implicit
@@ -261,10 +285,12 @@ form of the same option are present.
 
 - Every GitHub Actions job that invokes Cargo first runs
   `.github/actions/setup-sagy-sandbox/action.yml`. The composite action derives isolated
-  `HOME`, `SAGY_HOME`, `GEMINI_HOME`, `ANTIGRAVITY_CONFIG_DIR`, and `CARGO_HOME` paths at runner
-  runtime and creates those directories before Rust toolchain setup.
-- CI runs the Rust quality gate on Linux and the Windows runtime/checksum harness on a native
-  Windows runner. Release builds depend on the version guard, quality job, and Windows harness.
+  `HOME`, `SAGY_HOME`, `SAGY_PROFILE_ROOT`, `GEMINI_HOME`, `ANTIGRAVITY_CONFIG_DIR`, and
+  `CARGO_HOME` paths at runner runtime and creates those directories before Rust toolchain setup.
+- CI runs the Rust quality gate on Linux, native profile unit + integration tests on macOS, and the
+  Windows runtime/checksum harness on a native Windows runner. Release builds depend on the version
+  guard, quality job, macOS profile suite, and Windows harness, and package only the shipped `sagy`
+  binary across Linux (`x86_64` and `aarch64` musl), macOS (`aarch64`), and Windows.
 - The publish job alone receives `contents: write`; third-party Actions are pinned to commit SHAs.
 - Published packages and checksums are available at https://github.com/lauzhihao/sagy/releases/latest.
   Native `update`/`upgrade` delegates to the existing updater, including `-f`/`--force`, checksum validation,

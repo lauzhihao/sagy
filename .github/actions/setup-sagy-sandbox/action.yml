@@ -14,12 +14,14 @@ runs:
         mkdir -p -- \
           "${sandbox_root}/sagy-home" \
           "${sandbox_root}/sagy-state" \
+          "${sandbox_root}/sagy-profiles" \
           "${sandbox_root}/gemini-home" \
           "${sandbox_root}/antigravity-config" \
           "${sandbox_root}/cargo-home"
         {
           printf 'HOME=%s/sagy-home\n' "${sandbox_root}"
           printf 'SAGY_HOME=%s/sagy-state\n' "${sandbox_root}"
+          printf 'SAGY_PROFILE_ROOT=%s/sagy-profiles\n' "${sandbox_root}"
           printf 'GEMINI_HOME=%s/gemini-home\n' "${sandbox_root}"
           printf 'ANTIGRAVITY_CONFIG_DIR=%s/antigravity-config\n' "${sandbox_root}"
           printf 'CARGO_HOME=%s/cargo-home\n' "${sandbox_root}"
@@ -34,6 +36,7 @@ runs:
         $sandboxPaths = @(
           (Join-Path $sandboxRoot "sagy-home")
           (Join-Path $sandboxRoot "sagy-state")
+          (Join-Path $sandboxRoot "sagy-profiles")
           (Join-Path $sandboxRoot "gemini-home")
           (Join-Path $sandboxRoot "antigravity-config")
           (Join-Path $sandboxRoot "cargo-home")
@@ -44,6 +47,7 @@ runs:
         @(
           "HOME=$sandboxRoot\sagy-home"
           "SAGY_HOME=$sandboxRoot\sagy-state"
+          "SAGY_PROFILE_ROOT=$sandboxRoot\sagy-profiles"
           "GEMINI_HOME=$sandboxRoot\gemini-home"
           "ANTIGRAVITY_CONFIG_DIR=$sandboxRoot\antigravity-config"
           "CARGO_HOME=$sandboxRoot\cargo-home"

@@ -42,10 +42,12 @@ backlog/
   tasks-v3/             # 3rd generation tickets (current) + COMMON.md
   verify/               # Offline acceptance scripts (bugs-NNN.sh, PASS/FAIL)
 scripts/
+  install-profiles.sh   # Source build installer for unified sagy + sagy-legacy alias
   map_project.py        # Project map generator (writes .project_map)
 src/
-  main.rs               # Binary entrypoint; calls sagy::main_entry
-  lib.rs                # Parses argv, runs the CLI, maps errors to an exit code
+  main.rs               # Default binary entrypoint; calls sagy::main_entry
+  legacy_main.rs        # Portable-credential binary entrypoint; calls sagy::legacy_main_entry
+  lib.rs                # Parses argv, dispatches profile vs legacy CLI, maps errors to exit codes
   cli/                  # Command router and args
     mod.rs              # Command dispatch, StateSession lifecycle, exit codes
     args.rs             # clap argument structs and login-mode resolution
@@ -64,12 +66,29 @@ src/
       auth.rs           # Login-mode vocabulary, hidden secret input, login dispatch
       launch_observation.rs # Bounded parsing of agy stderr for 429 diagnostics
       launcher.rs       # Child env construction, agy argv assembly, subprocess execution
+      native_session.rs # macOS Keychain-guarded local-only provider session passthrough
       paths.rs          # agy/git discovery, active-home roots, scope IDs, path guards
       repo_bundle.rs    # Encrypted v2 account-pool bundle schema
       repo_sync.rs      # git push/pull, XChaCha20Poly1305 bundle encryption
       ui.rs             # Account table and probe-degraded footer rendering
       usage.rs          # Quota probes and probe-outcome classification
-  profile/              # macOS native subscription login, v1 registry, quotas and TTY failover
+  profile/              # Linux/macOS native subscription profiles, quotas, desktop & TTY failover
+    mod.rs              # Profile orchestration, auto selection, lifecycle hooks
+    cache.rs            # Atomic Gemini quota snapshot persistence
+    cli.rs              # Native profile CLI help, compatibility routing, argument parsing
+    desktop.rs          # Shared-history Antigravity Desktop launcher and exclusive pool lock
+    desktop_history.rs  # One-time read-only desktop conversation history import
+    desktop_import.rs   # Verified Google UserInfo identity check and desktop profile enrollment
+    desktop_sync.rs     # Background credential watcher for managed desktop sign-ins
+    observer.rs         # Live session log observer for native 429 cooldown and TTY failover
+    quota.rs            # Isolated temporary-HOME `/usage` quota probing and parsing
+    remove.rs           # Recoverable profile archival and registry removal
+    repo_sync.rs        # Argon2id + XChaCha20-Poly1305 native profile bundle Git sync
+    runtime.rs          # Profile HOME/XDG/proxy environment, agy discovery, macOS sandbox
+    session_settings.rs # Session-only `--settings` merge for theme and terminal title
+    statusline.rs       # `statusLine` turn-completion bridge for background quota refresh
+    store.rs            # Versioned profile registry, locks, shared session leases
+    util.rs             # EPIPE-safe output, bounded reads, UTF-8 shell quoting helpers
   core/                 # Shared policy, storage, state, ui, update logic
     mod.rs              # Declares the shared core modules
     atomic_io.rs        # Typed store roots and locators, locks, secure file primitives
@@ -82,7 +101,7 @@ src/
     storage.rs          # State dir resolution, repo-sync config, legacy helpers
     ui.rs               # Locale detection, ANSI tables and messages
     update.rs           # GitHub release download, checksum, self-replace
-tests/                  # Integration tests (p0_*/p1_*/p2_*, docs/CI consistency, Windows runtime)
+tests/                  # Integration tests (native_*, p0_*/p1_*/p2_*, docs/CI consistency, Windows runtime)
 Cargo.toml
 Cargo.lock
 rust-toolchain.toml
@@ -97,10 +116,10 @@ install.ps1
 
 ## 3. Testing & Verification
 - Prefer unit tests close to the implementation with `#[cfg(test)]`.
-- **Always sandbox credentials first.** The test suite and some clippy targets resolve the live
-  Antigravity/Gemini homes, so an unsandboxed run overwrites the developer machine's real
-  credentials under `~/.gemini` (historical defect `bugs-001`). Export both overrides before
-  running any cargo command:
+- **Always sandbox credentials first.** Unit tests (`#[cfg(test)]`) now isolate default
+  active-home lookups automatically (fixing historical defect `bugs-001`), but integration binaries,
+  subprocess invocations, and manual runs still resolve the live homes unless overridden. Export
+  both overrides as defense-in-depth before running any cargo or manual binary command:
   ```bash
   export ANTIGRAVITY_CONFIG_DIR=/tmp/sagy-canary
   export GEMINI_HOME=/tmp/sagy-canary

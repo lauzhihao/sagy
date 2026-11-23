@@ -90,7 +90,7 @@ validate_configuration() {
 
 validate_install_targets() {
   local path
-  for path in "${WRAPPER_PATH}" "${INSTALL_BIN}/sagy-legacy" "${INSTALL_BIN}/sagy-profile"; do
+  for path in "${WRAPPER_PATH}" "${ORIGINAL_WRAPPER_PATH}" "${INSTALL_BIN}/sagy-legacy" "${INSTALL_BIN}/sagy-profile"; do
     if [[ -d "${path}" && ! -L "${path}" ]]; then
       echo "Cannot replace directory: ${path}" >&2
       return 1
@@ -238,6 +238,9 @@ detect_target() {
     Linux/x86_64|Linux/amd64)
       echo "x86_64-unknown-linux-musl"
       ;;
+    Linux/aarch64|Linux/arm64)
+      echo "aarch64-unknown-linux-musl"
+      ;;
     *)
       echo "Unsupported platform: ${os}/${arch}" >&2
       echo "Use a published release asset manually or build from source with cargo." >&2
@@ -313,7 +316,9 @@ download_and_install() {
 # 供应商自带的安装位置优先于 PATH，因为 PATH 上的 agy 可能是别的 wrapper 或别名，
 # 会造成回环调用；install.ps1 必须保持同一顺序。
 install_original_wrapper() {
-  cat > "${ORIGINAL_WRAPPER_PATH}" <<'EOF'
+  # 先写入同目录临时文件再原子替换，避免跟随旧符号链接篡改外部文件。
+  STAGED_WRAPPER_PATH="$(mktemp "${INSTALL_BIN}/.sagy-original.XXXXXX")"
+  cat > "${STAGED_WRAPPER_PATH}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ -n "${AGY_BIN:-}" && -x "${AGY_BIN}" ]]; then
@@ -328,7 +333,13 @@ fi
 echo "agy not found on PATH or ~/.gemini/antigravity-cli/bin/agy." >&2
 exit 1
 EOF
-  chmod 0755 "${ORIGINAL_WRAPPER_PATH}"
+  chmod 0755 "${STAGED_WRAPPER_PATH}"
+  case "$(uname -s)" in
+    Darwin) mv -fh "${STAGED_WRAPPER_PATH}" "${ORIGINAL_WRAPPER_PATH}" ;;
+    Linux) mv -fT "${STAGED_WRAPPER_PATH}" "${ORIGINAL_WRAPPER_PATH}" ;;
+    *) echo "Unsupported platform for atomic installation." >&2; return 1 ;;
+  esac
+  STAGED_WRAPPER_PATH=""
 }
 
 install_legacy_alias() {

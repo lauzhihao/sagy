@@ -175,6 +175,7 @@ fn release_target() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
         _ => None,
     }
 }
@@ -375,6 +376,78 @@ fn source_installer_creates_one_binary_and_a_legacy_alias() {
     );
     assert_unified_profile_install(&fixture.install_bin);
     assert_profiles_installer_arguments(&fixture);
+}
+
+#[test]
+#[cfg(unix)]
+fn source_installer_defaults_to_sagy_home_bin_when_install_bin_is_unset() {
+    let fixture = ProfilesInstallerFixture::new("profiles-default-bin");
+    let fake_bin = fixture.root.path().join("fake-bin");
+    let home = fixture.root.path().join("home");
+    let custom_sagy_home = fixture.root.path().join("custom-sagy-home");
+
+    // 显式设置 SAGY_HOME 且不设 INSTALL_BIN 时，默认落到 $SAGY_HOME/bin 并给出 PATH 提示。
+    let output = Command::new("bash")
+        .arg(fixture.project.join("scripts/install-profiles.sh"))
+        .env("HOME", &home)
+        .env("SAGY_HOME", &custom_sagy_home)
+        .env_remove("INSTALL_BIN")
+        .env("CARGO_TARGET_DIR", fixture.project.join("target"))
+        .env("CARGO_ARG_LOG", &fixture.cargo_log)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").expect("inherit PATH")
+            ),
+        )
+        .output()
+        .expect("run native profile installer with SAGY_HOME");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let custom_bin = custom_sagy_home.join("bin");
+    assert_unified_profile_install(&custom_bin);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_ascii(),
+        "source installer stdout must be ASCII-only: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "{} is not currently on PATH.",
+            custom_bin.display()
+        )),
+        "source installer missed PATH hint: {stdout}"
+    );
+
+    // SAGY_HOME 与 INSTALL_BIN 均未设置时，回退到 $HOME/.sagy/bin。
+    let fallback_output = Command::new("bash")
+        .arg(fixture.project.join("scripts/install-profiles.sh"))
+        .env("HOME", &home)
+        .env_remove("SAGY_HOME")
+        .env_remove("INSTALL_BIN")
+        .env("CARGO_TARGET_DIR", fixture.project.join("target"))
+        .env("CARGO_ARG_LOG", &fixture.cargo_log)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").expect("inherit PATH")
+            ),
+        )
+        .output()
+        .expect("run native profile installer with default HOME/.sagy/bin");
+    assert!(
+        fallback_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fallback_output.stderr)
+    );
+    assert_unified_profile_install(&home.join(".sagy/bin"));
 }
 
 #[test]
@@ -637,6 +710,87 @@ fn unix_installer_refuses_a_real_profile_directory_before_replacing_sagy() {
     );
     assert!(bin.join("sagy-profile").is_dir());
     assert!(!run.sagy_home().join("tmp").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_installer_refuses_a_real_original_wrapper_directory_before_replacing_sagy() {
+    let fixture = TempDir::new().unwrap();
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_curl(&fake_bin);
+    let home = fixture.path().join("original-wrapper-dir-home");
+    let archive = fixture.path().join("unused-archive");
+    let hash = "0".repeat(64);
+    let run = installer_run(
+        home,
+        &fake_bin,
+        "valid",
+        &archive,
+        &hash,
+        "sagy-v1.0.0-test.tar.gz",
+    );
+    let bin = run.sagy_home().join("bin");
+    fs::create_dir_all(bin.join("sagy-original")).unwrap();
+    fs::write(bin.join("sagy"), "keep old sagy\n").unwrap();
+
+    let output = run.run();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot replace directory"));
+    assert_eq!(
+        fs::read_to_string(bin.join("sagy")).unwrap(),
+        "keep old sagy\n"
+    );
+    assert!(bin.join("sagy-original").is_dir());
+    assert!(!run.sagy_home().join("tmp").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_installer_replaces_symlinked_original_wrapper_without_touching_external_target() {
+    let fixture = TempDir::new().unwrap();
+    let (archive, hash) = build_archive(
+        fixture.path(),
+        "original-wrapper-symlink",
+        &[("sagy", "new sagy binary\n", true)],
+    );
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_curl(&fake_bin);
+    let Some(target) = release_target() else {
+        return;
+    };
+    let asset = format!("sagy-v1.0.0-{target}.tar.gz");
+    let run = installer_run(
+        fixture.path().join("original-wrapper-symlink-home"),
+        &fake_bin,
+        "valid",
+        &archive,
+        &hash,
+        &asset,
+    );
+    let bin = run.sagy_home().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let external = fixture.path().join("external-original-target");
+    fs::write(&external, "preserve external sagy-original target\n").unwrap();
+    std::os::unix::fs::symlink(&external, bin.join("sagy-original")).unwrap();
+
+    let output = run.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&external).unwrap(),
+        "preserve external sagy-original target\n",
+        "install.sh followed a symlinked sagy-original and overwrote its external target"
+    );
+    let wrapper_meta = fs::symlink_metadata(bin.join("sagy-original")).unwrap();
+    assert!(
+        wrapper_meta.file_type().is_file() && !wrapper_meta.file_type().is_symlink(),
+        "sagy-original must be atomically replaced with a real file"
+    );
 }
 
 /// 一次性临时目录的守卫：安装结束后 `${SAGY_HOME}/tmp` 不允许留下任何条目。

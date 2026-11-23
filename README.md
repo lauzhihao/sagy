@@ -29,7 +29,7 @@ irm https://raw.githubusercontent.com/lauzhihao/sagy/main/install.ps1 | iex
 ### Pre-built Binary Targets:
 
 - macOS: `aarch64-apple-darwin` (Apple Silicon only)
-- Linux: `x86_64-unknown-linux-musl`
+- Linux: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
 - Windows: `x86_64-pc-windows-msvc`
 
 ### Build From Source:
@@ -136,7 +136,7 @@ Automation can use `sagy --print "prompt"` or place options before the prompt, f
 
 `sagy rm work@example.com` removes an exact label or email from the local pool and prints the private archive path. The archive retains its credentials and conversations. Close any active session first. Digits are treated as a literal label; only `use` takes list numbers. A later `pull` can reimport the label if the remote pool still contains it.
 
-Quota probes and model requests inherit the caller’s proxy environment. With no HTTP, HTTPS, or ALL proxy set, they default to `http://127.0.0.1:10808` and preserve any `NO_PROXY` rules.
+Quota probes and model/desktop requests inherit the caller's proxy environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and their lowercase variants, preserving any `NO_PROXY` / `no_proxy` rules). When none of those variables is set, `sagy` connects directly unless `SAGY_DEFAULT_PROXY` is explicitly set as an opt-in fallback proxy.
 
 `sagy auto` queries native `/usage` for profiles before launch. It compares the Gemini group by default and the Claude/GPT group for explicit Claude or GPT model IDs. The score is the lower remaining percentage across the five-hour and weekly windows. Ties rotate. Unknown quota is a fallback. Exhausted and cooling profiles, and profiles with known weekly quota below 5% for the selected model group, are skipped. Exactly 5% remains eligible. Use `sagy use work@example.com` to open a new instance with a specific account, Gemini 3.8 Flash (High), and auto-approved tools, without implicit resume. Additional agy arguments pass through. `sagy use 1` selects the first account in the current cached list order (one-based). Quota updates can change that order; check `sagy list` before choosing. Numeric arguments are list indexes; numeric labels remain accessible through `sagy run LABEL`. The weekly floor only applies to automatic selection; `use` can explicitly select a low-quota account. Use `sagy run work@example.com` for an unmodified launch, or run `sagy run personal@example.com` in another terminal to use both at once. Use `sagy list` to see local labels. Repeat the corresponding `sagy add EMAIL` if authorization is revoked.
 
@@ -196,7 +196,7 @@ an implicit `--continue`. Otherwise, exactly two things suppress resuming:
 
 1. `--no-resume`. It is a sagy-side flag, so it must appear before the first `agy` argument
    (`sagy --no-resume ...` or `sagy launch --no-resume ...`). Written after one, it is no longer a
-   sagy flag: `sagy --yolo --no-resume` forwards `--no-resume` to `agy` and still resumes.
+   sagy flag: `sagy --yolo --no-resume` forwards `--no-resume` to `agy` and resumes the previous session.
 2. The `agy` arguments already carry a session intent of their own. In that case sagy adds nothing
    and lets `agy` decide. This triggers on any of:
    `-c`, `--continue`, `-p`, `--print`, `--print=<...>`, `--prompt`, `--prompt=<...>`,
@@ -205,10 +205,11 @@ an implicit `--continue`. Otherwise, exactly two things suppress resuming:
    the argument list handed to `agy` (everything after such a separator counts as well).
    The value following `--model` / `-m` is an option value, not a bare token, and does not count.
 
-   A *leading* separator is consumed by sagy's own argument parsing and never reaches that check:
-   `sagy -- --help` and `sagy launch -- --help` are judged only on `--help`, so they still resume.
-   Pass `--no-resume` there if you want a fresh session. A separator that appears later, as in
-   `sagy --yolo -- --help`, does reach `agy` and does suppress resuming.
+   A `--` separator always starts a fresh session (`--no-resume`) across every reachable path:
+   when written as a leading boundary (`sagy -- --help`, `sagy <shortcut> -- --help`, or
+   `sagy launch [flags] -- --help`), `router::route` translates the boundary into an explicit
+   `--no-resume` before `clap` strips `--`, while a mid-argv separator (`sagy --yolo -- --help`)
+   survives into `extra_args` and suppresses `--continue` in `launcher::has_prompt_or_continue_args`.
 
 Plain passthrough (`sagy <agy args...>`) follows the same rule: only `--no-resume` turns resuming
 off, so adding an unrelated flag never silently changes session behaviour.
@@ -329,6 +330,7 @@ Only use it for a repository you fully control on a trusted network, and prefer 
 | `ANTIGRAVITY_CONFIG_DIR` | CLI | Overrides the live Antigravity CLI home. Default `~/.gemini/antigravity-cli` |
 | `GEMINI_HOME` | CLI | Overrides the live Gemini home. Default `~/.gemini` |
 | `AGY_BIN` | `launch`, passthrough | Explicit path to the `agy` binary. Checked before every other lookup |
+| `SAGY_DEFAULT_PROXY` | Native profile CLI, `desktop`, `refresh` | Opt-in fallback proxy applied when none of `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (or lowercase variants) is set; stripped before spawning children |
 | `LC_ALL`, `LC_MESSAGES`, `LANG` | CLI | A `zh*.UTF-8` locale selects Chinese console output; anything else is English |
 
 Installer-only variables:
@@ -337,7 +339,7 @@ Installer-only variables:
 | :--- | :--- | :--- |
 | `SAGY_REPO` | `install.sh` | GitHub `owner/repo` to download from. Default `lauzhihao/sagy` |
 | `SAGY_VERSION` | `install.sh` | Install a specific tag instead of the latest release |
-| `INSTALL_BIN` | `install.sh` | Destination directory for the binaries. Default `$SAGY_HOME/bin` |
+| `INSTALL_BIN` | `install.sh`, `scripts/install-profiles.sh` | Destination directory for the binaries. Default `$SAGY_HOME/bin` |
 | `SAGY_CURL_CONNECT_TIMEOUT` | `install.sh` | curl connect timeout in seconds. Default `10` |
 | `SAGY_CURL_MAX_TIME` | `install.sh` | curl total timeout in seconds. Default `120` |
 | `SAGY_DOWNLOAD_TIMEOUT_SEC` | `install.ps1` | Download timeout in seconds. Default `120` |
@@ -367,9 +369,10 @@ account, `GOOGLE_APPLICATION_CREDENTIALS` for a Vertex service account,
 `GOOGLE_CLOUD_PROJECT` when the OAuth or Vertex account carries a project ID, and a sanitized
 `GOOGLE_CLOUD_LOCATION` inherited from the parent. The other listed variables stay absent.
 
-`ANTIGRAVITY_CONFIG_DIR` and `GEMINI_HOME` are also the credential sandbox used when developing:
-point both at a scratch directory before running `cargo test`, otherwise the test suite writes over
-the real credentials in your `~/.gemini`.
+Unit tests (`#[cfg(test)]`) isolate default active-home lookups automatically so `cargo test --lib`
+never falls back to `~/.gemini`. Keep pointing `ANTIGRAVITY_CONFIG_DIR` and `GEMINI_HOME` at a
+scratch directory as defense-in-depth for full `cargo test` runs and manual binary/subprocess
+invocations so nothing can touch real credentials in `~/.gemini`.
 
 ---
 
