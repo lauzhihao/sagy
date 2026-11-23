@@ -64,18 +64,53 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
     well_known.into_iter().find(|candidate| candidate.is_file())
 }
 
+/// 单元测试在未设置覆盖变量时绝不能回退到开发机真实的 `~/.gemini`（历史缺陷 `bugs-001`）。
+#[cfg(test)]
+fn isolated_unit_test_home() -> &'static Path {
+    static TEST_HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    TEST_HOME
+        .get_or_init(|| tempfile::tempdir().expect("create isolated unit-test home"))
+        .path()
+}
+
 pub fn default_antigravity_cli_home() -> Option<PathBuf> {
-    if let Some(override_path) = non_empty_env_path("ANTIGRAVITY_CONFIG_DIR") {
-        return Some(expand_user_path(&override_path));
-    }
-    platform_home_dir().map(|home| home.join(".gemini").join("antigravity-cli"))
+    resolve_antigravity_cli_home(non_empty_env_path("ANTIGRAVITY_CONFIG_DIR"))
 }
 
 pub fn default_gemini_home() -> Option<PathBuf> {
-    if let Some(override_path) = non_empty_env_path("GEMINI_HOME") {
+    resolve_gemini_home(non_empty_env_path("GEMINI_HOME"))
+}
+
+fn resolve_antigravity_cli_home(override_path: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(override_path) = override_path {
         return Some(expand_user_path(&override_path));
     }
-    platform_home_dir().map(|home| home.join(".gemini"))
+    #[cfg(test)]
+    {
+        Some(
+            isolated_unit_test_home()
+                .join(".gemini")
+                .join("antigravity-cli"),
+        )
+    }
+    #[cfg(not(test))]
+    {
+        platform_home_dir().map(|home| home.join(".gemini").join("antigravity-cli"))
+    }
+}
+
+fn resolve_gemini_home(override_path: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(override_path) = override_path {
+        return Some(expand_user_path(&override_path));
+    }
+    #[cfg(test)]
+    {
+        Some(isolated_unit_test_home().join(".gemini"))
+    }
+    #[cfg(not(test))]
+    {
+        platform_home_dir().map(|home| home.join(".gemini"))
+    }
 }
 
 /// Return the two normalized roots used by the managed active profile.  The
@@ -118,6 +153,7 @@ fn non_empty_path_value(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     })
 }
 
+#[cfg(not(test))]
 fn platform_home_dir() -> Option<PathBuf> {
     if let Some(home) = non_empty_env_path("HOME") {
         return Some(home);
@@ -405,5 +441,52 @@ mod tests {
             active_home_scope_id(&real, &gemini),
             active_home_scope_id(&alias, &gemini)
         );
+    }
+
+    #[test]
+    fn unit_test_default_homes_use_isolated_tempdir_and_never_touch_real_home() {
+        let isolated = isolated_unit_test_home();
+        assert!(isolated.is_dir());
+        assert_eq!(isolated, isolated_unit_test_home());
+
+        let cli_default =
+            resolve_antigravity_cli_home(non_empty_path_value(None)).expect("cli fallback");
+        let gemini_default =
+            resolve_gemini_home(non_empty_path_value(None)).expect("gemini fallback");
+        assert_eq!(
+            cli_default,
+            isolated.join(".gemini").join("antigravity-cli")
+        );
+        assert_eq!(gemini_default, isolated.join(".gemini"));
+        assert_eq!(
+            resolve_antigravity_cli_home(non_empty_path_value(Some("   ".into()))),
+            Some(cli_default.clone())
+        );
+        assert_eq!(
+            resolve_gemini_home(non_empty_path_value(Some("".into()))),
+            Some(gemini_default.clone())
+        );
+
+        if non_empty_env_path("ANTIGRAVITY_CONFIG_DIR").is_none() {
+            assert_eq!(default_antigravity_cli_home(), Some(cli_default.clone()));
+        }
+        if non_empty_env_path("GEMINI_HOME").is_none() {
+            assert_eq!(default_gemini_home(), Some(gemini_default.clone()));
+        }
+
+        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+            if !home.as_os_str().is_empty() {
+                let real_gemini = home.join(".gemini");
+                assert_ne!(isolated, home.as_path());
+                assert!(
+                    !isolated.starts_with(&real_gemini),
+                    "isolated test home {} must never live inside ~/.gemini ({})",
+                    isolated.display(),
+                    real_gemini.display()
+                );
+                assert_ne!(cli_default, real_gemini.join("antigravity-cli"));
+                assert_ne!(gemini_default, real_gemini);
+            }
+        }
     }
 }

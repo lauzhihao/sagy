@@ -95,7 +95,8 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
     let executable_path =
         env::current_exe().context("failed to resolve current executable path")?;
     let previous_version = env!("CARGO_PKG_VERSION").to_string();
-    let asset = resolve_release_asset()?;
+    let client = http_client()?;
+    let asset = resolve_release_asset_with_client(&client)?;
 
     match update_decision(&asset.version, &previous_version, force)? {
         UpdateDecision::AlreadyCurrent => {
@@ -109,7 +110,7 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
         UpdateDecision::Update => {}
     }
 
-    let binary = download_release_binary(&asset)?;
+    let binary = download_release_binary_with_client(&client, &asset)?;
     let staged = stage_release_binary(state_dir, &binary)?;
 
     replace_staged_binary(&staged, &executable_path)?;
@@ -237,11 +238,11 @@ fn stage_release_binary(state_dir: &Path, binary: &[u8]) -> Result<StagedBinary>
     Ok(staged)
 }
 
-fn resolve_release_asset() -> Result<ReleaseAsset> {
+fn resolve_release_asset_with_client(client: &Client) -> Result<ReleaseAsset> {
     let target = current_release_target()?;
     let repo = env::var("SAGY_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
     validate_repository(&repo)?;
-    let release = fetch_latest_release(&repo)?;
+    let release = fetch_latest_release(client, &repo)?;
     let tag = release.tag_name;
     let version = parse_release_version(&tag)?.to_string();
     Ok(ReleaseAsset {
@@ -274,10 +275,9 @@ fn is_safe_repository_component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn fetch_latest_release(repo: &str) -> Result<GithubRelease> {
-    let client = http_client()?;
+fn fetch_latest_release(client: &Client, repo: &str) -> Result<GithubRelease> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    fetch_release_metadata(&client, &url)
+    fetch_release_metadata(client, &url)
 }
 
 /// 下载点 1/3：release metadata。上限写在这里而不是调用方，
@@ -306,6 +306,8 @@ fn fetch_release_metadata(client: &Client, url: &str) -> Result<GithubRelease> {
 fn fetch_release_asset(client: &Client, url: &str) -> Result<Vec<u8>> {
     let response = client
         .get(url)
+        // 归档下载体积明显大于 metadata 与 checksum 清单，单独放宽到与安装脚本一致的 120s。
+        .timeout(Duration::from_secs(120))
         .send()
         .with_context(|| format!("failed to download asset from {url}"))?;
     if !response.status().is_success() {
@@ -379,7 +381,7 @@ fn read_within_limit<R: Read>(reader: R, limit: u64, what: &str) -> Result<Vec<u
     Ok(buffer)
 }
 
-fn download_release_binary(asset: &ReleaseAsset) -> Result<Vec<u8>> {
+fn download_release_binary_with_client(client: &Client, asset: &ReleaseAsset) -> Result<Vec<u8>> {
     validate_repository(&asset.repo)?;
     let parsed_version = parse_release_version(&asset.tag)?;
     if asset.version != parsed_version.to_string() {
@@ -389,7 +391,6 @@ fn download_release_binary(asset: &ReleaseAsset) -> Result<Vec<u8>> {
             asset.tag
         );
     }
-    let client = http_client()?;
     let asset_name = format!(
         "sagy-{}-{}.{}",
         asset.tag, asset.target.triple, asset.target.archive_ext
@@ -398,9 +399,9 @@ fn download_release_binary(asset: &ReleaseAsset) -> Result<Vec<u8>> {
         "https://github.com/{}/releases/download/{}/{}",
         asset.repo, asset.tag, asset_name
     );
-    let bytes = fetch_release_asset(&client, &download_url)?;
+    let bytes = fetch_release_asset(client, &download_url)?;
 
-    verify_checksum(&client, asset, &asset_name, &bytes)?;
+    verify_checksum(client, asset, &asset_name, &bytes)?;
 
     unpack_binary_from_archive(&bytes, asset.target.archive_ext, "sagy")
 }
@@ -566,6 +567,11 @@ pub fn current_release_target() -> Result<ReleaseTarget> {
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         Ok(ReleaseTarget {
             triple: "x86_64-unknown-linux-musl",
+            archive_ext: "tar.gz",
+        })
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Ok(ReleaseTarget {
+            triple: "aarch64-unknown-linux-musl",
             archive_ext: "tar.gz",
         })
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {

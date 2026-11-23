@@ -15,8 +15,10 @@
 use chrono::Utc;
 use reqwest::blocking::{Client, Response};
 use serde_json::Value;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::adapters::antigravity::account::credential_store::CredentialStore;
@@ -68,7 +70,7 @@ impl ProbeConfig {
 struct ProbeContext {
     state_dir: std::path::PathBuf,
     state_version: u32,
-    credential_refs: std::collections::BTreeMap<String, CredentialRef>,
+    credential_refs: BTreeMap<String, CredentialRef>,
 }
 
 impl ProbeContext {
@@ -177,7 +179,15 @@ impl super::AntigravityAdapter {
         }
 
         let context = ProbeContext::from_state(state_dir, state);
-        let next = observe_and_reduce(&context, account, &usage, now, config);
+        let shared_client = build_client(config).ok();
+        let next = observe_and_reduce(
+            &context,
+            account,
+            &usage,
+            now,
+            config,
+            shared_client.as_ref(),
+        );
         state.usage_cache.insert(account.id.clone(), next.clone());
         next
     }
@@ -192,45 +202,74 @@ impl super::AntigravityAdapter {
     ) {
         let context = ProbeContext::from_state(state_dir, state);
         let accounts = state.accounts.clone();
-        let existing_usage = state.usage_cache.clone();
-        let config = config.clone();
+        let existing_usage = &state.usage_cache;
+        let shared_client = build_client(config).ok();
+        // 限制并发探测线程上限，避免账号池较大时瞬时拉起过多线程与 TLS 连接。
+        let worker_count = accounts.len().min(8);
+        let queue: Mutex<VecDeque<&AccountRecord>> = Mutex::new(accounts.iter().collect());
+        let completed: Mutex<BTreeMap<String, UsageSnapshot>> = Mutex::new(BTreeMap::new());
 
-        let results: Vec<(String, UsageSnapshot)> = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(accounts.len());
-            for account in &accounts {
-                let current = existing_usage.get(&account.id).cloned();
-                let context = context.clone();
-                let config = config.clone();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let queue = &queue;
+                let completed = &completed;
+                let context = &context;
+                let client = shared_client.as_ref();
                 handles.push(scope.spawn(move || {
-                    let mut usage = current.unwrap_or_else(|| UsageSnapshot {
-                        plan: account.plan.clone(),
-                        ..Default::default()
-                    });
-                    if usage.plan.is_none() {
-                        usage.plan.clone_from(&account.plan);
+                    loop {
+                        let Some(account) = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pop_front()
+                        else {
+                            break;
+                        };
+                        // 单个账号探测若发生 panic 不得中断其余账号或拖垮整轮 refresh。
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let mut usage = existing_usage
+                                    .get(&account.id)
+                                    .cloned()
+                                    .unwrap_or_else(|| UsageSnapshot {
+                                        plan: account.plan.clone(),
+                                        ..Default::default()
+                                    });
+                                if usage.plan.is_none() {
+                                    usage.plan.clone_from(&account.plan);
+                                }
+                                let mut usage = usage.normalized(now);
+                                if matches!(
+                                    probe_decision(&usage, now, force),
+                                    ProbeDecision::Probe
+                                ) {
+                                    usage = observe_and_reduce(
+                                        context, account, &usage, now, config, client,
+                                    );
+                                }
+                                (account.id.clone(), usage)
+                            }));
+                        if let Ok((id, usage)) = outcome {
+                            if !id.is_empty() {
+                                completed
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(id, usage);
+                            }
+                        }
                     }
-                    let mut usage = usage.normalized(now);
-                    if matches!(probe_decision(&usage, now, force), ProbeDecision::Probe) {
-                        usage = observe_and_reduce(&context, account, &usage, now, &config);
-                    }
-                    (account.id.clone(), usage)
                 }));
             }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().unwrap_or_else(|_| {
-                        // A probe thread must never take down a refresh-all run.
-                        (String::new(), UsageSnapshot::default())
-                    })
-                })
-                .collect()
+            for handle in handles {
+                let _ = handle.join();
+            }
         });
 
-        for (id, usage) in results {
-            if !id.is_empty() {
-                state.usage_cache.insert(id, usage);
-            }
+        for (id, usage) in completed
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            state.usage_cache.insert(id, usage);
         }
     }
 }
@@ -245,6 +284,7 @@ fn observe_and_reduce(
     previous: &UsageSnapshot,
     now: i64,
     config: &ProbeConfig,
+    client: Option<&Client>,
 ) -> UsageSnapshot {
     let observation = match load_credential(context, account) {
         Some(LoadedCredential::Vertex(credential)) => {
@@ -260,8 +300,8 @@ fn observe_and_reduce(
         Some(LoadedCredential::OAuth {
             credential,
             subject,
-        }) => probe_oauth(&credential, subject, now, config),
-        Some(LoadedCredential::ApiKey(credential)) => probe_api_key(&credential, config),
+        }) => probe_oauth(&credential, subject, now, config, client),
+        Some(LoadedCredential::ApiKey(credential)) => probe_api_key(&credential, config, client),
         None => ProbeResult::outcome(ProbeOutcome::InvalidCredential),
     };
 
@@ -368,7 +408,11 @@ fn build_client(config: &ProbeConfig) -> Result<Client, ProbeResult> {
         .map_err(|_| ProbeResult::outcome(ProbeOutcome::OtherTransient))
 }
 
-fn probe_api_key(credential: &PortableCredential, config: &ProbeConfig) -> ProbeResult {
+fn probe_api_key(
+    credential: &PortableCredential,
+    config: &ProbeConfig,
+    client: Option<&Client>,
+) -> ProbeResult {
     let Some(key) = credential
         .api_key_value()
         .map(str::trim)
@@ -376,13 +420,13 @@ fn probe_api_key(credential: &PortableCredential, config: &ProbeConfig) -> Probe
     else {
         return ProbeResult::outcome(ProbeOutcome::InvalidCredential);
     };
-    let Ok(client) = build_client(config) else {
+    let Some(client) = client else {
         return ProbeResult::outcome(ProbeOutcome::Network {
             subject: ProbeSubject::ApiKey,
         });
     };
     send_http_probe(
-        &client,
+        client,
         &config.api_url,
         ProbeSubject::ApiKey,
         Some(("x-goog-api-key", key)),
@@ -394,6 +438,7 @@ fn probe_oauth(
     subject: ProbeSubject,
     now: i64,
     config: &ProbeConfig,
+    client: Option<&Client>,
 ) -> ProbeResult {
     let Some(token) = credential
         .access_token()
@@ -420,12 +465,12 @@ fn probe_oauth(
         LocalTokenStatus::Opaque | LocalTokenStatus::ValidJwt => {}
     }
 
-    let Ok(client) = build_client(config) else {
+    let Some(client) = client else {
         return ProbeResult::outcome(ProbeOutcome::Network { subject });
     };
     let bearer = format!("Bearer {token}");
     send_http_probe(
-        &client,
+        client,
         &config.oauth_url,
         subject,
         Some(("authorization", bearer.as_str())),
@@ -1331,5 +1376,211 @@ mod tests {
         let fake_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3ODcxOTk5OTksImVtYWlsIjoidGVzdEBnb29nbGUuY29tIn0.fake_signature";
         assert_eq!(extract_jwt_exp(fake_jwt), None);
         assert_eq!(extract_jwt_exp("invalid_jwt_format"), None);
+    }
+
+    #[test]
+    fn refresh_all_accounts_bounds_concurrency_and_refreshes_more_than_eight_accounts() {
+        const PROBED_COUNT: usize = 12;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = State {
+            version: STATE_V2_VERSION,
+            ..Default::default()
+        };
+
+        for index in 0..PROBED_COUNT {
+            let id = format!("api-{index:02}");
+            let secret = format!("key-{index}");
+            let credential = PortableCredential::api_key(&secret).unwrap();
+            let account_dir = temp.path().join("accounts").join(&id);
+            fs::create_dir_all(&account_dir).unwrap();
+            let doc = serde_json::to_vec(&json!({ "api_key": secret })).unwrap();
+            fs::write(account_dir.join("credentials.json"), &doc).unwrap();
+            state.accounts.push(AccountRecord {
+                id: id.clone(),
+                account_type: AccountType::ApiKey,
+                plan: Some(format!("plan-{index}")),
+                ..Default::default()
+            });
+            state.credential_refs.insert(
+                id,
+                CredentialRef {
+                    kind: CredentialRefKind::ApiKey,
+                    fingerprint: credential.fingerprint(),
+                },
+            );
+        }
+
+        // 同时放入本地校验的 Vertex 账号与命中缓存的账号，覆盖混合批量刷新路径。
+        let vertex_doc = json!({
+            "type": "service_account",
+            "project_id": "project",
+            "private_key": "private-key",
+            "client_email": "vertex@example.com",
+            "token_uri": "https://oauth2.example/token"
+        });
+        let vertex_cred = PortableCredential::vertex_service_account(vertex_doc.clone()).unwrap();
+        let vertex_dir = temp.path().join("accounts").join("vertex-local");
+        fs::create_dir_all(&vertex_dir).unwrap();
+        fs::write(
+            vertex_dir.join("credentials.json"),
+            serde_json::to_vec(&vertex_doc).unwrap(),
+        )
+        .unwrap();
+        state
+            .accounts
+            .push(account("vertex-local", AccountType::Vertex));
+        state.credential_refs.insert(
+            "vertex-local".to_string(),
+            CredentialRef {
+                kind: CredentialRefKind::VertexServiceAccount,
+                fingerprint: vertex_cred.fingerprint(),
+            },
+        );
+
+        let cached_cred = PortableCredential::api_key("cached-key").unwrap();
+        let cached_dir = temp.path().join("accounts").join("cached-ready");
+        fs::create_dir_all(&cached_dir).unwrap();
+        fs::write(
+            cached_dir.join("credentials.json"),
+            br#"{"api_key":"cached-key"}"#,
+        )
+        .unwrap();
+        state
+            .accounts
+            .push(account("cached-ready", AccountType::ApiKey));
+        state.credential_refs.insert(
+            "cached-ready".to_string(),
+            CredentialRef {
+                kind: CredentialRefKind::ApiKey,
+                fingerprint: cached_cred.fingerprint(),
+            },
+        );
+        state.usage_cache.insert(
+            "cached-ready".to_string(),
+            UsageSnapshot {
+                health: HealthStatus::Ready,
+                remaining_quota_percent: Some(88),
+                last_probe_at: Some(99),
+                ..Default::default()
+            },
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+
+        let total_requests = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let total_clone = total_requests.clone();
+        let in_flight_clone = in_flight.clone();
+        let peak_clone = peak_in_flight.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut handlers = Vec::with_capacity(PROBED_COUNT);
+            while handlers.len() < PROBED_COUNT {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let total = total_clone.clone();
+                        let active = in_flight_clone.clone();
+                        let peak = peak_clone.clone();
+                        handlers.push(std::thread::spawn(move || {
+                            let _ = stream.set_nonblocking(false);
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(current, Ordering::SeqCst);
+                            total.fetch_add(1, Ordering::SeqCst);
+
+                            let mut quota = 0_u8;
+                            {
+                                let mut reader = BufReader::new(&mut stream);
+                                let mut line = String::new();
+                                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                                    if line == "\r\n" || line == "\n" {
+                                        break;
+                                    }
+                                    let lower = line.to_ascii_lowercase();
+                                    if let Some(rest) = lower.strip_prefix("x-goog-api-key:") {
+                                        if let Some(idx) = rest
+                                            .trim()
+                                            .strip_prefix("key-")
+                                            .and_then(|num| num.parse::<u8>().ok())
+                                        {
+                                            quota = 10 + idx;
+                                        }
+                                    }
+                                    line.clear();
+                                }
+                            }
+
+                            std::thread::sleep(Duration::from_millis(15));
+                            active.fetch_sub(1, Ordering::SeqCst);
+
+                            let body = format!(r#"{{"remaining_quota_percent":{quota}}}"#);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for handler in handlers {
+                let _ = handler.join();
+            }
+        });
+
+        let adapter = super::super::AntigravityAdapter;
+        adapter.refresh_all_accounts_at(temp.path(), &mut state, false, 100, &config(&endpoint));
+        server.join().unwrap();
+
+        assert_eq!(total_requests.load(Ordering::SeqCst), PROBED_COUNT);
+        assert!(
+            peak_in_flight.load(Ordering::SeqCst) <= 8,
+            "worker concurrency exceeded 8: {}",
+            peak_in_flight.load(Ordering::SeqCst)
+        );
+        assert_eq!(state.usage_cache.len(), PROBED_COUNT + 2);
+
+        for index in 0..PROBED_COUNT {
+            let id = format!("api-{index:02}");
+            let snapshot = state
+                .usage_cache
+                .get(&id)
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(snapshot.health, HealthStatus::Ready, "account {id}");
+            assert_eq!(
+                snapshot.remaining_quota_percent,
+                Some(10 + index as u8),
+                "account {id}"
+            );
+            assert_eq!(
+                snapshot.plan.as_deref(),
+                Some(format!("plan-{index}").as_str()),
+                "account {id}"
+            );
+        }
+        assert_eq!(
+            state.usage_cache.get("vertex-local").unwrap().health,
+            HealthStatus::Unverified
+        );
+        assert_eq!(
+            state
+                .usage_cache
+                .get("cached-ready")
+                .unwrap()
+                .remaining_quota_percent,
+            Some(88)
+        );
     }
 }

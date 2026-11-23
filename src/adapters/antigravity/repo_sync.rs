@@ -1384,6 +1384,8 @@ pub(crate) struct EncryptedRepo {
     password: String,
     identity_file: Option<PathBuf>,
     insecure_host_key: bool,
+    // 缓存当前 checkout 中已解密的远端 bundle（外层 Some 表示已读取过），避免 push 时重复跑 Argon2id 解密。
+    cached_remote: std::cell::RefCell<Option<Option<Vec<u8>>>>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1409,12 +1411,15 @@ impl EncryptedRepo {
             password,
             identity_file: identity_file.map(Path::to_path_buf),
             insecure_host_key,
+            cached_remote: std::cell::RefCell::new(None),
         })
     }
 
     pub(crate) fn read(&self) -> Result<Option<Vec<u8>>> {
+        *self.cached_remote.borrow_mut() = None;
         let Some(encoded) = read_bounded_file(&self.bundle_path, MAX_ENCRYPTED_PAYLOAD_BYTES)?
         else {
+            *self.cached_remote.borrow_mut() = Some(None);
             return Ok(None);
         };
         let payload = EncryptedBundlePayload::decode_strict(&encoded)?;
@@ -1422,6 +1427,7 @@ impl EncryptedRepo {
         if plaintext.len() > repo_bundle::MAX_BUNDLE_PLAINTEXT_BYTES {
             bail!("bundle plaintext exceeds the 8 MiB limit");
         }
+        *self.cached_remote.borrow_mut() = Some(Some(plaintext.clone()));
         Ok(Some(plaintext))
     }
 
@@ -1431,7 +1437,16 @@ impl EncryptedRepo {
         if plaintext.len() > repo_bundle::MAX_BUNDLE_PLAINTEXT_BYTES {
             bail!("bundle plaintext exceeds the 8 MiB limit");
         }
-        if self.read()?.as_deref() == Some(plaintext) {
+        if self.cached_remote.borrow().is_none() {
+            let _ = self.read()?;
+        }
+        if self
+            .cached_remote
+            .borrow()
+            .as_ref()
+            .and_then(Option::as_deref)
+            == Some(plaintext)
+        {
             return Ok(false);
         }
 
@@ -1465,6 +1480,7 @@ impl EncryptedRepo {
             self.insecure_host_key,
         )?;
         if status.stdout.is_empty() {
+            *self.cached_remote.borrow_mut() = Some(Some(plaintext.to_vec()));
             return Ok(false);
         }
         git_cmd(
@@ -1489,6 +1505,7 @@ impl EncryptedRepo {
             self.identity_file.as_deref(),
             self.insecure_host_key,
         )?;
+        *self.cached_remote.borrow_mut() = Some(Some(plaintext.to_vec()));
         Ok(true)
     }
 }
@@ -2824,6 +2841,52 @@ mod tests {
                 .windows(b"test-secret-value".len())
                 .any(|window| window == b"test-secret-value")
         );
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[test]
+    fn encrypted_repo_caches_remote_plaintext_across_read_and_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = init_bare(&temp.path().join("remote.git"));
+        seed_plain_file(temp.path(), &remote, "notes/readme.txt", b"keep this file");
+        let state = temp.path().join("sagy-state");
+        fs::create_dir_all(&state).unwrap();
+
+        let first = br#"{"profile":"alice@example.com","generation":1}"#;
+        let second = br#"{"profile":"bob@example.com","generation":2}"#;
+
+        // 空远端 read() 后应缓存 Some(None)，首次 publish 更新缓存为 Some(Some(first))。
+        let repo = open_encrypted_repo(&state, &remote);
+        assert!(repo.cached_remote.borrow().is_none());
+        assert_eq!(repo.read().unwrap(), None);
+        assert_eq!(*repo.cached_remote.borrow(), Some(None));
+        assert!(repo.publish(first, "initial publish").unwrap());
+        assert_eq!(*repo.cached_remote.borrow(), Some(Some(first.to_vec())));
+        drop(repo);
+
+        // 重新打开后：read() 填充缓存；随后将磁盘 bundle 改成非法密文，验证 publish 命中缓存而不重复读取解密。
+        let repo = open_encrypted_repo(&state, &remote);
+        assert_eq!(repo.read().unwrap().as_deref(), Some(first.as_slice()));
+        let head_before_noop = remote_head(&remote);
+        fs::write(&repo.bundle_path, b"corrupt-local-checkout-envelope").unwrap();
+
+        assert!(!repo.publish(first, "cached noop").unwrap());
+        assert_eq!(remote_head(&remote), head_before_noop);
+
+        // 即使磁盘副本已被破坏，非 no-op 的 publish 仍复用已缓存的前值并写出新的有效密文、同步更新缓存。
+        assert!(repo.publish(second, "publish updated payload").unwrap());
+        let head_after_update = remote_head(&remote);
+        assert_ne!(head_after_update, head_before_noop);
+        assert_eq!(*repo.cached_remote.borrow(), Some(Some(second.to_vec())));
+
+        fs::write(&repo.bundle_path, b"corrupt-again-after-publish").unwrap();
+        assert!(!repo.publish(second, "noop from updated cache").unwrap());
+        assert_eq!(remote_head(&remote), head_after_update);
+
+        // 验证推送到远端的真实 bundle 可由全新 EncryptedRepo 正常解密读取。
+        drop(repo);
+        let verifier = open_encrypted_repo(&state, &remote);
+        assert_eq!(verifier.read().unwrap().as_deref(), Some(second.as_slice()));
     }
 
     #[cfg(any(target_os = "macos", test))]
