@@ -2,9 +2,9 @@
 mod cache;
 mod cli;
 mod desktop;
+mod desktop_history;
 mod desktop_import;
 mod desktop_sync;
-mod desktop_history;
 mod observer;
 mod quota;
 mod remove;

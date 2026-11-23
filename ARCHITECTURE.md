@@ -37,6 +37,17 @@ Keychain and the ordinary desktop's browser data are not imported. Existing per-
 desktop directories remain untouched; nonempty histories there require an explicit
 source decision rather than an automatic merge.
 
+While the managed desktop runs, a background worker observes its credential file.
+The initial credential copied by sagy is a baseline, not an import request. A stable
+new snapshot is checked against Google's fixed HTTPS UserInfo endpoint before its
+verified email can become a profile label. Registration reuses the native repository
+import transaction and preserves the full credential document, including unknown fields.
+Existing profiles are never overwritten. Network work runs outside registry locks;
+busy registries and temporary failures are retried without blocking the desktop loop.
+After the desktop process group is reaped, the worker makes a bounded final pass and
+is joined before the global desktop lock is released. Newly added profiles acquire
+quota snapshots through the existing refresh and selection paths.
+
 The following diagram describes the portable `sagy-legacy` engine.
 
 ```text

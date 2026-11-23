@@ -138,6 +138,9 @@ fn print_command_help(command: &str) -> Option<i32> {
             );
             eprintln!("This selects at startup; it does not restart desktop work on HTTP 429.");
             eprintln!(
+                "New accounts signed in inside this desktop are verified and added to sagy list."
+            );
+            eprintln!(
                 "Set SAGY_DESKTOP_BIN to the absolute Antigravity App executable path if needed."
             );
         }
