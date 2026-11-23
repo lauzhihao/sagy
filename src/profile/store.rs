@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::CStr;
+use std::ffi::{CStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -40,8 +40,8 @@ impl Default for State {
     }
 }
 
-pub(super) fn real_home() -> Result<PathBuf> {
-    // 读取 passwd 数据库，忽略 HOME 等可由调用环境伪造的变量。
+fn passwd_home_dir() -> Result<Option<PathBuf>> {
+    // 优先读取 passwd 数据库，忽略常规宿主上可由调用环境伪造的 HOME。
     let uid = unsafe { libc::getuid() };
     let mut capacity = 16 * 1024usize;
     loop {
@@ -68,7 +68,7 @@ pub(super) fn real_home() -> Result<PathBuf> {
                 .context("failed to resolve current user's home directory");
         }
         if result.is_null() {
-            bail!("current user has no passwd entry");
+            return Ok(None);
         }
         let pwd = unsafe { pwd.assume_init() };
         if pwd.pw_dir.is_null() {
@@ -77,20 +77,56 @@ pub(super) fn real_home() -> Result<PathBuf> {
         let home = unsafe { CStr::from_ptr(pwd.pw_dir) }
             .to_string_lossy()
             .into_owned();
-        let path = PathBuf::from(home);
-        if !path.is_absolute() {
-            bail!("current user's home directory is not absolute");
-        }
-        return fs::canonicalize(&path)
-            .with_context(|| format!("failed to resolve {}", path.display()));
+        return Ok(Some(PathBuf::from(home)));
     }
 }
 
-pub(super) fn root_directory() -> Result<PathBuf> {
-    let home = real_home()?;
-    let requested = std::env::var_os("SAGY_PROFILE_ROOT")
+fn resolve_real_home(passwd_home: Option<PathBuf>, env_home: Option<OsString>) -> Result<PathBuf> {
+    if let Some(path) = passwd_home {
+        if !path.is_absolute() {
+            bail!("current user's home directory is not absolute");
+        }
+        // 容器或受限账号的 pw_dir 可能尚未创建；ENOENT 时按不存在路径安全规范化。
+        return match fs::canonicalize(&path) {
+            Ok(resolved) => Ok(resolved),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                resolve_nonexistent_path(&path)
+                    .with_context(|| format!("failed to resolve {}", path.display()))
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to resolve {}", path.display()))
+            }
+        };
+    }
+    // 无 passwd 条目的任意容器 UID 回退到显式绝对 HOME。
+    if let Some(home) = env_home
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share/sagy-profiles"));
+        .filter(|path| path.is_absolute())
+    {
+        return resolve_nonexistent_path(&home)
+            .with_context(|| format!("failed to resolve {}", home.display()));
+    }
+    bail!("current user has no passwd entry")
+}
+
+pub(super) fn real_home() -> Result<PathBuf> {
+    resolve_real_home(passwd_home_dir()?, std::env::var_os("HOME"))
+}
+
+fn resolve_root_directory(
+    requested_env: Option<PathBuf>,
+    home: Result<PathBuf>,
+) -> Result<PathBuf> {
+    let (requested, home) = match (requested_env, home) {
+        (Some(requested), Ok(home)) => (requested, Some(home)),
+        // 容器环境既无 passwd 又无有效 HOME 时，允许显式且安全的 SAGY_PROFILE_ROOT 正常工作。
+        (Some(requested), Err(_)) => (requested, None),
+        (None, Ok(home)) => {
+            let default_root = home.join(".local/share/sagy-profiles");
+            (default_root, Some(home))
+        }
+        (None, Err(error)) => return Err(error),
+    };
     if !requested.is_absolute() {
         bail!("SAGY_PROFILE_ROOT must be an absolute path");
     }
@@ -98,13 +134,18 @@ pub(super) fn root_directory() -> Result<PathBuf> {
         bail!("profile root cannot be a symbolic link");
     }
     let root = resolve_nonexistent_path(&requested)?;
-    if root == home || home.starts_with(&root) {
+    if root == Path::new("/") {
         bail!("choose a dedicated directory for SAGY_PROFILE_ROOT");
     }
-    for protected in [home.join(".gemini"), home.join("Library/Keychains")] {
-        let protected = resolve_nonexistent_path(&protected)?;
-        if root == protected || root.starts_with(&protected) {
-            bail!("profile storage must be separate from current credentials");
+    if let Some(home) = home {
+        if root == home || home.starts_with(&root) {
+            bail!("choose a dedicated directory for SAGY_PROFILE_ROOT");
+        }
+        for protected in [home.join(".gemini"), home.join("Library/Keychains")] {
+            let protected = resolve_nonexistent_path(&protected)?;
+            if root == protected || root.starts_with(&protected) {
+                bail!("profile storage must be separate from current credentials");
+            }
         }
     }
     if let Some(parent) = root.parent() {
@@ -114,6 +155,13 @@ pub(super) fn root_directory() -> Result<PathBuf> {
     ensure_private_dir(&root)?;
     ensure_private_dir(&root.join("profiles"))?;
     Ok(root)
+}
+
+pub(super) fn root_directory() -> Result<PathBuf> {
+    resolve_root_directory(
+        std::env::var_os("SAGY_PROFILE_ROOT").map(PathBuf::from),
+        real_home(),
+    )
 }
 
 pub(super) fn valid_name(name: &str) -> Result<String> {
@@ -622,5 +670,69 @@ mod tests {
             ..State::default()
         };
         assert!(write_state(root, &duplicate).is_err());
+    }
+
+    #[test]
+    fn real_home_resolves_nonexistent_passwd_dir_and_container_home_fallback() {
+        let dir = private_root();
+        let base = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(base.join("real")).unwrap();
+        symlink(base.join("real"), base.join("linked")).unwrap();
+
+        let missing_pw_dir = base.join("linked/missing-user");
+        assert_eq!(
+            resolve_real_home(Some(missing_pw_dir), Some("/ignored/env/home".into())).unwrap(),
+            base.join("real/missing-user")
+        );
+        assert!(resolve_real_home(Some(PathBuf::from("relative/home")), None).is_err());
+
+        let container_home = base.join("linked/container-home");
+        assert_eq!(
+            resolve_real_home(None, Some(container_home.into_os_string())).unwrap(),
+            base.join("real/container-home")
+        );
+        assert!(resolve_real_home(None, None).is_err());
+        assert!(resolve_real_home(None, Some("relative/home".into())).is_err());
+    }
+
+    #[test]
+    fn root_directory_supports_explicit_root_without_home_and_enforces_disjointness_with_home() {
+        let dir = private_root();
+        let base = dir.path().canonicalize().unwrap();
+        let explicit = base.join("isolated-root");
+
+        assert!(resolve_root_directory(None, Err(anyhow!("no home"))).is_err());
+        assert!(
+            resolve_root_directory(Some(PathBuf::from("relative")), Err(anyhow!("no home")))
+                .is_err()
+        );
+        assert!(resolve_root_directory(Some(PathBuf::from("/")), Err(anyhow!("no home"))).is_err());
+        assert!(
+            resolve_root_directory(Some(PathBuf::from("/tmp/..")), Err(anyhow!("no home")))
+                .is_err()
+        );
+
+        let link = base.join("root-symlink");
+        symlink(&explicit, &link).unwrap();
+        assert!(resolve_root_directory(Some(link), Err(anyhow!("no home"))).is_err());
+
+        let resolved = resolve_root_directory(Some(explicit.clone()), Err(anyhow!("no home")))
+            .expect("explicit root without real_home");
+        assert_eq!(resolved, explicit);
+        assert!(resolved.join("profiles").is_dir());
+
+        let home = base.join("user-home");
+        for forbidden in [
+            home.clone(),
+            base.clone(),
+            home.join(".gemini"),
+            home.join(".gemini/nested"),
+            home.join("Library/Keychains/sub"),
+        ] {
+            assert!(
+                resolve_root_directory(Some(forbidden), Ok(home.clone())).is_err(),
+                "must reject overlapping root"
+            );
+        }
     }
 }

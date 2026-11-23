@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use super::desktop_import::{self, Candidate, ImportOutcome, Importer};
+use super::util::write_stderr_line;
 
 type Fingerprint = [u8; 32];
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -56,24 +57,28 @@ enum Event {
 fn report(event: Event) {
     match event {
         Event::Added(email) => {
-            eprintln!("[sagy] Added desktop account {email}. Run sagy list to view it.");
+            write_stderr_line(format!(
+                "[sagy] Added desktop account {email}. Run sagy list to view it."
+            ));
         }
         Event::AlreadyRegistered(email) => {
-            eprintln!(
+            write_stderr_line(format!(
                 "[sagy] Desktop account {email} is already registered; its existing login was preserved."
-            );
+            ));
         }
         Event::Retry => {
-            eprintln!("[sagy] Desktop account synchronization is pending; retrying automatically.");
+            write_stderr_line(
+                "[sagy] Desktop account synchronization is pending; retrying automatically.",
+            );
         }
         Event::ReadUnavailable => {
-            eprintln!(
-                "[sagy] Desktop account credentials could not be read; waiting for a valid file."
+            write_stderr_line(
+                "[sagy] Desktop account credentials could not be read; waiting for a valid file.",
             );
         }
         Event::FinalUnavailable => {
-            eprintln!(
-                "[sagy] Desktop account synchronization did not complete before exit; sign in again and wait for the account confirmation."
+            write_stderr_line(
+                "[sagy] Desktop account synchronization did not complete before exit; sign in again and wait for the account confirmation.",
             );
         }
     }
@@ -237,7 +242,7 @@ impl Watcher {
             .take()
             .is_some_and(|thread| thread.join().is_err())
         {
-            eprintln!("[sagy] Desktop account synchronization stopped unexpectedly.");
+            write_stderr_line("[sagy] Desktop account synchronization stopped unexpectedly.");
         }
     }
 }

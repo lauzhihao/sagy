@@ -58,6 +58,7 @@ pub(super) fn takes_value(flag: &str) -> bool {
             | "input-format"
             | "json-schema"
             | "log-file"
+            | "m"
             | "mode"
             | "model"
             | "output-format"
@@ -94,7 +95,7 @@ pub(super) fn group(args: &[OsString]) -> Option<&'static str> {
                 Some(value) => value,
                 None => arguments.next()?.to_str()?,
             };
-            if flag == "model" {
+            if matches!(flag, "model" | "m") {
                 model = Some(value.to_ascii_lowercase());
             }
         }
@@ -119,7 +120,7 @@ fn restart_arguments(args: &[OsString]) -> bool {
         if option == "--dangerously-skip-permissions" && inline.is_none() {
             continue;
         }
-        if !matches!(option, "--model" | "-model" | "--effort" | "-effort") {
+        if !matches!(option, "--model" | "-model" | "-m" | "--effort" | "-effort") {
             return false;
         }
         let value = inline.or_else(|| arguments.next()?.to_str());
@@ -360,7 +361,7 @@ mod tests {
     #[test]
     fn group_respects_model_flags_and_does_not_read_prompt_values_as_flags() {
         assert_eq!(group(&args(&[])), Some("gemini"));
-        for flag in ["--model", "-model"] {
+        for flag in ["--model", "-model", "-m"] {
             assert_eq!(group(&args(&[flag, "claude-sonnet-4.5"])), Some("3p"));
             assert_eq!(
                 group(&args(&[&format!("{flag}=gemini-3.7-pro-high")])),
@@ -368,6 +369,7 @@ mod tests {
             );
         }
         assert_eq!(group(&args(&["--model=gpt-oss-120b"])), Some("3p"));
+        assert_eq!(group(&args(&["-m=gpt-oss-120b"])), Some("3p"));
         assert_eq!(
             group(&args(&["--model", "Gemini 3.8 Flash"])),
             Some("gemini")
@@ -386,6 +388,7 @@ mod tests {
         );
         assert_eq!(group(&args(&["--model=unknown"])), None);
         assert_eq!(group(&args(&["--model"])), None);
+        assert_eq!(group(&args(&["-m"])), None);
     }
 
     #[test]
@@ -402,12 +405,16 @@ mod tests {
             "--effort",
             "high"
         ])));
+        assert!(restart_arguments(&args(&["-m", "claude-sonnet-4.5"])));
+        assert!(restart_arguments(&args(&["-m=gpt-oss-120b"])));
         assert!(restart_arguments(&args(&[])));
         for replay in [
             args(&["-p", "hello"]),
             args(&["--continue"]),
             args(&["--conversation", "fixture"]),
             args(&["--model"]),
+            args(&["-m"]),
+            args(&["-m="]),
             args(&["--effort="]),
         ] {
             assert!(!restart_arguments(&replay));

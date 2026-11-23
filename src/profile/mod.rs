@@ -13,6 +13,7 @@ mod runtime;
 mod session_settings;
 mod statusline;
 mod store;
+mod util;
 
 use anyhow::{Result, anyhow, bail};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -23,10 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, atomic::AtomicBool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::adapters::antigravity::launcher::DEFAULT_MODEL_ID;
 use runtime::Binary;
 use store::State;
 
-const DEFAULT_MODEL: &str = "Gemini 3.8 Flash (High)";
+const EXIT_REFRESH_DEFAULT_TIMEOUT_MS: u64 = 8_000;
+const RECENT_LIVE_SAMPLE_MAX_AGE: Duration = Duration::from_secs(5);
 
 fn now() -> f64 {
     SystemTime::now()
@@ -36,7 +39,7 @@ fn now() -> f64 {
 }
 
 fn note(message: impl std::fmt::Display) {
-    eprintln!("[sagy] {message}");
+    util::write_stderr_line(format_args!("[sagy] {message}"));
 }
 
 fn name(arg: &OsStr) -> Result<String> {
@@ -155,11 +158,14 @@ fn run_named(root: &Path, binary: &Binary, name: String, args: &[OsString]) -> R
             bridge.poll();
         }
     });
-    if let Some(bridge) = &mut bridge {
-        bridge.finish();
-    }
+    // 刚完成本轮实时采样且无新回合等待时，跳过退出时重复的 /usage 探针。
+    let skip_exit_refresh = bridge
+        .as_mut()
+        .is_some_and(|b| b.finish_has_recent_clean_sample(RECENT_LIVE_SAMPLE_MAX_AGE));
     let code = code?;
-    refresh_after_exit(root, binary, &name, &home, code);
+    if !skip_exit_refresh {
+        refresh_after_exit(root, binary, &name, &home, code);
+    }
     Ok(code)
 }
 
@@ -292,11 +298,30 @@ fn record_measurements(
     cache::merge(root, updates)
 }
 
+fn exit_refresh_timeout_from(raw: Option<&str>) -> Duration {
+    let millis = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(EXIT_REFRESH_DEFAULT_TIMEOUT_MS, |millis| {
+            millis.min(EXIT_REFRESH_DEFAULT_TIMEOUT_MS)
+        });
+    Duration::from_millis(millis)
+}
+
+fn exit_refresh_timeout() -> Duration {
+    exit_refresh_timeout_from(
+        std::env::var("SAGY_EXIT_REFRESH_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 // 调用方仍持有账号锁；独立副本查询避免覆盖其他并发会话的凭据。
 fn refresh_after_exit(root: &Path, binary: &Binary, name: &str, home: &Path, code: i32) {
     if code >= 128 {
         return;
     }
+    let timeout = exit_refresh_timeout();
     let result = (|| -> Result<()> {
         let _signals = observer::SignalGuard::install()?;
         let sample = statusline::probe_snapshot(
@@ -304,7 +329,7 @@ fn refresh_after_exit(root: &Path, binary: &Binary, name: &str, home: &Path, cod
             home,
             binary,
             "gemini",
-            Duration::from_secs(8),
+            timeout,
             &AtomicBool::new(false),
         )?;
         observer::check_interrupted()?;
@@ -488,23 +513,20 @@ fn list(root: &Path) -> Result<i32> {
     }
     let widths: [usize; 6] =
         std::array::from_fn(|i| rows.iter().map(|r| r[i].len()).max().unwrap_or_default());
-    let border = |left, joint: &str, right| {
-        let line = widths.map(|w| "─".repeat(w + 2)).join(joint);
-        eprintln!("{left}{line}{right}");
-    };
-    border('┌', "┬", '┐');
+    let border = format!("+{}+", widths.map(|w| "-".repeat(w + 2)).join("+"));
+    util::write_stderr_line(&border);
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
-            border('├', "┼", '┤');
+            util::write_stderr_line(&border);
         }
         let cells = row
             .iter()
             .zip(widths)
             .map(|(v, w)| format!("{v:<w$}"))
             .collect::<Vec<_>>();
-        eprintln!("│ {} │", cells.join(" │ "));
+        util::write_stderr_line(format_args!("| {} |", cells.join(" | ")));
     }
-    border('└', "┴", '┘');
+    util::write_stderr_line(&border);
     Ok(0)
 }
 
@@ -750,12 +772,14 @@ fn auto(root: &Path, binary: &Binary, args: &[OsString]) -> Result<i32> {
                 }
             },
         );
-        if let Some(bridge) = &mut bridge {
-            bridge.finish();
-        }
+        let skip_exit_refresh = bridge
+            .as_mut()
+            .is_some_and(|b| b.finish_has_recent_clean_sample(RECENT_LIVE_SAMPLE_MAX_AGE));
         let (code, switched) = code?;
         if !switched {
-            refresh_after_exit(root, binary, &name, &home, code);
+            if !skip_exit_refresh {
+                refresh_after_exit(root, binary, &name, &home, code);
+            }
             return Ok(code);
         }
         drop(_lease);
@@ -793,7 +817,7 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
         expanded = [
             "auto",
             "--model",
-            DEFAULT_MODEL,
+            DEFAULT_MODEL_ID,
             "--dangerously-skip-permissions",
         ]
         .map(OsString::from)
@@ -874,11 +898,15 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
             let root = store::root_directory()?;
             let label = use_name(&root, label)?;
             let extra = quota::checked_arguments(extra)?;
-            let args: Vec<OsString> = ["--model", DEFAULT_MODEL, "--dangerously-skip-permissions"]
-                .map(OsString::from)
-                .into_iter()
-                .chain(extra.iter().cloned())
-                .collect();
+            let args: Vec<OsString> = [
+                "--model",
+                DEFAULT_MODEL_ID,
+                "--dangerously-skip-permissions",
+            ]
+            .map(OsString::from)
+            .into_iter()
+            .chain(extra.iter().cloned())
+            .collect();
             let binary = verify()?;
             run_named(&root, &binary, label, &args)
         }
@@ -925,7 +953,25 @@ mod tests {
     }
 
     #[test]
-    fn isolated_profile_cli() {
+    fn exit_refresh_timeout_parses_positive_millis_and_caps_at_eight_seconds() {
+        assert_eq!(exit_refresh_timeout_from(None), Duration::from_secs(8));
+        assert_eq!(exit_refresh_timeout_from(Some("")), Duration::from_secs(8));
+        assert_eq!(exit_refresh_timeout_from(Some("0")), Duration::from_secs(8));
+        assert_eq!(
+            exit_refresh_timeout_from(Some("invalid")),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            exit_refresh_timeout_from(Some("250")),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            exit_refresh_timeout_from(Some("30000")),
+            Duration::from_secs(8)
+        );
+    }
+
+    fn run_isolated_profile_cli_shard(shard: &str) {
         let status = Command::new("/usr/bin/python3")
             .arg("-B")
             .arg(concat!(
@@ -933,8 +979,29 @@ mod tests {
                 "/tests/test_sagy_profile.py"
             ))
             .env("SAGY_NATIVE_TEST_EXE", std::env::current_exe().unwrap())
+            .env("SAGY_PROFILE_TEST_SHARD", shard)
             .status()
             .unwrap();
-        assert!(status.success());
+        assert!(status.success(), "profile CLI test shard {shard} failed");
+    }
+
+    #[test]
+    fn isolated_profile_cli_shard_0() {
+        run_isolated_profile_cli_shard("0/4");
+    }
+
+    #[test]
+    fn isolated_profile_cli_shard_1() {
+        run_isolated_profile_cli_shard("1/4");
+    }
+
+    #[test]
+    fn isolated_profile_cli_shard_2() {
+        run_isolated_profile_cli_shard("2/4");
+    }
+
+    #[test]
+    fn isolated_profile_cli_shard_3() {
+        run_isolated_profile_cli_shard("3/4");
     }
 }

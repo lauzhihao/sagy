@@ -24,8 +24,12 @@ class SagyProfileTests(unittest.TestCase):
         self.profile_root = self.root / "profiles"
         self.fake_agy = self.root / "bin" / "agy"
         self.fake_agy.parent.mkdir()
-        fake_source = r"""#!/usr/bin/env python3
-import json
+        shebang = (
+            f"#!{sys.executable}\n"
+            if len(sys.executable) < 100
+            else "#!/usr/bin/env python3\n"
+        )
+        fake_source = shebang + r"""import json
 import os
 from pathlib import Path
 import sys
@@ -164,7 +168,7 @@ if os.environ.get("PROFILE_FIXTURE_LIVE_EVENTS"):
 if os.environ.get("PROFILE_FIXTURE_SESSION_SIGNAL"):
     os.kill(os.getpid(), int(os.environ["PROFILE_FIXTURE_SESSION_SIGNAL"]))
 if is_rate_limited:
-    time.sleep(3.0)
+    time.sleep(0.6)
 if finish_marker is not None:
     finish_marker.write_text(str(time.monotonic()))
 if is_rate_limited:
@@ -196,7 +200,7 @@ if is_rate_limited:
     def invoke(
         self, *arguments, expected=0, fixture_token=None, fixture_fail=False,
         fixture_usage=None, shortcut=False, resolve_binary=False, controlling_tty=False,
-        fixture_session_signal=None, fixture_wait_probe=None,
+        fixture_session_signal=None, fixture_wait_probe=None, exit_refresh_timeout_ms=None,
     ):
         env = self.clean_environment()
         if fixture_token is not None:
@@ -209,6 +213,8 @@ if is_rate_limited:
             env["PROFILE_FIXTURE_SESSION_SIGNAL"] = str(int(fixture_session_signal))
         if fixture_wait_probe is not None:
             env["PROFILE_FIXTURE_WAIT_FOR_SIGNAL"] = str(fixture_wait_probe)
+        if exit_refresh_timeout_ms is not None:
+            env["SAGY_EXIT_REFRESH_TIMEOUT_MS"] = str(exit_refresh_timeout_ms)
         env["SAGY_FIXTURE_ARGS"] = json.dumps(arguments)
         if shortcut:
             env["SAGY_FIXTURE_SHORTCUT"] = "1"
@@ -475,7 +481,7 @@ if is_rate_limited:
         self.add_quota_profile("beta", "beta", gemini=(0.7, 0.8))
         self.add_quota_profile("unknown", "unknown")
         lines = self.invoke("list").stderr.splitlines()
-        data = [[cell.strip() for cell in line.split("│")[1:-1]] for line in lines if line.startswith("│")]
+        data = [[cell.strip() for cell in line.split("|")[1:-1]] for line in lines if line.startswith("|")]
         self.assertEqual(data[0], ["#", "Profile", "Status", "5h", "weekly", "Quota age"])
         self.assertEqual([row[:5] for row in data[1:]], [
             ["1", "beta", "ready", "70.00%", "80.00%"],
@@ -582,8 +588,10 @@ if is_rate_limited:
         self.add_quota_profile("alpha", "alpha", gemini=0.8)
         marker = self.root / "timed-out-probe"
         started = time.monotonic()
-        self.invoke("run", "alpha", "hello", fixture_wait_probe=marker)
-        self.assertLess(time.monotonic() - started, 11)
+        self.invoke(
+            "run", "alpha", "hello", fixture_wait_probe=marker, exit_refresh_timeout_ms="250"
+        )
+        self.assertLess(time.monotonic() - started, 2.0)
         self.assertEqual(self.quota_snapshot()["alpha"]["windows"], [0.8, 0.8])
         self.assertEqual(self.quota_snapshot()["alpha"]["result"], "unavailable")
         with self.assertRaises(ProcessLookupError):
@@ -681,6 +689,8 @@ if is_rate_limited:
                     self.assertNotIn("must-not-be-in-event", raw)
                     Path(str(marker) + ".continue." + str(index)).touch()
                 self.assertEqual(process.wait(timeout=5), 0)
+                final_rows = [json.loads(line) for line in (self.root / "usage-events.jsonl").read_text().splitlines()][len(baseline_usage.splitlines()):]
+                self.assertEqual(len(final_rows), 2)
                 self.assertEqual(list((self.profile_root / "profiles/alpha/home").glob(".sagy-statusline-*")), [])
                 self.assertEqual(list((self.profile_root / "profiles").glob(".sagy-quota-probe-*")), [])
             finally:
@@ -1122,4 +1132,18 @@ if is_rate_limited:
         self.assertTrue(all(Path(event["home"]).resolve() == home.resolve() for event in events))
 
 if __name__ == "__main__":
+    shard = os.environ.get("SAGY_PROFILE_TEST_SHARD")
+    if shard and len(sys.argv) == 1:
+        index_text, total_text = shard.split("/", 1)
+        shard_index, shard_total = int(index_text), int(total_text)
+        if not (0 <= shard_index < shard_total):
+            raise ValueError(f"invalid SAGY_PROFILE_TEST_SHARD={shard!r}")
+        loader = unittest.TestLoader()
+        names = sorted(loader.getTestCaseNames(SagyProfileTests))
+        selected = [
+            name for pos, name in enumerate(names) if pos % shard_total == shard_index
+        ]
+        suite = unittest.TestSuite(SagyProfileTests(name) for name in selected)
+        result = unittest.TextTestRunner(verbosity=1).run(suite)
+        raise SystemExit(0 if result.wasSuccessful() else 1)
     unittest.main()

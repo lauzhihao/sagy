@@ -192,7 +192,8 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_EXIT_CODE"):
             .env_remove("https_proxy")
             .env_remove("HTTPS_PROXY")
             .env_remove("all_proxy")
-            .env_remove("ALL_PROXY");
+            .env_remove("ALL_PROXY")
+            .env_remove("SAGY_DEFAULT_PROXY");
         if let Some(proxy) = proxy {
             command.env("https_proxy", proxy);
         }
@@ -320,7 +321,7 @@ fn desktop_uses_auto_quota_policy_and_copies_token_into_an_isolated_home() {
     );
     assert_eq!(capture["xdg_cache_home"], format!("{desktop_home}/.cache"));
     assert_eq!(capture["ssh_connection"], "127.0.0.1 0 127.0.0.1 0");
-    assert_eq!(capture["proxy"], "http://127.0.0.1:10808");
+    assert_eq!(capture["proxy"], serde_json::Value::Null);
     assert!(
         capture["user_data"]
             .as_str()
@@ -360,7 +361,26 @@ fn desktop_inherits_a_configured_proxy_and_help_and_invalid_args_have_no_side_ef
     assert!(!invalid.status.success());
     assert!(!fixture.root.join("profiles/one/desktop-home").exists());
 
-    let output = fixture.invoke(&["desktop"], usage_map, Some("http://127.0.0.1:18888"));
+    let fallback = fixture
+        .command(&["desktop"], usage_map, None)
+        .env("SAGY_DEFAULT_PROXY", "http://127.0.0.1:10808")
+        .output()
+        .unwrap();
+    assert!(
+        fallback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    assert_eq!(
+        fixture.desktop_capture("one")["proxy"],
+        "http://127.0.0.1:10808"
+    );
+
+    let output = fixture
+        .command(&["desktop"], usage_map, Some("http://127.0.0.1:18888"))
+        .env("SAGY_DEFAULT_PROXY", "http://127.0.0.1:10808")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",

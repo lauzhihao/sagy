@@ -3,6 +3,8 @@ use std::ffi::OsString;
 
 use anyhow::{Result, bail};
 
+use super::util::{write_stderr_line, write_stdout_line};
+
 const COMMANDS: &[(&str, &str)] = &[
     (
         "add",
@@ -58,7 +60,7 @@ pub(super) fn help_or_version(args: &[OsString]) -> Option<i32> {
     }
     let action = args[0].to_str()?;
     if matches!(action, "--version" | "-V") && args.len() == 1 {
-        println!("sagy {}", env!("CARGO_PKG_VERSION"));
+        write_stdout_line(format_args!("sagy {}", env!("CARGO_PKG_VERSION")));
         return Some(0);
     }
     if matches!(action, "help" | "-h" | "--help") {
@@ -80,14 +82,14 @@ pub(super) fn help_or_version(args: &[OsString]) -> Option<i32> {
 }
 
 pub(super) fn print_root_help() {
-    eprintln!(
-        "Usage:\n  sagy                         Start auto with Gemini 3.8 Flash (High) and auto-approved tools\n  sagy -p PROMPT [options]     Print one response with those defaults\n  sagy --print PROMPT [options] Print one response with those defaults\n  sagy <COMMAND>               Manage native subscription profiles\n\nCommands:"
+    write_stderr_line(
+        "Usage:\n  sagy                         Start auto with Gemini 3.8 Flash (High) and auto-approved tools\n  sagy -p PROMPT [options]     Print one response with those defaults\n  sagy --print PROMPT [options] Print one response with those defaults\n  sagy <COMMAND>               Manage native subscription profiles\n\nCommands:",
     );
     for (name, usage) in COMMANDS {
         let summary = usage.lines().nth(1).unwrap_or_default();
-        eprintln!("  {name:8} {summary}");
+        write_stderr_line(format_args!("  {name:8} {summary}"));
     }
-    eprintln!("\nRun `sagy help COMMAND` or `sagy COMMAND --help` for details.");
+    write_stderr_line("\nRun `sagy help COMMAND` or `sagy COMMAND --help` for details.");
 }
 
 fn print_command_help(command: &str) -> Option<i32> {
@@ -100,48 +102,54 @@ fn print_command_help(command: &str) -> Option<i32> {
         return super::repo_sync::help(command == "push", &[OsString::from("--help")]);
     }
     if let Some((_, usage)) = COMMANDS.iter().find(|(name, _)| *name == command) {
-        eprintln!("{usage}");
+        write_stderr_line(usage);
         if command == "rm" {
-            eprintln!(
-                "NAME is an exact profile label or email address. Numeric labels are literal."
+            write_stderr_line(
+                "NAME is an exact profile label or email address. Numeric labels are literal.",
             );
-            eprintln!("The profile home and login data are moved into a private local archive.");
+            write_stderr_line(
+                "The profile home and login data are moved into a private local archive.",
+            );
         }
         if command == "refresh" {
-            eprintln!("--strict exits nonzero if any requested quota probe is incomplete.");
+            write_stderr_line("--strict exits nonzero if any requested quota probe is incomplete.");
         }
         if command == "update" {
-            eprintln!(
-                "-f, --force reinstalls the latest release when the version already matches."
+            write_stderr_line(
+                "-f, --force reinstalls the latest release when the version already matches.",
             );
-            eprintln!("Updates never downgrade the installed version.");
+            write_stderr_line("Updates never downgrade the installed version.");
         }
         if command == "desktop" {
-            eprintln!(
-                "Omit NAME|INDEX to refresh quotas and select automatically; incomplete quota is excluded."
+            write_stderr_line(
+                "Omit NAME|INDEX to refresh quotas and select automatically; incomplete quota is excluded.",
             );
-            eprintln!(
-                "NAME is an exact profile label/email; INDEX is the current sagy list number."
+            write_stderr_line(
+                "NAME is an exact profile label/email; INDEX is the current sagy list number.",
             );
-            eprintln!(
-                "Explicit selection uses that profile directly without auto quota filtering."
+            write_stderr_line(
+                "Explicit selection uses that profile directly without auto quota filtering.",
             );
-            eprintln!("Waits until the app quits; closing its last window may leave it running.");
-            eprintln!(
-                "All profiles share desktop history; only one sagy desktop may run at a time."
+            write_stderr_line(
+                "Waits until the app quits; closing its last window may leave it running.",
             );
-            eprintln!(
-                "The first launch copies existing history; quit regular Antigravity before importing."
+            write_stderr_line(
+                "All profiles share desktop history; only one sagy desktop may run at a time.",
             );
-            eprintln!(
-                "Existing desktop instances and concurrent CLI sessions keep their accounts."
+            write_stderr_line(
+                "The first launch copies existing history; quit regular Antigravity before importing.",
             );
-            eprintln!("This selects at startup; it does not restart desktop work on HTTP 429.");
-            eprintln!(
-                "New accounts signed in inside this desktop are verified and added to sagy list."
+            write_stderr_line(
+                "Existing desktop instances and concurrent CLI sessions keep their accounts.",
             );
-            eprintln!(
-                "Set SAGY_DESKTOP_BIN to the absolute Antigravity App executable path if needed."
+            write_stderr_line(
+                "This selects at startup; it does not restart desktop work on HTTP 429.",
+            );
+            write_stderr_line(
+                "New accounts signed in inside this desktop are verified and added to sagy list.",
+            );
+            write_stderr_line(
+                "Set SAGY_DESKTOP_BIN to the absolute Antigravity App executable path if needed.",
             );
         }
         Some(0)
@@ -273,6 +281,15 @@ mod tests {
             "-p",
             "hello"
         ])));
+        assert!(is_print_invocation(&args(&[
+            "-m", "claude-4", "-p", "hello"
+        ])));
+        assert!(is_print_invocation(&args(&[
+            "-m=gpt-oss-120b",
+            "-p",
+            "hello"
+        ])));
+        assert!(!is_print_invocation(&args(&["-m", "-p", "hello"])));
         assert!(!is_print_invocation(&args(&[
             "--model", "--print", "hello"
         ])));

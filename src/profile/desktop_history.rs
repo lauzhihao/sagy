@@ -293,9 +293,7 @@ pub(super) fn initialize_from(
     check_idle()?;
     let before = snapshot(source)?;
     if before.is_some() {
-        eprintln!(
-            "[sagy] Importing existing Antigravity history into the shared desktop directory."
-        );
+        super::note("Importing existing Antigravity history into the shared desktop directory.");
     }
     let staging = tempfile::Builder::new()
         .prefix(".desktop-import-")

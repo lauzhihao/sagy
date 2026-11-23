@@ -17,7 +17,6 @@ use crate::core::credential::StrictValue;
 const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
 const MAX_USERINFO_BYTES: u64 = 64 * 1024;
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
-const DEFAULT_PROXY: &str = "http://127.0.0.1:10808";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 // 凭据值不能实现 Debug/Display，避免错误诊断意外输出登录秘密。
@@ -179,8 +178,7 @@ impl Importer {
     }
 }
 
-fn has_proxy(environment: impl IntoIterator<Item = (OsString, OsString)>) -> bool {
-    let environment: BTreeMap<_, _> = environment.into_iter().collect();
+fn has_proxy_map(environment: &BTreeMap<OsString, OsString>) -> bool {
     [
         "http_proxy",
         "HTTP_PROXY",
@@ -197,6 +195,26 @@ fn has_proxy(environment: impl IntoIterator<Item = (OsString, OsString)>) -> boo
     })
 }
 
+#[cfg(test)]
+fn has_proxy(environment: impl IntoIterator<Item = (OsString, OsString)>) -> bool {
+    let environment: BTreeMap<_, _> = environment.into_iter().collect();
+    has_proxy_map(&environment)
+}
+
+// 桌面身份核验遵循相同的代理策略：无显式代理时默认直连，仅在显式配置 SAGY_DEFAULT_PROXY 时注入兜底代理。
+fn fallback_proxy(environment: impl IntoIterator<Item = (OsString, OsString)>) -> Option<String> {
+    let environment: BTreeMap<_, _> = environment.into_iter().collect();
+    if has_proxy_map(&environment) {
+        return None;
+    }
+    environment
+        .get(std::ffi::OsStr::new("SAGY_DEFAULT_PROXY"))
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|proxy| !proxy.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn identity_client_builder() -> reqwest::blocking::ClientBuilder {
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -206,8 +224,8 @@ fn identity_client_builder() -> reqwest::blocking::ClientBuilder {
 
 fn identity_client() -> Result<Client> {
     let mut builder = identity_client_builder();
-    if !has_proxy(std::env::vars_os()) {
-        let proxy = Proxy::all(DEFAULT_PROXY)
+    if let Some(default_proxy) = fallback_proxy(std::env::vars_os()) {
+        let proxy = Proxy::all(&default_proxy)
             .map_err(|_| anyhow!("Could not configure desktop identity verification."))?
             .no_proxy(NoProxy::from_env());
         builder = builder.proxy(proxy);
@@ -567,6 +585,25 @@ mod tests {
             assert!(!has_proxy([(key.into(), "".into())]));
         }
         assert!(!has_proxy([("NO_PROXY".into(), "*".into())]));
+        assert_eq!(fallback_proxy(Vec::new()), None);
+        assert_eq!(
+            fallback_proxy([("SAGY_DEFAULT_PROXY".into(), "   ".into())]),
+            None
+        );
+        assert_eq!(
+            fallback_proxy([(
+                "SAGY_DEFAULT_PROXY".into(),
+                " http://127.0.0.1:10808 ".into()
+            )]),
+            Some("http://127.0.0.1:10808".to_string())
+        );
+        assert_eq!(
+            fallback_proxy([
+                ("HTTP_PROXY".into(), "http://configured.invalid:1234".into()),
+                ("SAGY_DEFAULT_PROXY".into(), "http://127.0.0.1:10808".into()),
+            ]),
+            None
+        );
     }
 
     fn local_response(

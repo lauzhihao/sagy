@@ -117,16 +117,28 @@ fn child_environment(
         "SSH_CONNECTION",
         "SAGY_PROFILE_ROOT",
         "SAGY_POOL_KEY",
+        "SAGY_DEFAULT_PROXY",
+        "SAGY_EXIT_REFRESH_TIMEOUT_MS",
         "AGY_BIN",
     ];
-    let mut environment = inherited
-        .into_iter()
-        .filter(|(key, _)| {
-            let name = key.to_string_lossy();
-            !prefixes.iter().any(|prefix| name.starts_with(prefix))
-                && !excluded.contains(&name.as_ref())
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut default_proxy = None;
+    let mut environment = BTreeMap::new();
+    for (key, value) in inherited {
+        if key == OsStr::new("SAGY_DEFAULT_PROXY") {
+            default_proxy = value
+                .to_str()
+                .map(str::trim)
+                .filter(|proxy| !proxy.is_empty())
+                .map(OsString::from);
+            continue;
+        }
+        let name = key.to_string_lossy();
+        if !prefixes.iter().any(|prefix| name.starts_with(prefix))
+            && !excluded.contains(&name.as_ref())
+        {
+            environment.insert(key, value);
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         // SSH 文件认证不继承调用方显式指定的桌面 keyring 连接。
@@ -150,13 +162,15 @@ fn child_environment(
         "all_proxy",
         "ALL_PROXY",
     ];
+    // 默认不再强行注入本地 10808 端口，避免直连环境失败或多用户机器被本地端口劫持。
     if !proxy_keys.iter().any(|key| {
         environment
             .get(OsStr::new(key))
             .is_some_and(|value| !value.is_empty())
-    }) {
-        environment.insert("http_proxy".into(), "http://127.0.0.1:10808".into());
-        environment.insert("https_proxy".into(), "http://127.0.0.1:10808".into());
+    }) && let Some(proxy) = default_proxy
+    {
+        environment.insert("http_proxy".into(), proxy.clone());
+        environment.insert("https_proxy".into(), proxy);
     }
     for (key, path) in [
         ("HOME", home.to_path_buf()),
@@ -401,12 +415,14 @@ mod tests {
             ("GEMINI_API_KEY", "fixture"),
             ("AGY_ADC_AUTH", "true"),
             ("SAGY_POOL_KEY", "fixture-pool-key"),
+            ("SAGY_EXIT_REFRESH_TIMEOUT_MS", "250"),
             ("https_proxy", "http://proxy.example:3128"),
             ("no_proxy", "localhost"),
         ]);
         assert!(!env.contains_key(OsStr::new("GEMINI_API_KEY")));
         assert!(!env.contains_key(OsStr::new("AGY_ADC_AUTH")));
         assert!(!env.contains_key(OsStr::new("SAGY_POOL_KEY")));
+        assert!(!env.contains_key(OsStr::new("SAGY_EXIT_REFRESH_TIMEOUT_MS")));
         assert_eq!(
             env.get(OsStr::new("https_proxy")).unwrap(),
             "http://proxy.example:3128"
@@ -418,7 +434,19 @@ mod tests {
 
     #[test]
     fn proxy_defaults_apply_only_without_a_configured_proxy() {
-        let env = environment(&[("http_proxy", "")]);
+        let env = environment(&[]);
+        assert!(!env.contains_key(OsStr::new("http_proxy")));
+        assert!(!env.contains_key(OsStr::new("https_proxy")));
+
+        let env = environment(&[("SAGY_DEFAULT_PROXY", "   ")]);
+        assert!(!env.contains_key(OsStr::new("http_proxy")));
+        assert!(!env.contains_key(OsStr::new("https_proxy")));
+        assert!(!env.contains_key(OsStr::new("SAGY_DEFAULT_PROXY")));
+
+        let env = environment(&[
+            ("http_proxy", ""),
+            ("SAGY_DEFAULT_PROXY", " http://127.0.0.1:10808 "),
+        ]);
         assert_eq!(
             env.get(OsStr::new("http_proxy")).unwrap(),
             "http://127.0.0.1:10808"
@@ -427,8 +455,15 @@ mod tests {
             env.get(OsStr::new("https_proxy")).unwrap(),
             "http://127.0.0.1:10808"
         );
-        let env = environment(&[("ALL_PROXY", "socks5://localhost:1234")]);
+        assert!(!env.contains_key(OsStr::new("SAGY_DEFAULT_PROXY")));
+
+        let env = environment(&[
+            ("ALL_PROXY", "socks5://localhost:1234"),
+            ("SAGY_DEFAULT_PROXY", "http://127.0.0.1:10808"),
+        ]);
         assert!(!env.contains_key(OsStr::new("http_proxy")));
+        assert!(!env.contains_key(OsStr::new("https_proxy")));
+        assert!(!env.contains_key(OsStr::new("SAGY_DEFAULT_PROXY")));
     }
 
     #[cfg(target_os = "macos")]

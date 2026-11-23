@@ -1,6 +1,6 @@
 //! 将已登录 profile 的凭据副本交给独立的 Antigravity 桌面实例。
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
-use super::{desktop_history, desktop_sync, observer, runtime, store};
+use super::{
+    desktop_history, desktop_sync, observer, runtime, store,
+    util::{bounded_read, shell_quote, write_stderr_line},
+};
 use crate::core::credential::StrictValue;
 
 const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
@@ -53,13 +56,8 @@ fn read_token(profile_home: &Path) -> Result<Vec<u8>> {
         store::check_private_dir(&path)?;
     }
     let file = store::open_private_file(&profile_home.join(TOKEN_SOURCE), false)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_TOKEN_BYTES + 1)
-        .read_to_end(&mut bytes)
+    let bytes = bounded_read(file, MAX_TOKEN_BYTES)
         .context("Could not read the selected profile credentials.")?;
-    if bytes.len() as u64 > MAX_TOKEN_BYTES {
-        bail!("The selected profile credentials exceed the size limit.");
-    }
     let StrictValue(document) = serde_json::from_slice::<StrictValue>(&bytes)
         .map_err(|_| anyhow!("The selected profile credentials are invalid."))?;
     let token = document.get("token").unwrap_or(&document);
@@ -104,13 +102,6 @@ fn replace_private(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn shell_quote(path: &Path) -> Result<String> {
-    let text = path
-        .to_str()
-        .context("Desktop profile paths must be UTF-8.")?;
-    Ok(format!("'{}'", text.replace('\'', "'\\''")))
-}
-
 fn shell_script(home: &Path) -> Result<Vec<u8>> {
     let mut script = String::from("#!/bin/sh\nunset BASH_ENV ENV ZDOTDIR PROMPT_COMMAND\n");
     for (key, path) in [
@@ -120,12 +111,15 @@ fn shell_script(home: &Path) -> Result<Vec<u8>> {
         ("XDG_CACHE_HOME", home.join(".cache")),
         ("SHELL", home.join(".desktop-shell")),
     ] {
-        script.push_str(&format!("export {key}={}\n", shell_quote(&path)?));
+        script.push_str(&format!(
+            "export {key}={}\n",
+            shell_quote(path.as_os_str())?
+        ));
     }
     #[cfg(target_os = "macos")]
     script.push_str(&format!(
         "export CFFIXED_USER_HOME={}\n",
-        shell_quote(home)?
+        shell_quote(home.as_os_str())?
     ));
     script.push_str("export SSH_CONNECTION='127.0.0.1 0 127.0.0.1 0'\nexec /bin/bash --noprofile --norc \"$@\"\n");
     Ok(script.into_bytes())
@@ -373,7 +367,7 @@ pub(super) fn launch(root: &Path, profile_home: &Path) -> Result<i32> {
     ) {
         Ok(watcher) => Some(watcher),
         Err(_) => {
-            eprintln!("[sagy] Desktop account synchronization could not start.");
+            write_stderr_line("[sagy] Desktop account synchronization could not start.");
             None
         }
     };
@@ -387,7 +381,9 @@ pub(super) fn launch(root: &Path, profile_home: &Path) -> Result<i32> {
         });
     let code = result?;
     if code != 0 {
-        eprintln!("[sagy] Antigravity desktop exited with status {code}.");
+        super::note(format_args!(
+            "Antigravity desktop exited with status {code}."
+        ));
     }
     Ok(code)
 }

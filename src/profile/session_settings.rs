@@ -1,22 +1,23 @@
 //! Session-only agy `--settings` merged at launch: color scheme and title command.
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::statusline::SessionBridge;
 use super::store;
+use super::util::{bounded_read, shell_quote, write_stdout_line};
 use crate::core::credential::StrictValue;
 
 const COLOR_SCHEME_ENV: &str = "SAGY_COLOR_SCHEME";
 const TITLE_HELPER: &str = "--sagy-title-helper";
-const MAX_SETTINGS: usize = 256 * 1024;
-const MAX_INPUT: usize = 256 * 1024;
+const MAX_SETTINGS: u64 = 256 * 1024;
+const MAX_INPUT: u64 = 256 * 1024;
 const MAX_TITLE: usize = 256;
 
 pub(super) fn configure(
@@ -115,25 +116,6 @@ fn default_title_block() -> Result<Value> {
     }))
 }
 
-fn shell_quote(value: &OsStr) -> Result<String> {
-    let value = value
-        .to_str()
-        .context("Title helper paths must be UTF-8.")?;
-    Ok(format!("'{}'", value.replace('\'', r"'\''")))
-}
-
-fn bounded_read(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .context("Could not read the title helper input.")?;
-    if bytes.len() > limit {
-        bail!("Title helper input is too large.");
-    }
-    Ok(bytes)
-}
-
 pub(crate) fn helper_invocation(args: &[OsString]) -> Option<i32> {
     if args.get(1) != Some(&OsString::from(TITLE_HELPER)) {
         return None;
@@ -147,12 +129,9 @@ pub(crate) fn helper_invocation(args: &[OsString]) -> Option<i32> {
 fn print_title() -> Result<()> {
     let raw = bounded_read(std::io::stdin().lock(), MAX_INPUT)?;
     let title = title_from_state(&raw);
-    if title.is_empty() {
-        return Ok(());
+    if !title.is_empty() {
+        write_stdout_line(&title);
     }
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(title.as_bytes())?;
-    stdout.write_all(b"\n")?;
     Ok(())
 }
 

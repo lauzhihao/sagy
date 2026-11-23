@@ -1,7 +1,7 @@
 //! 原生状态回调只写当前 HOME 内的额度事件；父进程负责绑定账号并提交快照。
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,7 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::{cache, now, physical_directory, quota, runtime::Binary, store};
+use super::{
+    cache, now, physical_directory, quota,
+    runtime::Binary,
+    store,
+    util::{bounded_read, shell_quote},
+};
 use crate::core::credential::StrictValue;
 
 const HELPER: &str = "--sagy-statusline-helper";
@@ -38,15 +43,6 @@ struct Event {
 #[derive(Serialize, Deserialize)]
 struct HelperConfig {
     original_command: Option<String>,
-}
-
-fn bounded_read(mut reader: impl Read, limit: u64) -> Result<Vec<u8>> {
-    let mut raw = Vec::new();
-    reader.by_ref().take(limit + 1).read_to_end(&mut raw)?;
-    if raw.len() as u64 > limit {
-        bail!("Status callback input is too large.");
-    }
-    Ok(raw)
 }
 
 fn event(raw: &[u8]) -> Option<Event> {
@@ -87,13 +83,6 @@ fn event(raw: &[u8]) -> Option<Event> {
         input_tokens: token_count("/context_window/total_input_tokens")?,
         output_tokens: token_count("/context_window/total_output_tokens")?,
     })
-}
-
-fn shell_quote(value: &OsStr) -> Result<String> {
-    let value = value
-        .to_str()
-        .context("Status callback paths must be UTF-8.")?;
-    Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
 fn original_status_line(home: &Path) -> Result<Value> {
@@ -217,6 +206,7 @@ pub(super) struct SessionBridge {
     settings: String,
     previous: Option<Event>,
     checked_at: Option<Instant>,
+    last_sampled_at: Option<Instant>,
     flight: Option<Flight>,
     pending: bool,
     closing: bool,
@@ -280,6 +270,7 @@ impl SessionBridge {
             settings: serde_json::to_string(&json!({"statusLine":status}))?,
             previous: None,
             checked_at: None,
+            last_sampled_at: None,
             flight: None,
             pending: false,
             closing: false,
@@ -329,6 +320,8 @@ impl SessionBridge {
         }
         if completed_turn(self.previous.as_ref(), &next) {
             self.pending = true;
+            // 新回合完成后使旧采样失效，确保未完成本轮刷新前不会跳过退出探针。
+            self.last_sampled_at = None;
         }
         self.previous = Some(next);
         Ok(())
@@ -359,6 +352,7 @@ impl SessionBridge {
                     result: cache::Outcome::Ready,
                 }],
             )?;
+            self.last_sampled_at = Some(Instant::now());
         }
         if !self.closing {
             self.read_event()?;
@@ -424,9 +418,20 @@ impl SessionBridge {
         let _ = super::session_settings::publish_intent_title(&path, &title);
     }
 
-    pub(super) fn finish(&mut self) {
+    #[cfg(test)]
+    fn has_recent_clean_sample(&self, max_age: Duration) -> bool {
+        !self.pending
+            && self.flight.is_none()
+            && self.last_sampled_at.is_some_and(|t| t.elapsed() <= max_age)
+    }
+
+    pub(super) fn finish_has_recent_clean_sample(&mut self, max_age: Duration) -> bool {
+        if !self.closing {
+            // 收尾前补读一次事件，避免最后 100ms 节流窗口内刚完成的回合被误判为已刷新。
+            let _ = self.read_event();
+        }
         self.closing = true;
-        self.pending = false;
+        let had_unprobed_turn = self.pending;
         if self
             .flight
             .as_ref()
@@ -436,16 +441,21 @@ impl SessionBridge {
                 self.warn(error);
             }
         }
+        let clean = !had_unprobed_turn
+            && self.flight.is_none()
+            && self.last_sampled_at.is_some_and(|t| t.elapsed() <= max_age);
+        self.pending = false;
         if let Some(flight) = self.flight.take() {
             flight.cancel.store(true, Ordering::Relaxed);
             let _ = flight.handle.join();
         }
+        clean
     }
 }
 
 impl Drop for SessionBridge {
     fn drop(&mut self) {
-        self.finish();
+        let _ = self.finish_has_recent_clean_sample(Duration::ZERO);
     }
 }
 
@@ -594,5 +604,45 @@ mod tests {
     #[test]
     fn shell_path_quoting_preserves_spaces_and_quotes() {
         assert_eq!(shell_quote(OsStr::new("a' b")).unwrap(), "'a'\\'' b'");
+    }
+
+    #[test]
+    fn recent_clean_sample_tracks_freshness_and_invalidates_on_new_turn() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let home = store::profile_home(root.path(), &store::State::default(), "alpha", true)
+            .expect("profile home");
+        let binary = Binary::fixture(PathBuf::from("/bin/sh")).unwrap();
+        let mut bridge = SessionBridge::prepare(root.path(), &home, "alpha", &binary).unwrap();
+        assert!(!bridge.has_recent_clean_sample(Duration::from_secs(5)));
+
+        bridge.last_sampled_at = Some(Instant::now());
+        assert!(bridge.has_recent_clean_sample(Duration::from_secs(5)));
+        assert!(
+            !bridge.has_recent_clean_sample(Duration::ZERO) || {
+                thread::sleep(Duration::from_millis(2));
+                !bridge.has_recent_clean_sample(Duration::from_millis(1))
+            }
+        );
+
+        bridge.last_sampled_at = Some(Instant::now());
+        let event_path = bridge.directory.path().join("event.json");
+        let mut file = store::open_private_file(&event_path, true).unwrap();
+        serde_json::to_writer(
+            &mut file,
+            &Event {
+                state: "idle".into(),
+                conversation: Some("turn-2".into()),
+                conversation_title: None,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+            },
+        )
+        .unwrap();
+        drop(file);
+        bridge.read_event().unwrap();
+        assert!(bridge.pending);
+        assert!(bridge.last_sampled_at.is_none());
+        assert!(!bridge.has_recent_clean_sample(Duration::from_secs(5)));
     }
 }
