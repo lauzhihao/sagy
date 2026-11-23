@@ -232,6 +232,17 @@ pub(super) fn command(binary: &Binary, home: &Path) -> Result<Command> {
     Ok(command)
 }
 
+/// 直接启动桌面 app，避免 Electron 子沙箱嵌套在 sagy 的 CLI 沙箱中初始化失败；
+/// 账号仍使用独立 HOME、user-data-dir 和凭据副本，保持配置与环境隔离。
+pub(super) fn desktop_command(binary: &Binary, home: &Path) -> Result<Command> {
+    binary.check()?;
+    let mut command = Command::new(&binary.path);
+    command
+        .env_clear()
+        .envs(child_environment(home, std::env::vars_os()));
+    Ok(command)
+}
+
 extern "C" fn interrupted(_signal: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
@@ -426,10 +437,48 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("profiles/a/home");
         let policy = sandbox_policy(&home, temp.path()).unwrap();
+        let binary = Binary::fixture(PathBuf::from("/bin/sh")).unwrap();
+        let command = command(&binary, &home).unwrap();
+        assert_eq!(command.get_program(), OsStr::new(SANDBOX_EXEC));
         assert!(policy.contains("com.apple.securityd.xpc"));
         assert!(policy.contains("require-not (subpath"));
         assert!(policy.contains(home.to_str().unwrap()));
         assert!(policy.contains("Library/Keychains"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desktop_command_runs_the_app_directly_so_electron_can_start_its_sandbox() {
+        let binary = Binary::fixture(PathBuf::from("/bin/sh")).unwrap();
+        let command = desktop_command(&binary, Path::new("/tmp/sagy-profile/home")).unwrap();
+        assert_eq!(command.get_program(), OsStr::new("/bin/sh"));
+        assert!(
+            !command
+                .get_args()
+                .any(|argument| argument == OsStr::new("-p"))
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == OsStr::new("HOME")
+                    && value == Some(OsStr::new("/tmp/sagy-profile/home")))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desktop_child_can_initialize_its_own_seatbelt_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = Binary::fixture(PathBuf::from("/bin/sh")).unwrap();
+        let mut command = desktop_command(&binary, temp.path()).unwrap();
+        let status = command
+            .args([
+                "-c",
+                "/usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/sh -c 'exit 0'",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "child sandbox initialization failed");
     }
 
     #[cfg(target_os = "linux")]

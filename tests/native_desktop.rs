@@ -94,6 +94,9 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_WAIT") == "1":
     while not (home / "fixture-release").exists():
         import time
         time.sleep(0.02)
+if os.environ.get("SAGY_FIXTURE_DESKTOP_EXIT_CODE"):
+    print("raw desktop diagnostic with https://secret.example/token", file=sys.stderr)
+    raise SystemExit(int(os.environ["SAGY_FIXTURE_DESKTOP_EXIT_CODE"]))
 "##,
         )
         .unwrap();
@@ -170,6 +173,7 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_WAIT") == "1":
                 self._temp.path().join("probes.log"),
             )
             .env_remove("SAGY_FIXTURE_USAGE_DELAY")
+            .env_remove("SAGY_FIXTURE_DESKTOP_EXIT_CODE")
             .env_remove("http_proxy")
             .env_remove("HTTP_PROXY")
             .env_remove("https_proxy")
@@ -215,6 +219,23 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_WAIT") == "1":
         serde_json::from_slice(&fs::read(desktop_home.join("fixture-capture.json")).unwrap())
             .unwrap()
     }
+}
+
+#[test]
+fn desktop_reports_nonzero_exit_without_forwarding_private_app_logs() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[("chosen@example.test", 0.8, 0.8)]);
+    let output = fixture
+        .command(&["desktop", "chosen@example.test"], "{}", None)
+        .env("SAGY_FIXTURE_DESKTOP_EXIT_CODE", "23")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Antigravity desktop exited with status 23."));
+    assert!(!stderr.contains("raw desktop diagnostic"));
+    assert!(!stderr.contains("secret.example"));
 }
 
 fn make_executable(path: &Path) {

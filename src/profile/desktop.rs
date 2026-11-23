@@ -178,7 +178,7 @@ fn prepare(profile_home: &Path) -> Result<Prepared> {
 }
 
 fn desktop_command(binary: &runtime::Binary, prepared: &Prepared) -> Result<Command> {
-    let mut command = runtime::command(binary, &prepared.home)?;
+    let mut command = runtime::desktop_command(binary, &prepared.home)?;
     // 桌面会重新读取 login shell 环境，私有 shim 防止真实 shell 配置将 HOME 改回去。
     command.env("SHELL", prepared.home.join(".desktop-shell"));
     #[cfg(target_os = "macos")]
@@ -340,7 +340,11 @@ pub(super) fn launch(profile_home: &Path) -> Result<i32> {
         .spawn()
         .context("Could not start Antigravity desktop.")?;
     // prepared 持有桌面锁，调用方另持 profile 共享锁；二者都覆盖整个子进程生命周期。
-    wait_for_desktop(child, STOP_GRACE, observer::check_interrupted)
+    let code = wait_for_desktop(child, STOP_GRACE, observer::check_interrupted)?;
+    if code != 0 {
+        eprintln!("[sagy] Antigravity desktop exited with status {code}.");
+    }
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -505,6 +509,7 @@ mod tests {
         let prepared = prepare(&home).unwrap();
         let binary = runtime::Binary::from_path(PathBuf::from("/bin/sh")).unwrap();
         let command = desktop_command(&binary, &prepared).unwrap();
+        assert_eq!(command.get_program(), OsStr::new("/bin/sh"));
         let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
         assert_eq!(env[OsStr::new("HOME")], Some(prepared.home.as_os_str()));
         assert_eq!(
