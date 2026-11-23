@@ -563,11 +563,6 @@ pub fn current_release_target() -> Result<ReleaseTarget> {
             triple: "aarch64-apple-darwin",
             archive_ext: "tar.gz",
         })
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        Ok(ReleaseTarget {
-            triple: "x86_64-apple-darwin",
-            archive_ext: "tar.gz",
-        })
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         Ok(ReleaseTarget {
             triple: "x86_64-unknown-linux-musl",

@@ -232,7 +232,8 @@ detect_target() {
       echo "aarch64-apple-darwin"
       ;;
     Darwin/x86_64)
-      echo "x86_64-apple-darwin"
+      echo "Intel Macs are not supported. macOS releases require Apple Silicon." >&2
+      exit 1
       ;;
     Linux/x86_64|Linux/amd64)
       echo "x86_64-unknown-linux-musl"

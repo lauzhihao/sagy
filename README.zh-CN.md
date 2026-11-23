@@ -28,7 +28,7 @@ irm https://raw.githubusercontent.com/lauzhihao/sagy/main/install.ps1 | iex
 
 ### 预编译支持平台：
 
-- macOS：`aarch64-apple-darwin` (Apple Silicon), `x86_64-apple-darwin` (Intel)
+- macOS：`aarch64-apple-darwin`（仅 Apple Silicon）
 - Linux：`x86_64-unknown-linux-musl`
 - Windows：`x86_64-pc-windows-msvc`
 

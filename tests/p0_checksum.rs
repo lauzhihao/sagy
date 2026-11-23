@@ -174,7 +174,6 @@ fn build_archive(root: &Path, label: &str, entries: &[(&str, &str, bool)]) -> (P
 fn release_target() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
         _ => None,
     }
@@ -558,6 +557,47 @@ fn unix_installer_unlinks_an_external_profile_symlink_without_touching_its_targe
     assert_eq!(
         fs::read_to_string(external).unwrap(),
         "preserve external target\n"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_installer_rejects_intel_mac_without_downloading_or_replacing_the_binary() {
+    let fixture = TempDir::new().unwrap();
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    for (name, script) in [
+        (
+            "uname",
+            "#!/bin/sh\ncase \"$1\" in -s) echo Darwin;; -m) echo x86_64;; *) exit 1;; esac\n",
+        ),
+        ("curl", "#!/bin/sh\n: > \"$HOME/network-used\"\nexit 99\n"),
+    ] {
+        let path = fake_bin.join(name);
+        fs::write(&path, script).unwrap();
+        make_executable(&path);
+    }
+    let home = fixture.path().join("home");
+    let archive = fixture.path().join("unused-archive");
+    let hash = "0".repeat(64);
+    let run = installer_run(
+        home.clone(),
+        &fake_bin,
+        "valid",
+        &archive,
+        &hash,
+        "unused.tar.gz",
+    );
+    fs::create_dir_all(run.installed_binary().parent().unwrap()).unwrap();
+    fs::write(run.installed_binary(), b"existing installation").unwrap();
+
+    let output = run.run();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Intel Macs are not supported"));
+    assert!(!home.join("network-used").exists());
+    assert_eq!(
+        fs::read(run.installed_binary()).unwrap(),
+        b"existing installation"
     );
 }
 

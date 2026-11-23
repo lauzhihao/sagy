@@ -92,10 +92,6 @@ jobs:
             archive_ext: tar.gz
             bin_name: sagy
           - os: macos-latest
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
-            bin_name: sagy
-          - os: macos-latest
             target: aarch64-apple-darwin
             archive_ext: tar.gz
             bin_name: sagy
