@@ -238,4 +238,5 @@ form of the same option are present.
   Windows runner. Release builds depend on the version guard, quality job, and Windows harness.
 - The publish job alone receives `contents: write`; third-party Actions are pinned to commit SHAs.
 - Published packages and checksums are available at https://github.com/lauzhihao/sagy/releases/latest.
-  Rerunning the installer updates the native launcher while preserving profile data; source builds remain supported.
+  Native `update`/`upgrade` delegates to the existing updater, including `-f`/`--force`, checksum validation,
+  and downgrade refusal. Rerunning the installer can bootstrap older native entrypoints; source builds remain supported.

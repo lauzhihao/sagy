@@ -90,7 +90,11 @@ fn update_and_upgrade_help_are_available_from_both_native_entrypoints() {
                 "{args:?}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let help = String::from_utf8_lossy(&output.stderr);
+            let help = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(help.contains("sagy update"), "{args:?}: {help}");
             assert!(help.contains("--force"), "{args:?}: {help}");
             fixture.assert_profile_state_untouched();

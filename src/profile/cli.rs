@@ -5,8 +5,12 @@ use anyhow::{Result, bail};
 
 const COMMANDS: &[(&str, &str)] = &[
     (
+        "add",
+        "sagy add NAME\nAdd or authorize a subscription profile using its full email as the label.",
+    ),
+    (
         "login",
-        "sagy login NAME\nAdd or authorize a subscription profile.",
+        "sagy login NAME\nCompatibility alias for sagy add NAME.",
     ),
     (
         "run",
@@ -77,7 +81,7 @@ pub(super) fn help_or_version(args: &[OsString]) -> Option<i32> {
 
 pub(super) fn print_root_help() {
     eprintln!(
-        "Usage:\n  sagy                         Start auto with Gemini 3.8 Flash (High) and auto-approved tools\n  sagy -p PROMPT [options]     Print one response with those defaults\n  sagy --print PROMPT [options] Print one response with those defaults\n  sagy-profile <COMMAND>       Manage native subscription profiles\n\nCommands:"
+        "Usage:\n  sagy                         Start auto with Gemini 3.8 Flash (High) and auto-approved tools\n  sagy -p PROMPT [options]     Print one response with those defaults\n  sagy --print PROMPT [options] Print one response with those defaults\n  sagy <COMMAND>               Manage native subscription profiles\n\nCommands:"
     );
     for (name, usage) in COMMANDS {
         let summary = usage.lines().nth(1).unwrap_or_default();
@@ -225,7 +229,7 @@ mod tests {
     fn help_and_version_are_recognized_before_account_lookup() {
         assert_eq!(help_or_version(&args(&["--version"])), Some(0));
         for command in [
-            "login", "run", "use", "auto", "desktop", "list", "refresh", "rm",
+            "add", "login", "run", "use", "auto", "desktop", "list", "refresh", "rm",
         ] {
             assert_eq!(
                 help_or_version(&args(&["help", command])),

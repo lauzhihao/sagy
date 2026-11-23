@@ -33,7 +33,7 @@ fn now() -> f64 {
 }
 
 fn note(message: impl std::fmt::Display) {
-    eprintln!("[sagy-profile] {message}");
+    eprintln!("[sagy] {message}");
 }
 
 fn name(arg: &OsStr) -> Result<String> {
@@ -441,7 +441,7 @@ fn use_name(root: &Path, argument: &OsStr) -> Result<String> {
         let state = snapshot(root)?;
         let accounts = list_accounts(root, &state)?;
         if accounts.is_empty() {
-            bail!("No profiles. Run sagy login NAME first.");
+            bail!("No profiles. Run sagy add NAME first.");
         }
         let index = number.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
         return index
@@ -460,7 +460,7 @@ fn use_name(root: &Path, argument: &OsStr) -> Result<String> {
 fn list(root: &Path) -> Result<i32> {
     let state = snapshot(root)?;
     if state.profiles.is_empty() {
-        note("No profiles. Run sagy-profile login NAME for each subscription.");
+        note("No profiles. Run sagy add NAME for each subscription.");
         return Ok(0);
     }
     let accounts = list_accounts(root, &state)?;
@@ -856,7 +856,7 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
             let label = name(label)?;
             remove::run(&store::root_directory()?, label)
         }
-        (Some("login"), [label]) => {
+        (Some("add" | "login"), [label]) => {
             let label = name(label)?;
             let binary = verify()?;
             login(&store::root_directory()?, &binary, label)
@@ -884,7 +884,7 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
             let binary = verify()?;
             auto(&store::root_directory()?, &binary, args)
         }
-        _ => bail!("Invalid command. Run sagy-profile --help."),
+        _ => bail!("Invalid command. Run sagy --help."),
     }
 }
 

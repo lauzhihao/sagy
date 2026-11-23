@@ -11,7 +11,8 @@
 ## 一、安装
 
 > 预编译安装包已在 [GitHub Releases](https://github.com/lauzhihao/sagy/releases/latest) 发布。
-> macOS/Linux 可重新执行下方安装命令更新原生启动器，已有账号会保留。
+> v0.3.2 起，macOS/Linux 可直接用 `sagy update` 更新，`sagy update -f` 或 `--force` 可重装同一版本。
+> 较早的原生入口需要先用下方安装脚本升级一次；已有账号会保留。
 
 ### Unix (macOS / Linux):
 
@@ -113,15 +114,15 @@ Google `authorized_user` JSON 必须包含 `client_id`、`client_secret` 与 `re
 
 ### Linux 和 macOS 上切换个人订阅账号
 
-在项目根目录运行安装脚本，会编译一份 Rust 程序。`sagy` 和 `sagy-profile` 使用原生订阅账号池，`sagy-legacy` 提供原有可携带凭据命令。后续更新也使用同一安装脚本。已有 profile 会继续使用原目录和登录态，下面的 `login` 仅用于新增账号。每次授权时核对浏览器显示的 Google 邮箱，回到终端按 `agy` 的提示完成，进入会话后输入 `/exit` 退出。
+在项目根目录运行安装脚本，只编译并安装一份实体 Rust 程序 `sagy`。安装器会迁移旧的 `sagy -> sagy-profile` 布局并删除旧 `sagy-profile` 入口；`sagy-legacy` 仅作为指向同一程序的可携带凭据兼容别名。账号目录和登录态保持不变。新增账号使用 `sagy add 完整邮箱`，`sagy login` 保留为同一流程的兼容别名。每次授权时核对浏览器显示的 Google 邮箱，回到终端按 `agy` 的提示完成，进入会话后输入 `/exit` 退出。
 
 ```bash
 ./scripts/install-profiles.sh
-sagy-profile login work@example.com
-sagy-profile login personal@example.com
+sagy add work@example.com
+sagy add personal@example.com
 ```
 
-将同一启动器以可执行文件名 `sagy` 安装后，单独运行 `sagy` 等同于 `sagy-profile auto --model "Gemini 3.8 Flash (High)" --dangerously-skip-permissions`。`sagy -p "提示词"` 使用相同默认配置执行一次非交互请求。子命令原样交给 profile 命令，例如 `sagy login work@example.com`、`sagy list`。
+将同一启动器以可执行文件名 `sagy` 安装后，单独运行 `sagy` 等同于 `sagy auto --model "Gemini 3.8 Flash (High)" --dangerously-skip-permissions`。`sagy -p "提示词"` 使用相同默认配置执行一次非交互请求。子命令原样交给 profile 命令，例如 `sagy add work@example.com`、`sagy list`。
 
 自动化可以写 `sagy --print "提示词"`，也可以把选项放在提示词之前，例如 `sagy --output-format json -p "提示词"`。用 `sagy help 命令` 或 `sagy 命令 --help` 查看该命令的参数，用 `sagy --version` 查看启动器版本。
 
@@ -129,7 +130,9 @@ sagy-profile login personal@example.com
 
 额度查询和模型请求沿用调用方的代理环境变量。若未设置 HTTP、HTTPS 或 ALL 代理，则默认使用 `http://127.0.0.1:10808`；已有的 `NO_PROXY` 规则仍生效。
 
-`sagy-profile auto` 在启动前向每个账号查询原生 `/usage`。默认比较 Gemini 组，显式指定 `--model claude-sonnet-4-6` 或 GPT 模型时比较 Claude/GPT 组。每个账号以 5 小时和每周两个窗口中较低的剩余百分比参与排序，同分时轮换。查不到额度的账号作为备选，确认耗尽、正在冷却或所选模型组周额度低于 5% 的账号会被跳过；周额度恰好 5% 仍可选。用 `sagy use work@example.com` 可指定账号打开新实例，默认 Gemini 3.8 Flash (High) 和最高权限，不自动续接；也可追加 agy 参数。`sagy use 1` 按执行时本地快照的列表顺序打开第一个账号，序号从 1 开始；额度更新后排序可能改变，可先运行 `sagy list` 确认。纯数字参数优先作为序号，纯数字标签仍可用 `sagy run 标签` 启动。周额度门槛仅用于自动选号，`use` 允许手动指定低额度账号。用 `sagy-profile run work@example.com` 可原样启动某个账号，在第二个终端用 `sagy-profile run personal@example.com` 可同时使用另一个账号。`sagy-profile list` 列出本地标签。账号被撤销授权时，重新运行对应的 `login`。
+`sagy auto` 在启动前向每个账号查询原生 `/usage`。默认比较 Gemini 组，显式指定 `--model claude-sonnet-4-6` 或 GPT 模型时比较 Claude/GPT 组。每个账号以 5 小时和每周两个窗口中较低的剩余百分比参与排序，同分时轮换。查不到额度的账号作为备选，确认耗尽、正在冷却或所选模型组周额度低于 5% 的账号会被跳过；周额度恰好 5% 仍可选。用 `sagy use work@example.com` 可指定账号打开新实例，默认 Gemini 3.8 Flash (High) 和最高权限，不自动续接；也可追加 agy 参数。`sagy use 1` 按执行时本地快照的列表顺序打开第一个账号，序号从 1 开始；额度更新后排序可能改变，可先运行 `sagy list` 确认。纯数字参数优先作为序号，纯数字标签仍可用 `sagy run 标签` 启动。周额度门槛仅用于自动选号，`use` 允许手动指定低额度账号。用 `sagy run work@example.com` 可原样启动某个账号，在第二个终端用 `sagy run personal@example.com` 可同时使用另一个账号。`sagy list` 列出本地标签。账号被撤销授权时，重新运行对应的 `sagy add 邮箱`。
+
+`sagy update` 与 `sagy upgrade` 使用同一个更新器，无需安装 agy 或读取账号注册表。`sagy update -f` / `sagy update --force` 允许重装远端同版本，仍不允许降级；下载会校验 SHA256。更新会保留账号数据和现有快捷命令链接。
 
 运行 `sagy desktop` 会先并行刷新所有账号的 Gemini 额度（每个账号最多等待 25 秒），更新快照后直接用本次查询结果按 auto 规则选号，再打开该账号的 Antigravity 桌面实例。本次未查到完整 5h 和 weekly 额度的账号会跳过；若所有账号均不符合条件则退出，不使用旧快照兜底。桌面实例使用独立的私有 HOME 和窗口数据目录；登录凭据从 sagy 账号目录复制到桌面专用文件，桌面端刷新凭据不会覆盖 CLI 文件。该命令会一直前台运行并持有账号会话；请从 Antigravity 菜单退出应用后再结束终端命令。同一账号的 CLI agent 可并行运行；若该账号的 sagy 桌面实例已在运行，重复命令会提示并退出。也可执行 `sagy desktop user@example.com` 或 `sagy desktop 1` 指定账号，序号与当前 `sagy list` 一致；手动指定时直接使用该账号，不走启动前自动刷新或额度筛选。此命令不会把普通 Antigravity 实例切换到该账号；已有的普通桌面实例和聊天记录保持独立。macOS 默认查找 `/Applications/Antigravity.app` 和 `~/Applications/Antigravity.app`；Linux 或自定义安装可设置 `SAGY_DESKTOP_BIN` 指向桌面应用的可执行文件。桌面仅在启动时自动选号，运行中不会因 429 重启或换号。当前需要用户验证实际桌面登录和 token 刷新行为。
 

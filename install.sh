@@ -28,7 +28,7 @@ need_cmd() {
 }
 
 cleanup_workspace() {
-  if [[ -n "${STAGED_WRAPPER_PATH}" && -e "${STAGED_WRAPPER_PATH}" ]]; then
+  if [[ -n "${STAGED_WRAPPER_PATH}" && ( -e "${STAGED_WRAPPER_PATH}" || -L "${STAGED_WRAPPER_PATH}" ) ]]; then
     rm -f -- "${STAGED_WRAPPER_PATH}"
   fi
   if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
@@ -332,12 +332,14 @@ EOF
 
 install_legacy_alias() {
   # 在同一文件系统中替换别名；sagy 始终是独立实体文件，不会沿旧链接覆盖 profile。
-  ln -s sagy "${WORK_DIR}/sagy-legacy"
+  STAGED_WRAPPER_PATH="$(mktemp "${INSTALL_BIN}/.sagy-legacy.XXXXXX")"
+  ln -sf sagy "${STAGED_WRAPPER_PATH}"
   case "$(uname -s)" in
-    Darwin) mv -fh "${WORK_DIR}/sagy-legacy" "${INSTALL_BIN}/sagy-legacy" ;;
-    Linux) mv -fT "${WORK_DIR}/sagy-legacy" "${INSTALL_BIN}/sagy-legacy" ;;
+    Darwin) mv -fh "${STAGED_WRAPPER_PATH}" "${INSTALL_BIN}/sagy-legacy" ;;
+    Linux) mv -fT "${STAGED_WRAPPER_PATH}" "${INSTALL_BIN}/sagy-legacy" ;;
     *) echo "Unsupported platform for atomic installation." >&2; return 1 ;;
   esac
+  STAGED_WRAPPER_PATH=""
 }
 
 remove_profile_alias() {

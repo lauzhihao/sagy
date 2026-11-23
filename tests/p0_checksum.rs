@@ -569,12 +569,14 @@ fn unix_installer_refuses_a_real_profile_directory_before_replacing_sagy() {
     fs::create_dir_all(&fake_bin).unwrap();
     write_fake_curl(&fake_bin);
     let home = fixture.path().join("unified-directory-home");
+    let archive = fixture.path().join("unused-archive");
+    let hash = "0".repeat(64);
     let run = installer_run(
         home.clone(),
         &fake_bin,
         "valid",
-        fixture.path().join("unused-archive"),
-        &"0".repeat(64),
+        &archive,
+        &hash,
         "sagy-v1.0.0-test.tar.gz",
     );
     let bin = run.sagy_home().join("bin");
