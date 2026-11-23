@@ -12,6 +12,14 @@ launcher copies the complete CLI credential into
 write back into the CLI credential. A separate Electron `--user-data-dir` keeps
 the instance apart from the ordinary desktop app.
 
+On macOS, desktop launches the vendor executable directly so Electron can initialize
+its own sandbox. The CLI-only `sandbox-exec` wrapper cannot surround Electron:
+its helper processes abort when they try to initialize a nested sandbox. Desktop
+retains separate HOME, credentials and user data, but this is configuration separation,
+not the CLI's OS-enforced denial of access to the real home and Keychain. The launcher
+does not disable Electron's sandbox. Nonzero desktop exits report the exit code without
+printing potentially sensitive application logs.
+
 The caller holds the shared profile lease throughout the desktop process, while
 `desktop.rs` holds an exclusive desktop lock for that profile. CLI sessions may
 still share the account. A controlled shell preserves the isolated HOME when
