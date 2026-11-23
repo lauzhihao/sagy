@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
+use sha2::{Digest, Sha256};
 
-use super::{desktop_history, observer, runtime, store};
+use super::{desktop_history, desktop_sync, observer, runtime, store};
 use crate::core::credential::StrictValue;
 
 const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
@@ -133,6 +134,7 @@ fn shell_script(home: &Path) -> Result<Vec<u8>> {
 struct Prepared {
     home: PathBuf,
     user_data: PathBuf,
+    baseline: [u8; 32],
     _lock: File,
 }
 
@@ -184,6 +186,7 @@ fn prepare_with(
     Ok(Prepared {
         user_data: home.join(".local/share/antigravity-desktop"),
         home,
+        baseline: Sha256::digest(&bytes).into(),
         _lock: lock,
     })
 }
@@ -341,6 +344,18 @@ fn wait_for_desktop(
     result
 }
 
+fn wait_for_desktop_and_finish(
+    child: Child,
+    grace: Duration,
+    check: impl FnMut() -> Result<()>,
+    finish: impl FnOnce(),
+) -> Result<i32> {
+    let result = wait_for_desktop(child, grace, check);
+    // 即使等待返回中断或错误，子进程回收完成后也要收尾账号同步。
+    finish();
+    result
+}
+
 pub(super) fn launch(root: &Path, profile_home: &Path) -> Result<i32> {
     let binary = resolve_binary()?;
     observer::check_interrupted()?;
@@ -350,8 +365,27 @@ pub(super) fn launch(root: &Path, profile_home: &Path) -> Result<i32> {
     let child = command
         .spawn()
         .context("Could not start Antigravity desktop.")?;
+    // 基线来自启动前写入的确切字节；不能在 spawn 后重读，以免漏掉快速完成的新登录。
+    let mut sync = match desktop_sync::Watcher::start(
+        root.to_path_buf(),
+        prepared.home.join(TOKEN_TARGET),
+        prepared.baseline,
+    ) {
+        Ok(watcher) => Some(watcher),
+        Err(_) => {
+            eprintln!("[sagy] Desktop account synchronization could not start.");
+            None
+        }
+    };
     // prepared 持有桌面锁，调用方另持 profile 共享锁；二者都覆盖整个子进程生命周期。
-    let code = wait_for_desktop(child, STOP_GRACE, observer::check_interrupted)?;
+    let result =
+        wait_for_desktop_and_finish(child, STOP_GRACE, observer::check_interrupted, || {
+            // 桌面及其后代已停止后才做最后一次读取；线程 join 后才能交还共享桌面锁。
+            if let Some(watcher) = sync.as_mut() {
+                watcher.finish();
+            }
+        });
+    let code = result?;
     if code != 0 {
         eprintln!("[sagy] Antigravity desktop exited with status {code}.");
     }
@@ -393,6 +427,10 @@ mod tests {
         let prepared = test_prepare(temp.path(), &home).unwrap();
         let target = prepared.home.join(TOKEN_TARGET);
         assert_eq!(fs::read(&target).unwrap(), SYNTHETIC_TOKEN);
+        assert_eq!(
+            prepared.baseline,
+            <[u8; 32]>::from(Sha256::digest(SYNTHETIC_TOKEN))
+        );
         assert_eq!(fs::read(home.join(TOKEN_SOURCE)).unwrap(), SYNTHETIC_TOKEN);
         assert_eq!(
             fs::metadata(target).unwrap().permissions().mode() & 0o777,
@@ -600,5 +638,60 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn desktop_finalization_runs_after_reaping_and_preserves_the_exit_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = profile(temp.path());
+        let prepared = test_prepare(temp.path(), &home).unwrap();
+        let final_login = temp.path().join("final-login");
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf finished > \"$1\"; exit 7",
+                "desktop-final-sync",
+            ])
+            .arg(&final_login)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut finished = false;
+        let code = wait_for_desktop_and_finish(
+            child,
+            Duration::from_millis(50),
+            || Ok(()),
+            || {
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(fs::read(&final_login).unwrap(), b"finished");
+                assert!(test_prepare(temp.path(), &home).is_err());
+                finished = true;
+            },
+        )
+        .unwrap();
+        assert!(finished);
+        assert_eq!(code, 7);
+        drop(prepared);
+
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec /bin/sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut finished = false;
+        let error = wait_for_desktop_and_finish(
+            child,
+            Duration::from_millis(50),
+            || bail!("synthetic termination"),
+            || {
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                finished = true;
+            },
+        )
+        .unwrap_err();
+        assert!(finished);
+        assert_eq!(error.to_string(), "synthetic termination");
     }
 }
