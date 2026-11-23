@@ -285,6 +285,11 @@ fn directory_is_registered(state: &State, directory: &str) -> bool {
 
 fn recover_import(root: &Path) -> Result<()> {
     let _registry = store::lock_registry(root)?;
+    recover_import_locked(root)
+}
+
+// 调用方已经持有注册表锁，恢复不能重入同一把 flock。
+fn recover_import_locked(root: &Path) -> Result<()> {
     let Some(raw) = read_bounded(&root.join(MANIFEST), MAX_MANIFEST_BYTES)? else {
         return Ok(());
     };
@@ -336,6 +341,10 @@ fn write_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
 
 fn import_profiles_inner(root: &Path, bundle: &Bundle) -> Result<(usize, usize)> {
     let _registry = store::lock_registry(root)?;
+    import_profiles_locked(root, bundle)
+}
+
+fn import_profiles_locked(root: &Path, bundle: &Bundle) -> Result<(usize, usize)> {
     let mut state = store::read_state(root)?;
     let mut slots = Vec::new();
     let mut skipped = 0;
@@ -410,6 +419,34 @@ fn import_profiles(root: &Path, bundle: &Bundle) -> Result<(usize, usize)> {
         Err(error) => {
             // write_state 可能在 rename 后 fsync 失败，必须重读注册表后决定哪些目录可删除。
             if let Err(cleanup) = recover_import(root) {
+                return Err(error.context(format!(
+                    "Native profile import cleanup is pending: {cleanup}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+// 桌面同步只新增账号；网络验证由调用方完成，此处不等待其他会话或注册表事务。
+pub(super) fn try_import_profile(root: &Path, name: &str, token: &Value) -> Result<Option<bool>> {
+    let bundle = Bundle::new(BTreeMap::from([(name.to_owned(), token.clone())]));
+    bundle.validate()?;
+    let Some(_registry) = store::try_lock_registry(root)? else {
+        return Ok(None);
+    };
+    recover_import_locked(root)?;
+    let state = store::read_state(root)?;
+    if state.profiles.iter().any(|existing| existing == name) {
+        return Ok(Some(false));
+    }
+    if state.profiles.len() >= MAX_PROFILES {
+        bail!("Native profile pool exceeds the 256-account limit.");
+    }
+    match import_profiles_locked(root, &bundle) {
+        Ok((added, _)) => Ok(Some(added == 1)),
+        Err(error) => {
+            if let Err(cleanup) = recover_import_locked(root) {
                 return Err(error.context(format!(
                     "Native profile import cleanup is pending: {cleanup}"
                 )));
@@ -571,6 +608,59 @@ mod tests {
             state.directories
         );
         assert!(!root.path().join(MANIFEST).exists());
+    }
+
+    #[test]
+    fn desktop_import_recovers_owned_orphans_before_registering_a_complete_profile() {
+        let root = root();
+        let interrupted = manifest(root.path(), "interrupted@example.test");
+        let destination = interrupted.slots[0].destination(root.path()).unwrap();
+        let staging = interrupted.slots[0].staging(root.path()).unwrap();
+        store::ensure_private_dir(&destination).unwrap();
+        store::ensure_private_dir(&staging).unwrap();
+        let unrelated = root.path().join("profiles/unrelated");
+        store::ensure_private_dir(&unrelated).unwrap();
+        assert_eq!(
+            try_import_profile(
+                root.path(),
+                "desktop@example.test",
+                &token("desktop-refresh")
+            )
+            .unwrap(),
+            Some(true)
+        );
+        assert!(!destination.exists());
+        assert!(!staging.exists());
+        assert!(unrelated.is_dir());
+        let state = store::read_state(root.path()).unwrap();
+        assert_eq!(state.profiles, ["desktop@example.test"]);
+        let home = store::profile_home(root.path(), &state, "desktop@example.test", false).unwrap();
+        assert!(store::token_ready(&home).unwrap());
+        assert!(!root.path().join(MANIFEST).exists());
+    }
+
+    #[test]
+    fn failed_desktop_import_rolls_back_staging_without_registering_half_a_login() {
+        if unsafe { libc::getuid() } == 0 {
+            // root 不受目录写权限约束，无法用此方式注入 rename 失败。
+            return;
+        }
+        let root = root();
+        let profiles = root.path().join("profiles");
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = try_import_profile(root.path(), "desktop@example.test", &token("refresh"));
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(store::read_state(root.path()).unwrap().profiles.is_empty());
+        assert!(!root.path().join(MANIFEST).exists());
+        assert!(fs::read_dir(&profiles).unwrap().next().is_none());
+        assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sync-stage_")
+        }));
     }
 
     #[test]

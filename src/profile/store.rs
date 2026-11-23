@@ -173,6 +173,28 @@ pub(super) fn lock_registry(root: &Path) -> Result<File> {
     Ok(lock)
 }
 
+pub(super) fn try_lock_registry(root: &Path) -> Result<Option<File>> {
+    ensure_private_dir(root)?;
+    let lock = open_private_file(&root.join(".lock"), true)?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => (),
+        Err(error)
+            if error.kind() == fs2::lock_contended_error().kind()
+                || error.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("failed to lock profile registry"),
+    }
+    // 归档恢复会等待额度缓存锁；后台同步只延后重试，由正常管理命令恢复事务。
+    match fs::symlink_metadata(root.join(super::remove::MANIFEST)) {
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error).context("failed to inspect profile removal state"),
+    }
+    Ok(Some(lock))
+}
+
 pub(super) fn read_state(root: &Path) -> Result<State> {
     let path = root.join("state.json");
     let mut file = match open_private_file(&path, false) {

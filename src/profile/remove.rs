@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::{cache, store};
 use crate::core::credential::StrictValue;
 
-const MANIFEST: &str = ".remove-profile.json";
+pub(super) const MANIFEST: &str = ".remove-profile.json";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
