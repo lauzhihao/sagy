@@ -19,6 +19,7 @@ const TOKEN_SOURCE: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 const TOKEN_TARGET: &str = ".gemini/jetski-standalone-oauth-token";
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STOP_GRACE: Duration = Duration::from_secs(3);
+const GROUP_SETTLE: Duration = Duration::from_millis(250);
 
 fn resolve_binary() -> Result<runtime::Binary> {
     if let Some(path) = std::env::var_os("SAGY_DESKTOP_BIN") {
@@ -228,6 +229,15 @@ fn group_exists(group: libc::pid_t) -> bool {
         || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+fn settle_group(group: libc::pid_t) {
+    let deadline = Instant::now() + GROUP_SETTLE;
+    // SIGKILL 返回时后代还可能在退出；短时等待后再释放锁。kill(0) 也会看到
+    // 等待系统收割的 zombie，因此这里只能有界等待，不能把“仍存在”当作仍在工作。
+    while group_exists(group) && Instant::now() < deadline {
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
 struct DesktopProcess {
     child: Child,
     status: Option<ExitStatus>,
@@ -262,6 +272,9 @@ impl DesktopProcess {
         } else {
             Ok(())
         };
+        if force.is_ok() {
+            settle_group(group);
+        }
         self.cleaned = force.is_ok() && waited.is_ok();
         termination.context("Could not stop the Antigravity desktop process group.")?;
         force.context("Could not clean up the Antigravity desktop process group.")?;
@@ -279,6 +292,7 @@ impl Drop for DesktopProcess {
             let _ = signal_group(self.child.id() as libc::pid_t, libc::SIGKILL);
             let _ = self.child.kill();
             let _ = self.child.wait();
+            settle_group(self.child.id() as libc::pid_t);
         }
     }
 }
@@ -529,9 +543,11 @@ mod tests {
             wait_for_desktop(child, Duration::from_millis(50), || Ok(())).unwrap(),
             0
         );
-        let size = fs::metadata(&heartbeat).unwrap().len();
+        // 返回后立即取样；后台 writer 不能在锁交还调用方后继续写入。
+        let after_return = fs::read(&heartbeat).unwrap();
+        assert!(!after_return.is_empty());
         thread::sleep(Duration::from_millis(100));
-        assert_eq!(fs::metadata(&heartbeat).unwrap().len(), size);
+        assert_eq!(fs::read(&heartbeat).unwrap(), after_return);
     }
 
     #[test]
