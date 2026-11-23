@@ -6,7 +6,8 @@
 
 On macOS and Linux the default entrypoint uses `src/profile/`. Its `desktop`
 command calls the same Gemini quota selector as `auto`, then launches Antigravity
-App with a persistent, per-profile `desktop-home` beside the CLI `home`. The
+App with one persistent `desktop-home` under the profile storage root. All selected
+accounts share this desktop's conversation history. The
 launcher copies the complete CLI credential into
 `desktop-home/.gemini/jetski-standalone-oauth-token`; desktop refreshes do not
 write back into the CLI credential. A separate Electron `--user-data-dir` keeps
@@ -21,11 +22,20 @@ does not disable Electron's sandbox. Nonzero desktop exits report the exit code 
 printing potentially sensitive application logs.
 
 The caller holds the shared profile lease throughout the desktop process, while
-`desktop.rs` holds an exclusive desktop lock for that profile. CLI sessions may
+`desktop.rs` holds one exclusive desktop lock across the profile pool. CLI sessions may
 still share the account. A controlled shell preserves the isolated HOME when
 the app reloads its login-shell environment. The command waits for app exit and
 handles interruption before releasing its leases. Desktop selection happens at
 startup; the CLI's live 429 restart observer is not attached to desktop work.
+
+The first shared desktop launch imports persistent history from the real home's
+`.gemini/antigravity` into a staged HOME, then publishes it atomically. The source is
+kept intact; later launches do not synchronize it. Desktop processes must be closed
+during import and the source metadata must remain stable. Runtime directories,
+scratch workspaces, executable caches, plugin data and MCP configuration are excluded. Credentials,
+Keychain and the ordinary desktop's browser data are not imported. Existing per-profile
+desktop directories remain untouched; nonempty histories there require an explicit
+source decision rather than an automatic merge.
 
 The following diagram describes the portable `sagy-legacy` engine.
 

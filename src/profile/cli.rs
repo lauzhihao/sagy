@@ -128,6 +128,12 @@ fn print_command_help(command: &str) -> Option<i32> {
             );
             eprintln!("Waits until the app quits; closing its last window may leave it running.");
             eprintln!(
+                "All profiles share desktop history; only one sagy desktop may run at a time."
+            );
+            eprintln!(
+                "The first launch copies existing history; quit regular Antigravity before importing."
+            );
+            eprintln!(
                 "Existing desktop instances and concurrent CLI sessions keep their accounts."
             );
             eprintln!("This selects at startup; it does not restart desktop work on HTTP 429.");
