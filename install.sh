@@ -85,6 +85,17 @@ validate_configuration() {
     echo "SAGY_CURL_MAX_TIME must be a positive integer." >&2
     return 1
   fi
+  validate_install_targets
+}
+
+validate_install_targets() {
+  local path
+  for path in "${WRAPPER_PATH}" "${INSTALL_BIN}/sagy-legacy" "${INSTALL_BIN}/sagy-profile"; do
+    if [[ -d "${path}" && ! -L "${path}" ]]; then
+      echo "Cannot replace directory: ${path}" >&2
+      return 1
+    fi
+  done
 }
 
 show_requirements() {
@@ -319,20 +330,19 @@ EOF
   chmod 0755 "${ORIGINAL_WRAPPER_PATH}"
 }
 
-install_native_aliases() {
-  local alias
-  for alias in sagy-profile sagy-legacy; do
-    if [[ -d "${INSTALL_BIN}/${alias}" && ! -L "${INSTALL_BIN}/${alias}" ]]; then
-      echo "Cannot replace directory: ${INSTALL_BIN}/${alias}" >&2
-      return 1
-    fi
-    # 先在本次安装的目录中创建链接，再原子替换，避免并发 ln 的删除/创建竞态。
-    ln -s sagy "${WORK_DIR}/${alias}"
-    case "$(uname -s)" in
-      Darwin) mv -fh "${WORK_DIR}/${alias}" "${INSTALL_BIN}/${alias}" ;;
-      Linux) mv -fT "${WORK_DIR}/${alias}" "${INSTALL_BIN}/${alias}" ;;
-    esac
-  done
+install_legacy_alias() {
+  # 在同一文件系统中替换别名；sagy 始终是独立实体文件，不会沿旧链接覆盖 profile。
+  ln -s sagy "${WORK_DIR}/sagy-legacy"
+  case "$(uname -s)" in
+    Darwin) mv -fh "${WORK_DIR}/sagy-legacy" "${INSTALL_BIN}/sagy-legacy" ;;
+    Linux) mv -fT "${WORK_DIR}/sagy-legacy" "${INSTALL_BIN}/sagy-legacy" ;;
+    *) echo "Unsupported platform for atomic installation." >&2; return 1 ;;
+  esac
+}
+
+remove_profile_alias() {
+  # rm 删除链接本身；不跟随可能指向外部文件或目录的旧链接。
+  rm -f -- "${INSTALL_BIN}/sagy-profile"
 }
 
 remove_legacy_aliases() {
@@ -363,7 +373,8 @@ setup_workspace
 TARGET="$(detect_target)"
 VERSION="$(resolve_version)"
 download_and_install "${VERSION}" "${TARGET}"
-install_native_aliases
+install_legacy_alias
+remove_profile_alias
 install_original_wrapper
 remove_legacy_aliases
 print_next_steps

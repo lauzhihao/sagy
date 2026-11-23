@@ -271,6 +271,332 @@ fn installer_run<'a>(
     }
 }
 
+#[cfg(unix)]
+struct ProfilesInstallerFixture {
+    root: TempDir,
+    project: PathBuf,
+    install_bin: PathBuf,
+    cargo_log: PathBuf,
+}
+
+#[cfg(unix)]
+impl ProfilesInstallerFixture {
+    fn new(label: &str) -> Self {
+        let root = TempDir::new().expect("create native profile installer fixture");
+        let project = root.path().join(label);
+        let scripts = project.join("scripts");
+        fs::create_dir_all(&scripts).expect("create fixture scripts directory");
+        fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/install-profiles.sh"),
+            scripts.join("install-profiles.sh"),
+        )
+        .expect("copy source installer");
+        let target_binary = project.join("target/release/sagy");
+        fs::create_dir_all(target_binary.parent().unwrap()).expect("create fake Cargo target");
+        fs::write(&target_binary, "new sagy binary\n").expect("write fake Cargo output");
+
+        let fake_bin = root.path().join("fake-bin");
+        fs::create_dir_all(&fake_bin).expect("create fake tools");
+        let cargo = fake_bin.join("cargo");
+        fs::write(
+            &cargo,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CARGO_ARG_LOG\"\n",
+        )
+        .expect("write fake Cargo");
+        make_executable(&cargo);
+
+        Self {
+            install_bin: root.path().join("install-bin"),
+            cargo_log: root.path().join("cargo-args"),
+            root,
+            project,
+        }
+    }
+
+    fn run(&self) -> Output {
+        let fake_bin = self.root.path().join("fake-bin");
+        Command::new("bash")
+            .arg(self.project.join("scripts/install-profiles.sh"))
+            .env("HOME", self.root.path().join("home"))
+            .env("INSTALL_BIN", &self.install_bin)
+            .env("CARGO_TARGET_DIR", self.project.join("target"))
+            .env("CARGO_ARG_LOG", &self.cargo_log)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    fake_bin.display(),
+                    std::env::var("PATH").expect("inherit PATH")
+                ),
+            )
+            .output()
+            .expect("run native profile installer")
+    }
+}
+
+#[cfg(unix)]
+fn assert_unified_profile_install(bin: &Path) {
+    let sagy = fs::symlink_metadata(bin.join("sagy")).expect("inspect installed sagy");
+    assert!(
+        sagy.file_type().is_file(),
+        "sagy must be the physical binary"
+    );
+    assert!(!sagy.file_type().is_symlink(), "sagy must not be a symlink");
+    assert_eq!(
+        fs::read_to_string(bin.join("sagy")).unwrap(),
+        "new sagy binary\n"
+    );
+    assert_eq!(
+        fs::read_link(bin.join("sagy-legacy")).unwrap(),
+        Path::new("sagy")
+    );
+    assert!(
+        fs::symlink_metadata(bin.join("sagy-profile")).is_err(),
+        "the obsolete sagy-profile entry must be removed"
+    );
+}
+
+#[cfg(unix)]
+fn assert_profiles_installer_arguments(fixture: &ProfilesInstallerFixture) {
+    assert_eq!(
+        fs::read_to_string(&fixture.cargo_log).unwrap(),
+        "build\n--release\n--locked\n--bin\nsagy\n"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn source_installer_creates_one_binary_and_a_legacy_alias() {
+    let fixture = ProfilesInstallerFixture::new("profiles-clean");
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_unified_profile_install(&fixture.install_bin);
+    assert_profiles_installer_arguments(&fixture);
+}
+
+#[test]
+#[cfg(unix)]
+fn source_installer_replaces_the_old_profile_backed_alias_layout() {
+    let fixture = ProfilesInstallerFixture::new("profiles-old-layout");
+    fs::create_dir_all(&fixture.install_bin).unwrap();
+    fs::write(
+        fixture.install_bin.join("sagy-profile"),
+        "old profile executable\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("sagy-profile", fixture.install_bin.join("sagy")).unwrap();
+    std::os::unix::fs::symlink("sagy-profile", fixture.install_bin.join("sagy-legacy")).unwrap();
+
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_unified_profile_install(&fixture.install_bin);
+    assert_profiles_installer_arguments(&fixture);
+}
+
+#[test]
+#[cfg(unix)]
+fn source_installer_unlinks_an_external_profile_symlink_without_touching_its_target() {
+    let fixture = ProfilesInstallerFixture::new("profiles-external-link");
+    fs::create_dir_all(&fixture.install_bin).unwrap();
+    let external = fixture.root.path().join("external-profile-target");
+    fs::write(&external, "preserve external target\n").unwrap();
+    std::os::unix::fs::symlink(&external, fixture.install_bin.join("sagy-profile")).unwrap();
+
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_unified_profile_install(&fixture.install_bin);
+    assert_eq!(
+        fs::read_to_string(external).unwrap(),
+        "preserve external target\n"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn source_installer_refuses_a_real_profile_directory_before_building() {
+    let fixture = ProfilesInstallerFixture::new("profiles-directory");
+    fs::create_dir_all(fixture.install_bin.join("sagy-profile")).unwrap();
+    fs::write(fixture.install_bin.join("sagy"), "keep old sagy\n").unwrap();
+    std::os::unix::fs::symlink("sagy-profile", fixture.install_bin.join("sagy-legacy")).unwrap();
+
+    let output = fixture.run();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot replace directory"));
+    assert_eq!(
+        fs::read_to_string(fixture.install_bin.join("sagy")).unwrap(),
+        "keep old sagy\n"
+    );
+    assert_eq!(
+        fs::read_link(fixture.install_bin.join("sagy-legacy")).unwrap(),
+        Path::new("sagy-profile")
+    );
+    assert!(fixture.install_bin.join("sagy-profile").is_dir());
+    assert!(!fixture.cargo_log.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_installer_creates_one_binary_and_a_legacy_alias() {
+    let fixture = TempDir::new().unwrap();
+    let (archive, hash) = build_archive(
+        fixture.path(),
+        "unified-clean",
+        &[("sagy", "new sagy binary\n", true)],
+    );
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_curl(&fake_bin);
+    let Some(target) = release_target() else {
+        return;
+    };
+    let asset = format!("sagy-v1.0.0-{target}.tar.gz");
+    let run = installer_run(
+        fixture.path().join("unified-clean-home"),
+        &fake_bin,
+        "valid",
+        &archive,
+        &hash,
+        &asset,
+    );
+    let output = run.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_unified_profile_install(&run.sagy_home().join("bin"));
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_installer_replaces_the_old_profile_backed_alias_layout() {
+    let fixture = TempDir::new().unwrap();
+    let (archive, hash) = build_archive(
+        fixture.path(),
+        "unified-old-layout",
+        &[("sagy", "new sagy binary\n", true)],
+    );
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_curl(&fake_bin);
+    let Some(target) = release_target() else {
+        return;
+    };
+    let asset = format!("sagy-v1.0.0-{target}.tar.gz");
+    let run = installer_run(
+        fixture.path().join("unified-old-layout-home"),
+        &fake_bin,
+        "valid",
+        &archive,
+        &hash,
+        &asset,
+    );
+    let bin = run.sagy_home().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("sagy-profile"), "old profile executable\n").unwrap();
+    std::os::unix::fs::symlink("sagy-profile", bin.join("sagy")).unwrap();
+    std::os::unix::fs::symlink("sagy-profile", bin.join("sagy-legacy")).unwrap();
+
+    let output = run.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_unified_profile_install(&bin);
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_installer_unlinks_an_external_profile_symlink_without_touching_its_target() {
+    let fixture = TempDir::new().unwrap();
+    let (archive, hash) = build_archive(
+        fixture.path(),
+        "unified-external-link",
+        &[("sagy", "new sagy binary\n", true)],
+    );
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_curl(&fake_bin);
+    let Some(target) = release_target() else {
+        return;
+    };
+    let asset = format!("sagy-v1.0.0-{target}.tar.gz");
+    let run = installer_run(
+        fixture.path().join("unified-external-link-home"),
+        &fake_bin,
+        "valid",
+        &archive,
+        &hash,
+        &asset,
+    );
+    let bin = run.sagy_home().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let external = fixture.path().join("external-profile-target");
+    fs::write(&external, "preserve external target\n").unwrap();
+    std::os::unix::fs::symlink(&external, bin.join("sagy-profile")).unwrap();
+
+    let output = run.run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_unified_profile_install(&bin);
+    assert_eq!(
+        fs::read_to_string(external).unwrap(),
+        "preserve external target\n"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_installer_refuses_a_real_profile_directory_before_replacing_sagy() {
+    let fixture = TempDir::new().unwrap();
+    let fake_bin = fixture.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_curl(&fake_bin);
+    let home = fixture.path().join("unified-directory-home");
+    let run = installer_run(
+        home.clone(),
+        &fake_bin,
+        "valid",
+        fixture.path().join("unused-archive"),
+        &"0".repeat(64),
+        "sagy-v1.0.0-test.tar.gz",
+    );
+    let bin = run.sagy_home().join("bin");
+    fs::create_dir_all(bin.join("sagy-profile")).unwrap();
+    fs::write(bin.join("sagy"), "keep old sagy\n").unwrap();
+    std::os::unix::fs::symlink("sagy-profile", bin.join("sagy-legacy")).unwrap();
+
+    let output = run.run();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot replace directory"));
+    assert_eq!(
+        fs::read_to_string(bin.join("sagy")).unwrap(),
+        "keep old sagy\n"
+    );
+    assert_eq!(
+        fs::read_link(bin.join("sagy-legacy")).unwrap(),
+        Path::new("sagy-profile")
+    );
+    assert!(bin.join("sagy-profile").is_dir());
+    assert!(!run.sagy_home().join("tmp").exists());
+}
+
 /// 一次性临时目录的守卫：安装结束后 `${SAGY_HOME}/tmp` 不允许留下任何条目。
 #[cfg(unix)]
 fn assert_temp_root_is_clean(sagy_home: &Path, context: &str) {
