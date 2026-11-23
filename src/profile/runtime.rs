@@ -25,11 +25,20 @@ pub(super) struct Binary {
 }
 
 impl Binary {
+    pub(super) fn from_path(path: PathBuf) -> Result<Self> {
+        if !path.is_absolute() {
+            bail!("The executable path must be absolute.");
+        }
+        let binary = Self { path };
+        binary.check()?;
+        Ok(binary)
+    }
+
     pub(super) fn check(&self) -> Result<()> {
         let metadata = fs::metadata(&self.path)
-            .context("AGY_BIN must identify an executable regular file.")?;
+            .context("The executable must be a regular file with execute permission.")?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            bail!("AGY_BIN must identify an executable regular file.");
+            bail!("The executable must be a regular file with execute permission.");
         }
         Ok(())
     }
