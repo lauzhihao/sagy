@@ -942,7 +942,6 @@ impl CredentialStore {
     /// Construct a credential store from the sealed state transaction
     /// capability. This is the mutation-safe entry point; the legacy
     /// constructor remains for pure migration planning and compatibility.
-    #[allow(dead_code)]
     pub(crate) fn from_permit(permit: CredentialMutationPermit) -> StoreResult<Self> {
         let account_id = permit.account_id().to_string();
         let capability = permit.account_capability().clone();
@@ -963,11 +962,6 @@ impl CredentialStore {
             base_revision: Some(permit.state_revision().clone()),
             before_ref: permit.before_ref().cloned(),
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
     }
 
     pub(crate) fn account_dir(&self) -> &Path {
@@ -1173,7 +1167,7 @@ impl CredentialStore {
     /// Stage a credential after validating the complete two-slot layout while
     /// holding the credential lock.  The lock is retained in the returned
     /// stage until publish, restore or cleanup completes.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn stage(
         &self,
         txid: Uuid,
@@ -1362,7 +1356,6 @@ impl CredentialStore {
     /// Deletion uses the same journal/evidence protocol as replacement, so a
     /// crash cannot turn a state reference removal into an unrecoverable
     /// credential loss.
-    #[allow(dead_code)]
     pub(crate) fn stage_delete(
         &self,
         txid: Uuid,
@@ -1857,7 +1850,6 @@ impl CredentialStore {
     /// Return opaque proof that this transaction's journal is durable. The
     /// proof contains only account id, txid, journal digest, state revision
     /// and before/after references, never secret credential bytes.
-    #[allow(dead_code)]
     pub(crate) fn journal_proof(
         &self,
         published: &PublishedCredentialTxn,
@@ -1983,7 +1975,6 @@ impl CredentialStore {
             .map_err(CredentialStoreError::io)
     }
 
-    #[allow(dead_code)]
     fn restore_slot(
         &self,
         slot: CredentialSlot,
@@ -2169,7 +2160,6 @@ impl CredentialStore {
             .map_err(CredentialStoreError::io)
     }
 
-    #[allow(dead_code)]
     fn read_slot(&self, slot: CredentialSlot) -> StoreResult<Option<StoredCredential>> {
         match slot {
             CredentialSlot::Token => self.read_kind(CredentialRefKind::OauthAccessToken),
@@ -2193,25 +2183,11 @@ impl CredentialStore {
             .map_err(CredentialStoreError::io)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn restore_reconcile(&self, token: ReconcileToken) -> StoreResult<RestoreReceipt> {
         self.restore(PublishedCredentialTxn {
             inner: *token.inner,
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn finalize_reconcile(
-        &self,
-        token: ReconcileToken,
-        receipt: &StateCommitReceipt,
-    ) -> StoreResult<()> {
-        self.finalize(
-            PublishedCredentialTxn {
-                inner: *token.inner,
-            },
-            receipt,
-        )
     }
 
     /// Recover every fixed journal currently present for this account after a

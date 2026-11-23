@@ -46,29 +46,6 @@ const MAX_BUNDLE_CIPHERTEXT_BASE64_BYTES: usize = 4 * MAX_BUNDLE_CIPHERTEXT_BYTE
 // expansion while remaining a fixed pre-allocation guard.
 const MAX_ENCRYPTED_PAYLOAD_BYTES: usize = 24 * 1024 * 1024;
 
-/// Legacy source-compatibility shape. It is intentionally not accepted by
-/// the v2 repository adapter; keeping the type avoids breaking downstream
-/// code while preventing the old lossy wire format from being emitted.
-#[deprecated(note = "repository synchronization uses repo_bundle::BundleV2")]
-#[derive(Clone, Serialize, Deserialize)]
-pub struct AccountPoolBundle {
-    pub version: u32,
-    pub exported_at: i64,
-    pub accounts: Vec<AccountRecord>,
-}
-
-#[allow(deprecated)]
-impl std::fmt::Debug for AccountPoolBundle {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AccountPoolBundle")
-            .field("version", &self.version)
-            .field("exported_at", &self.exported_at)
-            .field("account_count", &self.accounts.len())
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct EncryptedBundlePayload {
     pub algorithm: String,

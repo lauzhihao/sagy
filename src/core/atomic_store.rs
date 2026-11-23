@@ -4,10 +4,6 @@
 //! opaque bytes and protects only their exact SHA-256 digest.  State versioning
 //! and migration belong to the layer above this one.
 
-// 2b 接入 StateStore 后这些接口会成为生产调用路径；在独立工作包合并前
-// 暂时允许未使用告警，避免用改变可见性来掩盖尚未接线的接口。
-#![allow(dead_code)]
-
 use std::fmt;
 use std::fs::File;
 use std::io::Write;
@@ -40,6 +36,7 @@ const MAX_ACCOUNT_DIRECTORIES: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExpectedDigest {
     /// Do not perform a compare-and-swap check.
+    #[cfg(test)]
     Any,
     /// Require the live document to have this exact digest. `None` means the
     /// document must be absent.
@@ -49,6 +46,7 @@ pub(crate) enum ExpectedDigest {
 impl ExpectedDigest {
     fn matches(self, actual: Option<DocumentDigest>) -> bool {
         match self {
+            #[cfg(test)]
             Self::Any => true,
             Self::Exact(expected) => expected == actual,
         }
@@ -450,7 +448,7 @@ pub(crate) struct AtomicStore {
 #[derive(Debug)]
 pub(crate) struct LockedAtomicStore {
     store: AtomicStore,
-    lock: File,
+    _lock: File,
 }
 
 /// Account-relative capability minted from an already-held state-store lock.
@@ -531,10 +529,6 @@ impl AccountStoreCapability {
         locator: &SafeRelativePath,
     ) -> std::result::Result<bool, MutationFailure> {
         remove_file(&self.root, locator)
-    }
-
-    pub(crate) fn sync(&self, locator: &SafeRelativePath) -> Result<()> {
-        sync_file(&self.root, locator)
     }
 
     pub(crate) fn sync_parent(&self, locator: &SafeRelativePath) -> Result<()> {
@@ -804,7 +798,7 @@ impl AtomicStore {
         let store = Self::from_owned_parts(owned, target, lock, journal);
         let locked = LockedAtomicStore {
             store,
-            lock: lock_file,
+            _lock: lock_file,
         };
         locked.cleanup_orphans(&current.orphan_stages)?;
         Ok(locked)
@@ -829,12 +823,14 @@ impl AtomicStore {
     }
 
     /// Recover a prepared journal while holding the store's cross-process lock.
+    #[cfg(test)]
     pub(crate) fn recover(&self) -> std::result::Result<RecoveryOutcome, AtomicStoreError> {
         let _lock = self.acquire_lock()?;
         self.recover_locked()
     }
 
     /// Compare-and-swap the target and publish opaque bytes atomically.
+    #[cfg(test)]
     pub(crate) fn commit(
         &self,
         expected: ExpectedDigest,
@@ -862,7 +858,7 @@ impl AtomicStore {
         }
         Ok(LockedAtomicStore {
             store: self.clone(),
-            lock,
+            _lock: lock,
         })
     }
 

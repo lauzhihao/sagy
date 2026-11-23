@@ -103,49 +103,8 @@ impl super::AntigravityAdapter {
         state_dir: &Path,
         raw_path: &Path,
     ) -> Result<MutationResult<AccountRecord>> {
-        self.import_auth_path_transaction_with_email(state_dir, raw_path, None)
-    }
-
-    fn import_auth_path_transaction_with_email(
-        &self,
-        state_dir: &Path,
-        raw_path: &Path,
-        email_override: Option<&str>,
-    ) -> Result<MutationResult<AccountRecord>> {
-        let source = read_import_source(raw_path)?;
-        let (credential, source_material) = parse_import_source(&source)?;
-        let email = credential_email(&credential)
-            .or_else(|| {
-                email_override
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| {
-                raw_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(|stem| {
-                        if stem == "oauth_creds" {
-                            "google-oauth-user@gemini".to_string()
-                        } else {
-                            format!("{stem}@gemini")
-                        }
-                    })
-                    .unwrap_or_else(|| "imported-account@gemini".to_string())
-            });
-        if email.trim().is_empty() {
-            bail!("credential email cannot be empty")
-        }
-        run_credential_import(
-            state_dir,
-            credential,
-            source_material,
-            &email,
-            None,
-            ImportMatch::IdentityOrEmail,
-            true,
-        )
+        let mut session = StateSession::open(state_dir).map_err(anyhow::Error::new)?;
+        self.import_auth_path_session(state_dir, &mut session, raw_path)
     }
 
     pub(crate) fn import_or_update_token_transaction(
@@ -155,20 +114,11 @@ impl super::AntigravityAdapter {
         token: &str,
         plan_label: Option<&str>,
     ) -> Result<MutationResult<AccountRecord>> {
-        let token = token.trim();
-        let credential =
-            PortableCredential::oauth_access_token(token).map_err(anyhow::Error::new)?;
-        run_credential_import(
-            state_dir,
-            credential,
-            token.as_bytes().to_vec(),
-            email,
-            plan_label,
-            ImportMatch::IdentityOrEmail,
-            true,
-        )
+        let mut session = StateSession::open(state_dir).map_err(anyhow::Error::new)?;
+        self.import_or_update_token_session(state_dir, &mut session, email, token, plan_label)
     }
 
+    #[cfg(test)]
     pub(crate) fn import_or_update_api_key_transaction(
         &self,
         state_dir: &Path,
@@ -176,25 +126,8 @@ impl super::AntigravityAdapter {
         email: &str,
         project_id: Option<&str>,
     ) -> Result<MutationResult<AccountRecord>> {
-        let api_key = api_key.trim();
-        let email = email.trim();
-        if api_key.is_empty() {
-            bail!("API key cannot be empty")
-        }
-        if email.is_empty() {
-            bail!("credential email cannot be empty")
-        }
-        let credential = api_key_credential(api_key, project_id)?;
-        let material = credential_material(&credential)?;
-        run_credential_import(
-            state_dir,
-            credential,
-            material,
-            email,
-            None,
-            ImportMatch::IdentityOnly,
-            false,
-        )
+        let mut session = StateSession::open(state_dir).map_err(anyhow::Error::new)?;
+        self.import_or_update_api_key_session(state_dir, &mut session, api_key, email, project_id)
     }
 
     /// CLI 使用的 session 变体。整个操作只由同一 session 持有 revision，
@@ -220,6 +153,9 @@ impl super::AntigravityAdapter {
                 })
                 .unwrap_or_else(|| "imported-account@gemini".to_string())
         });
+        if email.trim().is_empty() {
+            bail!("credential email cannot be empty")
+        }
         run_credential_import_session(
             state_dir,
             session,
@@ -285,26 +221,158 @@ impl super::AntigravityAdapter {
         )
     }
 
-    /// Migrate a legacy v1 state using only the fixed account credential
-    /// slots.  No caller `State`, arbitrary `auth_path`, or ambient home scan
-    /// participates in this transaction.
     /// Run the sealed v1 -> v2 migration on the caller-owned session. The
     /// planner reads only fixed account slots and never manufactures a new
     /// credential from ambient user-home files.
-    pub(crate) fn migrate_legacy_state_transaction(
-        &self,
-        state_dir: &Path,
-        session: &mut StateSession,
-    ) -> Result<MutationResult<()>> {
-        run_legacy_migration_session(state_dir, session)
-    }
-
     pub(crate) fn migrate_legacy_state_session(
         &self,
         state_dir: &Path,
         session: &mut StateSession,
     ) -> Result<MutationResult<()>> {
-        self.migrate_legacy_state_transaction(state_dir, session)
+        recover_active_home_journals(state_dir, session, None)?;
+        recover_credential_journals_session(state_dir, session)?;
+        if matches!(session.migration(), MigrationStatus::Missing) {
+            let committed = session.bootstrap_empty_v2().map_err(anyhow::Error::new)?;
+            return Ok(MutationResult::Committed {
+                value: (),
+                state: committed.after().clone(),
+            });
+        }
+        if matches!(session.migration(), MigrationStatus::None) {
+            return Err(anyhow!("state is already current v2"));
+        }
+        let disk = session.read().clone();
+        if disk.recovery_pending {
+            bail!("state recovery is pending; recover before legacy migration")
+        }
+        let mut reported = Vec::new();
+        // 隔离改名发生在事务的 staging 阶段，而且是非事务性的：事务回滚不会把它移
+        // 回去。必须在闭包外面留一份"已经真的改了名"的清单，回滚时告诉用户
+        // （AC-R12-1.1）。
+        let mut quarantined: Vec<QuarantinedFiles> = Vec::new();
+        let outcome = session
+            .with_locked_exact(|transaction| {
+                let base = transaction.snapshot()?.state;
+                let plan = credential_store::MigrationPlanner::plan(state_dir, &base)
+                    .map_err(anyhow::Error::new)?;
+                let mut planned = plan.entries;
+                let skipped = plan.skipped;
+                planned.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+                reported.clone_from(&skipped);
+
+                let mut staged = Vec::with_capacity(planned.len() + skipped.len());
+                for entry in planned {
+                    let permit = transaction
+                        .credential_mutation_permit(&entry.account_id)
+                        .map_err(anyhow::Error::new)?;
+                    let (store, prepared) = prepare_credential_with_permit(
+                        permit,
+                        &entry.credential,
+                        entry.material(),
+                    )?;
+                    staged.push((
+                        entry.account_id,
+                        Some(entry.credential_ref),
+                        store,
+                        prepared,
+                    ));
+                }
+                for skip in &skipped {
+                    let permit = transaction
+                        .credential_mutation_permit(&skip.account_id)
+                        .map_err(anyhow::Error::new)?;
+                    let (store, prepared, moved) = purge_unmigratable_account(permit, &base, skip)?;
+                    if !moved.is_empty() {
+                        quarantined.push(QuarantinedFiles {
+                            account_id: skip.account_id.clone(),
+                            files: moved,
+                        });
+                    }
+                    staged.push((skip.account_id.clone(), None, store, prepared));
+                }
+                staged.sort_by(|left, right| left.0.cmp(&right.0));
+
+                let mut published = Vec::with_capacity(staged.len());
+                for (account_id, reference, store, prepared) in staged {
+                    match store.publish(prepared) {
+                        Ok(published_txn) => {
+                            published.push((account_id, reference, store, published_txn))
+                        }
+                        Err(error) => {
+                            restore_published_transactions(published)?;
+                            return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
+                        }
+                    }
+                }
+                let mut proofs = Vec::with_capacity(published.len());
+                for (_, _, store, published_txn) in &published {
+                    match store.journal_proof(published_txn) {
+                        Ok(proof) => proofs.push(proof),
+                        Err(error) => {
+                            restore_published_transactions(published)?;
+                            return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
+                        }
+                    }
+                }
+
+                let mut candidate = base;
+                candidate.version = 2;
+                candidate.current_account_id = None;
+                candidate.active_profile = None;
+                candidate.credential_refs.clear();
+                for proof in &proofs {
+                    if let Some(reference) = proof.after_ref() {
+                        candidate
+                            .credential_refs
+                            .insert(proof.account_id().to_string(), reference.clone());
+                    }
+                }
+                // 被跳过的账号在 v2 里没有凭据引用，必须一并从账号表和用量缓存移除，
+                // 否则 encode_v2 会因为缺 credential_ref 而拒绝写出。原始数据已经隔离
+                // 到 accounts/<id>/ 的 quarantine 文件里，不随之销毁。
+                retain_migratable_accounts(&mut candidate, &skipped);
+                let permit = transaction.migration_commit_permit(proofs)?;
+                let receipt = match transaction.commit_migration(&candidate, permit) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        restore_published_transactions(published)?;
+                        return Err(error);
+                    }
+                };
+                let mut after = transaction.snapshot()?;
+                let mut recovery = Vec::new();
+                for (_, _, store, published_txn) in published {
+                    if let Err(error) = store.finalize(published_txn, &receipt) {
+                        recovery.push(error.to_string());
+                    }
+                }
+                if recovery.is_empty() {
+                    Ok(MutationResult::Committed {
+                        value: (),
+                        state: after,
+                    })
+                } else {
+                    after.recovery_pending = true;
+                    Ok(MutationResult::CommittedRecoveryPending {
+                        value: (),
+                        state: after,
+                        message: recovery.join("; "),
+                    })
+                }
+            })
+            .map_err(anyhow::Error::new);
+        // 提示必须在事务外打印：事务内打印会在回滚时留下与最终结果矛盾的输出。
+        // 同理，只有事务真的提交成功才可以报告跳过——整笔回滚时数据仍是 v1，
+        // 打印 "was skipped / 原始数据已保留" 与实际结果矛盾。
+        match outcome {
+            Ok(value) => {
+                report_migration_skips(&reported);
+                Ok(value)
+            }
+            // 回滚了，但隔离改名已经落盘且不会被撤销。以前这条路径什么都不说，
+            // 用户只看到一个与文件系统状态无关的错误。
+            Err(error) => Err(annotate_rollback_quarantine(error, &quarantined)),
+        }
     }
 
     /// Recover credential and active-home journals using the caller's one
@@ -448,6 +516,7 @@ impl super::AntigravityAdapter {
     /// PortableCredential/credential-store path used by file imports.  The
     /// lower layer rejects blank keys and reuses an id for an exact material
     /// duplicate, even when the caller supplies a different email hint.
+    #[cfg(test)]
     pub fn import_or_update_api_key(
         &self,
         state_dir: &Path,
@@ -1440,153 +1509,6 @@ fn recover_active_home_journals(
         .map_err(anyhow::Error::new)
 }
 
-fn run_legacy_migration_session(
-    state_dir: &Path,
-    session: &mut StateSession,
-) -> Result<MutationResult<()>> {
-    recover_active_home_journals(state_dir, session, None)?;
-    recover_credential_journals_session(state_dir, session)?;
-    if matches!(session.migration(), MigrationStatus::Missing) {
-        let committed = session.bootstrap_empty_v2().map_err(anyhow::Error::new)?;
-        return Ok(MutationResult::Committed {
-            value: (),
-            state: committed.after().clone(),
-        });
-    }
-    if matches!(session.migration(), MigrationStatus::None) {
-        return Err(anyhow!("state is already current v2"));
-    }
-    let disk = session.read().clone();
-    if disk.recovery_pending {
-        bail!("state recovery is pending; recover before legacy migration")
-    }
-    let mut reported = Vec::new();
-    // 隔离改名发生在事务的 staging 阶段，而且是非事务性的：事务回滚不会把它移
-    // 回去。必须在闭包外面留一份"已经真的改了名"的清单，回滚时告诉用户
-    // （AC-R12-1.1）。
-    let mut quarantined: Vec<QuarantinedFiles> = Vec::new();
-    let outcome = session
-        .with_locked_exact(|transaction| {
-            let base = transaction.snapshot()?.state;
-            let plan = credential_store::MigrationPlanner::plan(state_dir, &base)
-                .map_err(anyhow::Error::new)?;
-            let mut planned = plan.entries;
-            let skipped = plan.skipped;
-            planned.sort_by(|left, right| left.account_id.cmp(&right.account_id));
-            reported.clone_from(&skipped);
-
-            let mut staged = Vec::with_capacity(planned.len() + skipped.len());
-            for entry in planned {
-                let permit = transaction
-                    .credential_mutation_permit(&entry.account_id)
-                    .map_err(anyhow::Error::new)?;
-                let (store, prepared) =
-                    prepare_credential_with_permit(permit, &entry.credential, entry.material())?;
-                staged.push((
-                    entry.account_id,
-                    Some(entry.credential_ref),
-                    store,
-                    prepared,
-                ));
-            }
-            for skip in &skipped {
-                let permit = transaction
-                    .credential_mutation_permit(&skip.account_id)
-                    .map_err(anyhow::Error::new)?;
-                let (store, prepared, moved) = purge_unmigratable_account(permit, &base, skip)?;
-                if !moved.is_empty() {
-                    quarantined.push(QuarantinedFiles {
-                        account_id: skip.account_id.clone(),
-                        files: moved,
-                    });
-                }
-                staged.push((skip.account_id.clone(), None, store, prepared));
-            }
-            staged.sort_by(|left, right| left.0.cmp(&right.0));
-
-            let mut published = Vec::with_capacity(staged.len());
-            for (account_id, reference, store, prepared) in staged {
-                match store.publish(prepared) {
-                    Ok(published_txn) => {
-                        published.push((account_id, reference, store, published_txn))
-                    }
-                    Err(error) => {
-                        restore_published_transactions(published)?;
-                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
-                    }
-                }
-            }
-            let mut proofs = Vec::with_capacity(published.len());
-            for (_, _, store, published_txn) in &published {
-                match store.journal_proof(published_txn) {
-                    Ok(proof) => proofs.push(proof),
-                    Err(error) => {
-                        restore_published_transactions(published)?;
-                        return Err(StateStoreError::Invalid(anyhow::Error::new(error)));
-                    }
-                }
-            }
-
-            let mut candidate = base;
-            candidate.version = 2;
-            candidate.current_account_id = None;
-            candidate.active_profile = None;
-            candidate.credential_refs.clear();
-            for proof in &proofs {
-                if let Some(reference) = proof.after_ref() {
-                    candidate
-                        .credential_refs
-                        .insert(proof.account_id().to_string(), reference.clone());
-                }
-            }
-            // 被跳过的账号在 v2 里没有凭据引用，必须一并从账号表和用量缓存移除，
-            // 否则 encode_v2 会因为缺 credential_ref 而拒绝写出。原始数据已经隔离
-            // 到 accounts/<id>/ 的 quarantine 文件里，不随之销毁。
-            retain_migratable_accounts(&mut candidate, &skipped);
-            let permit = transaction.migration_commit_permit(proofs)?;
-            let receipt = match transaction.commit_migration(&candidate, permit) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    restore_published_transactions(published)?;
-                    return Err(error);
-                }
-            };
-            let mut after = transaction.snapshot()?;
-            let mut recovery = Vec::new();
-            for (_, _, store, published_txn) in published {
-                if let Err(error) = store.finalize(published_txn, &receipt) {
-                    recovery.push(error.to_string());
-                }
-            }
-            if recovery.is_empty() {
-                Ok(MutationResult::Committed {
-                    value: (),
-                    state: after,
-                })
-            } else {
-                after.recovery_pending = true;
-                Ok(MutationResult::CommittedRecoveryPending {
-                    value: (),
-                    state: after,
-                    message: recovery.join("; "),
-                })
-            }
-        })
-        .map_err(anyhow::Error::new);
-    // 提示必须在事务外打印：事务内打印会在回滚时留下与最终结果矛盾的输出。
-    // 同理，只有事务真的提交成功才可以报告跳过——整笔回滚时数据仍是 v1，
-    // 打印 "was skipped / 原始数据已保留" 与实际结果矛盾。
-    match outcome {
-        Ok(value) => {
-            report_migration_skips(&reported);
-            Ok(value)
-        }
-        // 回滚了，但隔离改名已经落盘且不会被撤销。以前这条路径什么都不说，
-        // 用户只看到一个与文件系统状态无关的错误。
-        Err(error) => Err(annotate_rollback_quarantine(error, &quarantined)),
-    }
-}
-
 /// One account's already-performed quarantine renames.
 struct QuarantinedFiles {
     account_id: String,
@@ -1716,30 +1638,6 @@ fn quarantine_evidence(base: &State, skip: &credential_store::MigrationSkip) -> 
 /// acquired in sorted account-id order.  A staged journal is published before
 /// the matching state reference is committed, and only the receipt returned by
 /// that commit may finalize evidence.
-#[allow(clippy::too_many_arguments)]
-fn run_credential_import(
-    state_dir: &Path,
-    incoming: PortableCredential,
-    source_material: Vec<u8>,
-    email: &str,
-    plan_label: Option<&str>,
-    matching: ImportMatch,
-    merge_oauth: bool,
-) -> Result<MutationResult<AccountRecord>> {
-    let store = StateStore::open(state_dir).map_err(anyhow::Error::new)?;
-    let mut session = StateSession::bootstrap_exact(&store).map_err(anyhow::Error::new)?;
-    run_credential_import_session(
-        state_dir,
-        &mut session,
-        incoming,
-        source_material,
-        email,
-        plan_label,
-        matching,
-        merge_oauth,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_credential_import_session(
     state_dir: &Path,
@@ -2728,7 +2626,7 @@ mod tests {
         let adapter = crate::adapters::antigravity::AntigravityAdapter;
         let mut session = StateSession::open(&state_dir).expect("open legacy session");
         let outcome = adapter
-            .migrate_legacy_state_transaction(&state_dir, &mut session)
+            .migrate_legacy_state_session(&state_dir, &mut session)
             .expect("migrate legacy state without import");
         assert!(!outcome.recovery_pending());
         assert_eq!(session.state().version, 2);
@@ -2800,7 +2698,7 @@ mod tests {
         let adapter = crate::adapters::antigravity::AntigravityAdapter;
         let mut session = StateSession::open(&state_dir).expect("open legacy session");
         let error = adapter
-            .migrate_legacy_state_transaction(&state_dir, &mut session)
+            .migrate_legacy_state_session(&state_dir, &mut session)
             .expect_err("an unquarantinable account must fail closed");
         let message = format!("{error:#}");
         assert!(

@@ -4,8 +4,6 @@
 //! private-field newtypes. This keeps a raw `Path` from accidentally reaching
 //! an operation that can create or replace state.
 
-#![allow(dead_code)]
-
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -536,7 +534,7 @@ pub(crate) struct ExternalDirectoryPreflight {
 #[derive(Debug)]
 pub(crate) struct ExternalDirectoryCapability {
     root: OwnedStoreRoot,
-    lock: File,
+    _lock: File,
     lock_locator: SafeRelativePath,
 }
 
@@ -616,7 +614,7 @@ impl ExternalDirectoryCapability {
         let owned = OwnedStoreRoot::adopt_external_nonempty_locked(root, &expected.identity)?;
         Ok(Self {
             root: owned,
-            lock: lock_file,
+            _lock: lock_file,
             lock_locator: expected.lock.clone(),
         })
     }
@@ -629,7 +627,7 @@ impl ExternalDirectoryCapability {
             .context("external directory identity changed after claim")?;
         Ok(Self {
             root,
-            lock,
+            _lock: lock,
             lock_locator,
         })
     }
@@ -638,10 +636,6 @@ impl ExternalDirectoryCapability {
     /// diagnostics. It cannot be supplied to any capability mutation method.
     pub(crate) fn root_path(&self) -> &Path {
         self.root.as_path()
-    }
-
-    pub(crate) fn root_identity(&self) -> &RootIdentity {
-        &self.root.identity
     }
 
     pub(crate) fn read_bounded(
@@ -665,6 +659,7 @@ impl ExternalDirectoryCapability {
         create_new_secure_file(&self.root, locator)
     }
 
+    #[cfg(test)]
     pub(crate) fn replace(
         &self,
         prepared: &SafeRelativePath,
@@ -891,10 +886,6 @@ impl MutationFailure {
         match self {
             Self::NotApplied { source } | Self::ReconcileRequired { source } => source,
         }
-    }
-
-    pub(crate) fn requires_reconciliation(&self) -> bool {
-        matches!(self, Self::ReconcileRequired { .. })
     }
 }
 
@@ -1429,6 +1420,7 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// Read a file below a normalized root without creating, chmod'ing, or
 /// canonicalizing anything. Missing roots/files return `None`; every existing
 /// intermediate and final symlink/reparse point is rejected.
+#[cfg(test)]
 pub(crate) fn read_relative_file(
     root: &NormalizedStoreRoot,
     relative: &SafeRelativePath,
@@ -1488,34 +1480,6 @@ pub(crate) fn read_relative_file(
         }
     }
     unreachable!("SafeRelativePath rejects empty locators")
-}
-
-/// Read a regular file below an owned root without changing any metadata.
-///
-/// This is the mutation-side counterpart of [`read_relative_file`].  Keeping
-/// the path resolution here means callers cannot accidentally turn an owned
-/// root plus an unchecked `Path` into a filesystem operation.
-pub(crate) fn read_owned_relative_file(
-    root: &OwnedStoreRoot,
-    relative: &SafeRelativePath,
-) -> Result<Option<Vec<u8>>> {
-    let (path, metadata) = resolve_owned_relative_path(root, relative, "read file", true)?;
-    let Some(metadata) = metadata else {
-        return Ok(None);
-    };
-    if !metadata.is_file() {
-        bail!("read path is not a regular file: {}", path.display())
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    apply_no_follow(&mut options);
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("failed to open file: {}", path.display()))?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read file: {}", path.display()))?;
-    Ok(Some(bytes))
 }
 
 /// Read a regular file below an owned root with a hard byte bound.

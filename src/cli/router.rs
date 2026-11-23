@@ -24,6 +24,14 @@ const LAUNCH_SHORTCUT_FLAGS: [&str; 4] = [
     "--no-launch",
     "--no-import-known",
 ];
+// 显式 `sagy launch` 子命令额外支持 `--takeover`，但顶层 `sagy --takeover` 不作为隐式 shortcut。
+const LAUNCH_SUBCOMMAND_FLAGS: [&str; 5] = [
+    "--dry-run",
+    "--no-resume",
+    "--no-launch",
+    "--no-import-known",
+    "--takeover",
+];
 
 const NO_RESUME_FLAG: &str = "--no-resume";
 
@@ -143,7 +151,7 @@ fn with_boundary_new_session(subcommand_args: &[OsString]) -> Vec<OsString> {
     let mut cursor = 1;
     while subcommand_args
         .get(cursor)
-        .is_some_and(|arg| LAUNCH_SHORTCUT_FLAGS.contains(&arg.to_string_lossy().as_ref()))
+        .is_some_and(|arg| LAUNCH_SUBCOMMAND_FLAGS.contains(&arg.to_string_lossy().as_ref()))
     {
         cursor += 1;
     }
@@ -307,6 +315,36 @@ mod tests {
         assert_eq!(
             route(&args(&["sagy", "launch", "--no-resume", "--", "--version"])),
             Route::Clap(args(&["sagy", "launch", "--no-resume", "--", "--version"]))
+        );
+        assert_eq!(
+            route(&args(&["sagy", "launch", "--takeover", "--", "--version"])),
+            Route::Clap(args(&[
+                "sagy",
+                "launch",
+                "--takeover",
+                "--no-resume",
+                "--",
+                "--version"
+            ]))
+        );
+        assert_eq!(
+            route(&args(&[
+                "sagy",
+                "launch",
+                "--takeover",
+                "--no-import-known",
+                "--",
+                "--version"
+            ])),
+            Route::Clap(args(&[
+                "sagy",
+                "launch",
+                "--takeover",
+                "--no-import-known",
+                "--no-resume",
+                "--",
+                "--version"
+            ]))
         );
     }
 

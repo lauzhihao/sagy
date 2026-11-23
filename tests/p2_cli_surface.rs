@@ -712,11 +712,12 @@ mod unix_tests {
         // 四条真实可达的边界输入：裸边界、显式 launch、root shortcut 之后、
         // launch shortcut 之后。四者的结果必须一致，否则规则又变成"看你多传了
         // 哪个无关 flag"。
-        let cases: [Vec<&str>; 4] = [
+        let cases: [Vec<&str>; 5] = [
             vec!["--", "--version"],
             vec!["launch", "--", "--version"],
             vec!["--no-import-known", "--", "--version"],
             vec!["launch", "--no-import-known", "--", "--version"],
+            vec!["launch", "--takeover", "--", "--version"],
         ];
         let own_version = format!("sagy {}", env!("CARGO_PKG_VERSION"));
         for case in cases {

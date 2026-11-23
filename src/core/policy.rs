@@ -1,3 +1,4 @@
+#[cfg(test)]
 use chrono::Utc;
 use std::collections::BTreeSet;
 
@@ -99,7 +100,8 @@ fn compatible_credential(account_type: AccountType, kind: CredentialRefKind) -> 
     }
 }
 
-pub fn select_best_account<'a>(
+#[cfg(test)]
+fn select_best_account<'a>(
     state: &'a State,
     accounts: &'a [AccountRecord],
 ) -> Option<(&'a AccountRecord, UsageSnapshot)> {

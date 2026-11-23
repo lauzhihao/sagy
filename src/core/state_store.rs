@@ -1,10 +1,8 @@
 //! Strict, versioned state storage over the generic atomic document store.
 //!
-//! This module is deliberately not wired into the current CLI in S0. The
-//! existing adapter still consumes the legacy runtime `AccountRecord`; the
-//! StateStore wire boundary is prepared for the later atomic cutover.
-
-#![allow(dead_code)]
+//! Owns the active State v2 wire format, compare-and-swap `StateSession`
+//! transactions, coordinated credential/active-home commit proofs, and
+//! sealed v1-to-v2 state migration.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -316,14 +314,6 @@ impl ActiveHomeJournalProof {
         self.txid
     }
 
-    pub(crate) fn journal_digest(&self) -> &str {
-        &self.journal_digest
-    }
-
-    pub(crate) fn base_revision(&self) -> &Revision {
-        &self.base_revision
-    }
-
     pub(crate) fn before_profile(&self) -> Option<&ActiveProfile> {
         self.before_profile.as_ref()
     }
@@ -472,12 +462,6 @@ impl CredentialJournalProof {
         &self.account_id
     }
 
-    pub(crate) fn credential_ref(&self) -> &CredentialRef {
-        self.after_ref
-            .as_ref()
-            .expect("legacy proof has an after ref")
-    }
-
     pub(crate) fn before_ref(&self) -> Option<&CredentialRef> {
         self.before_ref.as_ref()
     }
@@ -486,18 +470,11 @@ impl CredentialJournalProof {
         self.after_ref.as_ref()
     }
 
-    pub(crate) fn txid(&self) -> Uuid {
-        self.txid
-    }
-
-    pub(crate) fn journal_digest(&self) -> &str {
-        &self.journal_digest
-    }
-
     pub(crate) fn base_revision(&self) -> &Revision {
         &self.base_revision
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         account_id: &str,
         txid: Uuid,
@@ -619,10 +596,6 @@ pub(crate) struct CredentialCommitTransition {
 }
 
 impl CredentialCommitTransition {
-    pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
-    }
-
     pub(crate) fn txid(&self) -> Uuid {
         self.txid
     }
@@ -647,12 +620,6 @@ impl CredentialCommitTransition {
 impl StateCommitReceipt {
     pub(crate) fn revision(&self) -> &Revision {
         &self.revision
-    }
-
-    pub(crate) fn credential_ref(&self, account_id: &str) -> Option<&CredentialRef> {
-        self.transitions
-            .get(account_id)
-            .and_then(|transition| transition.after_ref.as_ref())
     }
 
     pub(crate) fn credential_transition(
@@ -813,26 +780,24 @@ pub(crate) struct StateRead {
 /// reconstruct a revision from a mutable `State` value.
 #[derive(Debug, Clone)]
 pub(crate) struct Committed<T> {
-    value: T,
+    _value: T,
     after: StateRead,
-    receipt: StateCommitReceipt,
+    _receipt: StateCommitReceipt,
 }
 
 impl<T> Committed<T> {
+    #[cfg(test)]
     pub(crate) fn value(&self) -> &T {
-        &self.value
-    }
-
-    pub(crate) fn into_value(self) -> T {
-        self.value
+        &self._value
     }
 
     pub(crate) fn after(&self) -> &StateRead {
         &self.after
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt(&self) -> &StateCommitReceipt {
-        &self.receipt
+        &self._receipt
     }
 }
 
@@ -955,16 +920,6 @@ impl StateSession {
         result
     }
 
-    /// Alias for callers that model a state mutation as a transaction rather
-    /// than as an exact-lock callback.
-    pub(crate) fn transact<T, E, F>(&mut self, callback: F) -> Result<T, E>
-    where
-        E: From<StateStoreError>,
-        F: FnOnce(&mut LockedStateTxn<'_>) -> Result<T, E>,
-    {
-        self.with_locked_exact(callback)
-    }
-
     /// Commit one current-generation candidate against this session's exact
     /// revision.  The candidate's runtime revision/version are normalized by
     /// the state layer, and the session is updated only after the durable
@@ -991,38 +946,9 @@ impl StateSession {
         })?;
         self.read = after.clone();
         Ok(Committed {
-            value: after.state.clone(),
+            _value: after.state.clone(),
             after,
-            receipt,
-        })
-    }
-
-    pub(crate) fn commit_coordinated(
-        &mut self,
-        state: &State,
-        proofs: Vec<CredentialJournalProof>,
-    ) -> Result<Committed<State>, StateStoreError> {
-        self.commit_coordinated_with_active(state, proofs, None)
-    }
-
-    pub(crate) fn commit_coordinated_with_active(
-        &mut self,
-        state: &State,
-        proofs: Vec<CredentialJournalProof>,
-        active_proof: Option<ActiveHomeJournalProof>,
-    ) -> Result<Committed<State>, StateStoreError> {
-        let expected = self.read.revision.clone();
-        let (receipt, after) = self.store.with_locked_exact(&expected, |transaction| {
-            let receipt =
-                transaction.commit_coordinated_with_active(state, proofs, active_proof)?;
-            let after = transaction.snapshot()?;
-            Ok((receipt, after))
-        })?;
-        self.read = after.clone();
-        Ok(Committed {
-            value: after.state.clone(),
-            after,
-            receipt,
+            _receipt: receipt,
         })
     }
 
@@ -1062,9 +988,9 @@ impl StateSession {
         })?;
         self.read = after.clone();
         Ok(Committed {
-            value: after.state.clone(),
+            _value: after.state.clone(),
             after,
-            receipt,
+            _receipt: receipt,
         })
     }
 
@@ -1121,13 +1047,6 @@ impl StateStore {
         StateSession::from_store(self.clone())
     }
 
-    /// State-layer bootstrap entry point.  This is intentionally pure: a
-    /// missing root is represented by a Missing session until the caller
-    /// explicitly requests the sealed empty-v2 bootstrap.
-    pub(crate) fn bootstrap_exact(&self) -> Result<StateSession, StateStoreError> {
-        self.session()
-    }
-
     /// Pure read: no mkdir, lock, chmod, recovery, credential write or
     /// migration write is performed here.
     pub(crate) fn read(&self) -> Result<StateRead, StateStoreError> {
@@ -1144,6 +1063,7 @@ impl StateStore {
         Self::open(path)?.read()
     }
 
+    #[cfg(test)]
     pub(crate) fn commit(
         &self,
         expected: &Revision,
@@ -1164,6 +1084,7 @@ impl StateStore {
     /// Perform the sealed one-time migration commit.  The caller must provide
     /// one durable credential-journal proof per account; ordinary `commit`
     /// cannot cross the missing/legacy boundary.
+    #[cfg(test)]
     pub(crate) fn commit_migration(
         &self,
         expected: &Revision,
@@ -1177,45 +1098,6 @@ impl StateStore {
             Ok(())
         })?;
         committed.ok_or_else(|| StateStoreError::Invalid(anyhow!("state migration did not commit")))
-    }
-
-    pub(crate) fn commit_coordinated(
-        &self,
-        expected: &Revision,
-        state: &State,
-        proofs: Vec<CredentialJournalProof>,
-    ) -> std::result::Result<StateCommitReceipt, StateStoreError> {
-        let mut committed = None;
-        self.with_locked_exact(expected, |transaction| {
-            committed = Some(transaction.commit_coordinated(state, proofs)?);
-            Ok(())
-        })?;
-        committed.ok_or_else(|| {
-            StateStoreError::Invalid(anyhow!("coordinated state transaction did not commit"))
-        })
-    }
-
-    pub(crate) fn commit_coordinated_with_active(
-        &self,
-        expected: &Revision,
-        state: &State,
-        proofs: Vec<CredentialJournalProof>,
-        active_proof: ActiveHomeJournalProof,
-    ) -> std::result::Result<StateCommitReceipt, StateStoreError> {
-        let mut committed = None;
-        self.with_locked_exact(expected, |transaction| {
-            committed = Some(transaction.commit_coordinated_with_active(
-                state,
-                proofs,
-                Some(active_proof),
-            )?);
-            Ok(())
-        })?;
-        committed.ok_or_else(|| {
-            StateStoreError::Invalid(anyhow!(
-                "coordinated active-home state transaction did not commit"
-            ))
-        })
     }
 
     /// Execute an exact state transaction while keeping one filesystem lock.
@@ -1248,7 +1130,7 @@ impl StateStore {
             let snapshot = guard.read_snapshot().map_err(StateStoreError::Invalid)?;
             let current = parse_snapshot(&snapshot).map_err(StateStoreError::Invalid)?;
             ensure_revision(expected, &current.revision)?;
-            let mut txn = LockedStateTxn::new(&guard, current.revision, self.root.clone());
+            let mut txn = LockedStateTxn::new(&guard, current.revision);
             return callback(&mut txn);
         };
         if is_link_or_reparse(&metadata) || !metadata.is_dir() {
@@ -1265,7 +1147,7 @@ impl StateStore {
             let snapshot = guard.read_snapshot().map_err(StateStoreError::Invalid)?;
             let current = parse_snapshot(&snapshot).map_err(StateStoreError::Invalid)?;
             ensure_revision(expected, &current.revision)?;
-            let mut txn = LockedStateTxn::new(&guard, current.revision, self.root.clone());
+            let mut txn = LockedStateTxn::new(&guard, current.revision);
             return callback(&mut txn);
         }
 
@@ -1275,7 +1157,7 @@ impl StateStore {
         let validator_root = mutation_root.clone();
         let adopted = unsafe {
             AtomicStore::adopt_existing_with(
-                mutation_root.clone(),
+                mutation_root,
                 self.target.clone(),
                 &preflight,
                 move |current| validate_adoption_root(&validator_root, current),
@@ -1285,7 +1167,7 @@ impl StateStore {
         let snapshot = adopted.check_exact(ExpectedDigest::Exact(expected_digest))?;
         let current = parse_snapshot(&snapshot).map_err(StateStoreError::Invalid)?;
         ensure_revision(expected, &current.revision)?;
-        let mut txn = LockedStateTxn::new(&adopted, current.revision, mutation_root);
+        let mut txn = LockedStateTxn::new(&adopted, current.revision);
         callback(&mut txn)
     }
 }
@@ -1294,16 +1176,11 @@ impl StateStore {
 pub(crate) struct LockedStateTxn<'a> {
     guard: &'a LockedAtomicStore,
     revision: Revision,
-    root: NormalizedStoreRoot,
 }
 
 impl<'a> LockedStateTxn<'a> {
-    fn new(guard: &'a LockedAtomicStore, revision: Revision, root: NormalizedStoreRoot) -> Self {
-        Self {
-            guard,
-            revision,
-            root,
-        }
+    fn new(guard: &'a LockedAtomicStore, revision: Revision) -> Self {
+        Self { guard, revision }
     }
 
     /// Mint a credential-store capability for one validated account while the
@@ -1333,30 +1210,6 @@ impl<'a> LockedStateTxn<'a> {
                 CredentialMutationMode::Migration
             },
         })
-    }
-
-    /// Mint the only capability accepted by the active-home adapter. The
-    /// profile and credential reference are copied under the State lock so a
-    /// caller cannot switch the target while home locks are being acquired.
-    pub(crate) fn active_home_mutation_permit(
-        &self,
-        target_profile: Option<ActiveProfile>,
-    ) -> std::result::Result<ActiveHomeMutationPermit, StateStoreError> {
-        let snapshot = self.snapshot()?;
-        let target_ref = match target_profile.as_ref() {
-            Some(profile) => snapshot
-                .state
-                .credential_refs
-                .get(&profile.account_id)
-                .cloned(),
-            None => snapshot
-                .state
-                .active_profile
-                .as_ref()
-                .and_then(|profile| snapshot.state.credential_refs.get(&profile.account_id))
-                .cloned(),
-        };
-        self.active_home_mutation_permit_with_ref(target_profile, target_ref)
     }
 
     /// Variant used when one coordinated commit creates the target account
@@ -1585,6 +1438,7 @@ impl<'a> LockedStateTxn<'a> {
         parse_snapshot(&snapshot).map_err(StateStoreError::Invalid)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_exact(
         &mut self,
         state: &State,
