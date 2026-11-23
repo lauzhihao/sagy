@@ -20,6 +20,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "auto",
         "sagy auto [agy arguments...]\nChoose an available profile and start agy.",
     ),
+    (
+        "desktop",
+        "sagy desktop\nChoose a profile with auto and open an isolated Antigravity desktop instance.",
+    ),
     ("list", "sagy list\nShow local profiles and cached quota."),
     (
         "refresh",
@@ -92,6 +96,19 @@ fn print_command_help(command: &str) -> Option<i32> {
         }
         if command == "refresh" {
             eprintln!("--strict exits nonzero if any requested quota probe is incomplete.");
+        }
+        if command == "desktop" {
+            eprintln!(
+                "No account argument is needed. Uses the same Gemini quota selection as auto."
+            );
+            eprintln!("Waits until the app quits; closing its last window may leave it running.");
+            eprintln!(
+                "Existing desktop instances and concurrent CLI sessions keep their accounts."
+            );
+            eprintln!("This selects at startup; it does not restart desktop work on HTTP 429.");
+            eprintln!(
+                "Set SAGY_DESKTOP_BIN to the absolute Antigravity App executable path if needed."
+            );
         }
         Some(0)
     } else {
@@ -186,7 +203,9 @@ mod tests {
     #[test]
     fn help_and_version_are_recognized_before_account_lookup() {
         assert_eq!(help_or_version(&args(&["--version"])), Some(0));
-        for command in ["login", "run", "use", "auto", "list", "refresh", "rm"] {
+        for command in [
+            "login", "run", "use", "auto", "desktop", "list", "refresh", "rm",
+        ] {
             assert_eq!(
                 help_or_version(&args(&["help", command])),
                 Some(0),

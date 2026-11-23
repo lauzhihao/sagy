@@ -4,6 +4,23 @@
 
 ## 1. System Overview
 
+On macOS and Linux the default entrypoint uses `src/profile/`. Its `desktop`
+command calls the same Gemini quota selector as `auto`, then launches Antigravity
+App with a persistent, per-profile `desktop-home` beside the CLI `home`. The
+launcher copies the complete CLI credential into
+`desktop-home/.gemini/jetski-standalone-oauth-token`; desktop refreshes do not
+write back into the CLI credential. A separate Electron `--user-data-dir` keeps
+the instance apart from the ordinary desktop app.
+
+The caller holds the shared profile lease throughout the desktop process, while
+`desktop.rs` holds an exclusive desktop lock for that profile. CLI sessions may
+still share the account. A controlled shell preserves the isolated HOME when
+the app reloads its login-shell environment. The command waits for app exit and
+handles interruption before releasing its leases. Desktop selection happens at
+startup; the CLI's live 429 restart observer is not attached to desktop work.
+
+The following diagram describes the portable `sagy-legacy` engine.
+
 ```text
                +-----------------------------------------+
                |  CLI Entrypoints (sagy / sagy-original) |

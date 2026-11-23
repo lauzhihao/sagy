@@ -4,6 +4,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
+
+// 每个场景内部已有并发进程；场景间串行，避免测试宿主负载耗尽生产 probe 的八秒预算。
+static DESKTOP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -164,7 +168,27 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_WAIT") == "1":
     }
 
     fn invoke(&self, args: &[&str], usage_map: &str, proxy: Option<&str>) -> Output {
-        self.command(args, usage_map, proxy).output().unwrap()
+        let mut child = self
+            .command(args, usage_map, proxy)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "command {args:?} did not finish: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     fn profile_home(&self, name: &str) -> PathBuf {
@@ -197,19 +221,20 @@ impl Drop for RunningDesktop {
 
 #[test]
 fn desktop_uses_auto_quota_policy_and_copies_token_into_an_isolated_home() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
     fixture.prepare_profiles(&[
-        ("weekly-low", 1.0, 0.049),
-        ("best", 0.95, 0.93),
+        ("a-weekly-low", 1.0, 0.049),
+        ("z-best", 0.95, 0.93),
         ("runner-up", 0.81, 0.75),
     ]);
     let best_original = fs::read(
         fixture
-            .profile_home("best")
+            .profile_home("z-best")
             .join(".gemini/antigravity-cli/antigravity-oauth-token"),
     )
     .unwrap();
-    let usage_map = r#"{"weekly-low":[1.0,0.049],"best":[0.95,0.93],"runner-up":[0.81,0.75]}"#;
+    let usage_map = r#"{"a-weekly-low":[1.0,0.049],"z-best":[0.95,0.93],"runner-up":[0.81,0.75]}"#;
     let output = fixture.invoke(&["desktop"], usage_map, None);
     assert!(
         output.status.success(),
@@ -217,18 +242,18 @@ fn desktop_uses_auto_quota_policy_and_copies_token_into_an_isolated_home() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Opening Antigravity with profile best."));
+    assert!(stderr.contains("Opening Antigravity with profile z-best."));
     assert!(
         !fixture
             .root
-            .join("profiles/weekly-low/desktop-home")
+            .join("profiles/a-weekly-low/desktop-home")
             .exists()
     );
 
-    let capture = fixture.desktop_capture("best");
+    let capture = fixture.desktop_capture("z-best");
     let desktop_home = fixture
         .root
-        .join("profiles/best/desktop-home")
+        .join("profiles/z-best/desktop-home")
         .to_string_lossy()
         .into_owned();
     assert_eq!(capture["home"], desktop_home);
@@ -262,7 +287,7 @@ fn desktop_uses_auto_quota_policy_and_copies_token_into_an_isolated_home() {
     assert_eq!(
         fs::read(
             fixture
-                .profile_home("best")
+                .profile_home("z-best")
                 .join(".gemini/antigravity-cli/antigravity-oauth-token")
         )
         .unwrap(),
@@ -272,6 +297,7 @@ fn desktop_uses_auto_quota_policy_and_copies_token_into_an_isolated_home() {
 
 #[test]
 fn desktop_inherits_a_configured_proxy_and_help_and_invalid_args_have_no_side_effects() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
     fixture.prepare_profiles(&[("one", 0.9, 0.9)]);
     let usage_map = r#"{"one":[0.9,0.9]}"#;
@@ -299,6 +325,7 @@ fn desktop_inherits_a_configured_proxy_and_help_and_invalid_args_have_no_side_ef
 
 #[test]
 fn desktop_holds_profile_lease_allows_cli_run_and_releases_locks_on_exit() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
     fixture.prepare_profiles(&[("one", 0.9, 0.9)]);
     let usage_map = r#"{"one":[0.9,0.9]}"#;
@@ -313,7 +340,7 @@ fn desktop_holds_profile_lease_allows_cli_run_and_releases_locks_on_exit() {
     let ready = desktop_home.join("fixture-ready");
     let release = desktop_home.join("fixture-release");
     let mut desktop = RunningDesktop { child, release };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !ready.exists() {
         if let Some(status) = desktop.child.try_wait().unwrap() {
             panic!("desktop exited before ready: {status}");
@@ -340,14 +367,25 @@ fn desktop_holds_profile_lease_allows_cli_run_and_releases_locks_on_exit() {
 
     let second = fixture.invoke(&["desktop"], usage_map, None);
     assert!(!second.status.success());
-    assert!(String::from_utf8_lossy(&second.stderr).contains("already running"));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("desktop instance running"));
     assert_eq!(
         fs::read(desktop_home.join(".gemini/jetski-standalone-oauth-token")).unwrap(),
         desktop_token
     );
 
     fs::write(&desktop.release, "release").unwrap();
-    assert!(desktop.child.wait().unwrap().success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = desktop.child.try_wait().unwrap() {
+            assert!(status.success(), "desktop failed to finish: {status}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "desktop command did not finish after the app exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let remove_after_exit = fixture.invoke(&["rm", "one"], usage_map, None);
     assert!(
         remove_after_exit.status.success(),

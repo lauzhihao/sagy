@@ -1,6 +1,7 @@
 //! 本机订阅账号池沿用 agy 的独立 HOME 和已有 v1 注册表。
 mod cache;
 mod cli;
+mod desktop;
 mod observer;
 mod quota;
 mod remove;
@@ -606,6 +607,33 @@ fn mark_limited(root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn remember_selection(root: &Path, name: &str) -> Result<()> {
+    let _registry = store::lock_registry(root)?;
+    let mut state = store::read_state(root)?;
+    state.last_selected = Some(name.to_owned());
+    store::write_state(root, &state)
+}
+
+fn launch_desktop(root: &Path, binary: &Binary) -> Result<i32> {
+    let _signals = observer::SignalGuard::install()?;
+    // 桌面与 CLI 共用选号器；共享 lease 必须覆盖整个桌面进程生命周期。
+    let selected = select(root, binary, Some("gemini"), &HashSet::new())?;
+    observer::check_interrupted()?;
+    let selected = selected.ok_or_else(|| {
+        anyhow!("No eligible profile. Check login, cooldowns, exhausted quota, or weekly quota below 5%.")
+    })?;
+    remember_selection(root, &selected.name)?;
+    note(format!(
+        "Opening Antigravity with profile {}.",
+        selected.name
+    ));
+    let code = desktop::launch(&selected.home)?;
+    // 退出刷新会安装自己的 signal guard，先释放会话 guard，避免重入同一把锁。
+    drop(_signals);
+    refresh_after_exit(root, binary, &selected.name, &selected.home, code);
+    Ok(code)
+}
+
 fn auto(root: &Path, binary: &Binary, args: &[OsString]) -> Result<i32> {
     if args.iter().any(|arg| {
         let opt = arg.to_string_lossy();
@@ -635,12 +663,7 @@ fn auto(root: &Path, binary: &Binary, args: &[OsString]) -> Result<i32> {
             score,
             _lease,
         } = selected;
-        {
-            let _registry = store::lock_registry(root)?;
-            let mut state = store::read_state(root)?;
-            state.last_selected = Some(name.clone());
-            store::write_state(root, &state)?;
-        }
+        remember_selection(root, &name)?;
         attempted.insert(name.clone());
         let summary = score.map_or_else(
             || "quota unknown".into(),
@@ -766,6 +789,15 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
             repo_sync::run(&store::root_directory()?, action == "push", extra)
         }
         (Some("list"), []) => list(&store::root_directory()?),
+        (Some("desktop"), []) => {
+            let binary = verify()?;
+            launch_desktop(&store::root_directory()?, &binary)
+        }
+        (Some("desktop"), _) => {
+            bail!(
+                "desktop does not accept an account or additional arguments. Run sagy desktop --help."
+            )
+        }
         (Some("refresh"), extra) => {
             let (strict, raw_name) = cli::refresh_options(extra)?;
             let name = raw_name.as_deref().map(name).transpose()?;
