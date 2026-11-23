@@ -237,5 +237,5 @@ form of the same option are present.
 - CI runs the Rust quality gate on Linux and the Windows runtime/checksum harness on a native
   Windows runner. Release builds depend on the version guard, quality job, and Windows harness.
 - The publish job alone receives `contents: write`; third-party Actions are pinned to commit SHAs.
-- No GitHub Release exists yet. Source builds are the current installation path; installer and
-  updater downloads become usable only after the first separately approved tag/release.
+- Published packages and checksums are available at https://github.com/lauzhihao/sagy/releases/latest.
+  Rerunning the installer updates the native launcher while preserving profile data; source builds remain supported.

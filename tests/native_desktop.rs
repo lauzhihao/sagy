@@ -37,7 +37,15 @@ if "/usage" not in sys.argv:
 token_path = os.path.join(os.environ["HOME"], ".gemini/antigravity-cli/antigravity-oauth-token")
 token = json.load(open(token_path))["token"]["refresh_token"]
 profile = token.removeprefix("synthetic-refresh-")
+log = os.environ["SAGY_FIXTURE_PROBE_LOG"]
+with open(log, "a") as file:
+    file.write(profile + "\n")
+if os.environ.get("SAGY_FIXTURE_USAGE_DELAY") and open(log).read().splitlines().count(profile) == 1:
+    import time
+    time.sleep(float(os.environ["SAGY_FIXTURE_USAGE_DELAY"]))
 quotas = json.loads(os.environ["SAGY_FIXTURE_USAGE_MAP"])
+if quotas[profile] is None:
+    raise SystemExit(2)
 five_hour, weekly = quotas[profile]
 print(json.dumps({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[
     {"id":"gemini-5h","remaining_fraction":five_hour},
@@ -68,6 +76,8 @@ if user_data is None:
             break
 token = (home / ".gemini/jetski-standalone-oauth-token").read_bytes()
 (home / "fixture-capture.json").write_text(json.dumps({
+    "probes": (pathlib.Path(os.environ["SAGY_FIXTURE_PROBE_LOG"]).read_text().splitlines()
+               if pathlib.Path(os.environ["SAGY_FIXTURE_PROBE_LOG"]).exists() else []),
     "argv": sys.argv[1:],
     "home": str(home),
     "xdg_config_home": os.environ.get("XDG_CONFIG_HOME"),
@@ -155,6 +165,11 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_WAIT") == "1":
             .env("AGY_BIN", &self.fake_agy)
             .env("SAGY_DESKTOP_BIN", &self.fake_desktop)
             .env("SAGY_FIXTURE_USAGE_MAP", usage_map)
+            .env(
+                "SAGY_FIXTURE_PROBE_LOG",
+                self._temp.path().join("probes.log"),
+            )
+            .env_remove("SAGY_FIXTURE_USAGE_DELAY")
             .env_remove("http_proxy")
             .env_remove("HTTP_PROXY")
             .env_remove("https_proxy")
@@ -307,7 +322,7 @@ fn desktop_inherits_a_configured_proxy_and_help_and_invalid_args_have_no_side_ef
     assert!(String::from_utf8_lossy(&help.stderr).contains("sagy desktop"));
     assert!(!fixture.root.join("profiles/one/desktop-home").exists());
 
-    let invalid = fixture.invoke(&["desktop", "one"], usage_map, None);
+    let invalid = fixture.invoke(&["desktop", "one", "extra"], usage_map, None);
     assert!(!invalid.status.success());
     assert!(!fixture.root.join("profiles/one/desktop-home").exists());
 
@@ -392,4 +407,184 @@ fn desktop_holds_profile_lease_allows_cli_run_and_releases_locks_on_exit() {
         "{}",
         String::from_utf8_lossy(&remove_after_exit.stderr)
     );
+}
+
+#[test]
+fn desktop_refreshes_stale_quotas_once_and_skips_unavailable_profiles() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[
+        ("exhausted", 1.0, 1.0),
+        ("best", 0.1, 0.1),
+        ("unknown", 0.9, 0.9),
+    ]);
+    let seed = fixture.invoke(
+        &["refresh"],
+        r#"{"exhausted":[1,1],"best":[0.1,0.1],"unknown":[0.9,0.9]}"#,
+        None,
+    );
+    assert!(seed.status.success());
+    fs::write(fixture._temp.path().join("probes.log"), "").unwrap();
+    let output = fixture.invoke(
+        &["desktop"],
+        r#"{"exhausted":[0,0.8],"best":[0.7,0.8],"unknown":null}"#,
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let capture = fixture.desktop_capture("best");
+    let mut probes = capture["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    probes.sort();
+    assert_eq!(probes, ["best", "exhausted", "unknown"]);
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("quota.json")).unwrap()).unwrap();
+    assert_eq!(
+        snapshot["profiles"]["exhausted"]["windows"],
+        serde_json::json!([0.0, 0.8])
+    );
+    assert_eq!(snapshot["profiles"]["unknown"]["result"], "unavailable");
+    for name in ["exhausted", "unknown"] {
+        assert!(
+            !fixture
+                .root
+                .join("profiles")
+                .join(name)
+                .join("desktop-home")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn desktop_refuses_missing_quota_windows_even_with_a_healthy_old_snapshot() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[("missing", 1.0, 1.0), ("partial", 1.0, 1.0)]);
+    assert!(
+        fixture
+            .invoke(&["refresh"], r#"{"missing":[1,1],"partial":[1,1]}"#, None)
+            .status
+            .success()
+    );
+    let output = fixture.invoke(&["desktop"], r#"{"missing":null,"partial":[1,null]}"#, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No eligible profile after quota refresh")
+    );
+    for name in ["missing", "partial"] {
+        assert!(
+            !fixture
+                .root
+                .join("profiles")
+                .join(name)
+                .join("desktop-home")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn desktop_refresh_accepts_a_probe_slower_than_the_auto_timeout() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[("slow", 1.0, 1.0)]);
+    let output = fixture
+        .command(&["desktop"], r#"{"slow":[0.9,0.9]}"#, None)
+        .env("SAGY_FIXTURE_USAGE_DELAY", "9")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.desktop_capture("slow")["probes"],
+        serde_json::json!(["slow"])
+    );
+}
+
+#[test]
+fn desktop_accepts_an_exact_email_without_auto_quota_filtering() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[("chosen@example.test", 0.0, 0.01), ("other", 1.0, 1.0)]);
+    let output = fixture.invoke(
+        &["desktop", "chosen@example.test"],
+        r#"{"chosen@example.test":[0,0.01],"other":[1,1]}"#,
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let capture = fixture.desktop_capture("chosen@example.test");
+    assert_eq!(capture["probes"], serde_json::json!([]));
+    assert!(!fixture.root.join("profiles/other/desktop-home").exists());
+    assert!(
+        capture["token"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic-refresh-chosen@example.test")
+    );
+}
+
+#[test]
+fn desktop_index_uses_the_displayed_snapshot_order_without_refreshing_it_first() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[("alphabetic-first", 0.1, 0.2), ("z-list-first", 0.9, 0.9)]);
+    assert!(
+        fixture
+            .invoke(
+                &["refresh"],
+                r#"{"alphabetic-first":[0.1,0.2],"z-list-first":[0.9,0.9]}"#,
+                None
+            )
+            .status
+            .success()
+    );
+    fs::write(fixture._temp.path().join("probes.log"), "").unwrap();
+    let output = fixture.invoke(
+        &["desktop", "1"],
+        r#"{"alphabetic-first":[1,1],"z-list-first":[0,0]}"#,
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.desktop_capture("z-list-first")["probes"],
+        serde_json::json!([])
+    );
+    assert!(
+        !fixture
+            .root
+            .join("profiles/alphabetic-first/desktop-home")
+            .exists()
+    );
+}
+
+#[test]
+fn desktop_rejects_unknown_profiles_and_invalid_indices_without_launching() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[("one", 1.0, 1.0)]);
+    for argument in ["missing", "0", "2", "--unknown"] {
+        let output = fixture.invoke(&["desktop", argument], r#"{"one":[1,1]}"#, None);
+        assert!(!output.status.success(), "{argument}");
+        assert!(!fixture.root.join("profiles/one/desktop-home").exists());
+        assert!(!fixture._temp.path().join("probes.log").exists());
+    }
 }

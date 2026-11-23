@@ -22,7 +22,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "desktop",
-        "sagy desktop\nChoose a profile with auto and open an isolated Antigravity desktop instance.",
+        "sagy desktop [NAME|INDEX]\nOpen a chosen profile, or refresh quotas and choose automatically.",
     ),
     ("list", "sagy list\nShow local profiles and cached quota."),
     (
@@ -99,7 +99,13 @@ fn print_command_help(command: &str) -> Option<i32> {
         }
         if command == "desktop" {
             eprintln!(
-                "No account argument is needed. Uses the same Gemini quota selection as auto."
+                "Omit NAME|INDEX to refresh quotas and select automatically; incomplete quota is excluded."
+            );
+            eprintln!(
+                "NAME is an exact profile label/email; INDEX is the current sagy list number."
+            );
+            eprintln!(
+                "Explicit selection uses that profile directly without auto quota filtering."
             );
             eprintln!("Waits until the app quits; closing its last window may leave it running.");
             eprintln!(

@@ -10,8 +10,8 @@
 
 ## 一、安装
 
-> 当前尚未发布 GitHub Release。在首个 release 产生之前，一键安装脚本和 `sagy update`
-> 无法下载二进制；目前请使用下方的源码编译方式。
+> 预编译安装包已在 [GitHub Releases](https://github.com/lauzhihao/sagy/releases/latest) 发布。
+> macOS/Linux 可重新执行下方安装命令更新原生启动器，已有账号会保留。
 
 ### Unix (macOS / Linux):
 
@@ -131,7 +131,7 @@ sagy-profile login personal@example.com
 
 `sagy-profile auto` 在启动前向每个账号查询原生 `/usage`。默认比较 Gemini 组，显式指定 `--model claude-sonnet-4-6` 或 GPT 模型时比较 Claude/GPT 组。每个账号以 5 小时和每周两个窗口中较低的剩余百分比参与排序，同分时轮换。查不到额度的账号作为备选，确认耗尽、正在冷却或所选模型组周额度低于 5% 的账号会被跳过；周额度恰好 5% 仍可选。用 `sagy use work@example.com` 可指定账号打开新实例，默认 Gemini 3.8 Flash (High) 和最高权限，不自动续接；也可追加 agy 参数。`sagy use 1` 按执行时本地快照的列表顺序打开第一个账号，序号从 1 开始；额度更新后排序可能改变，可先运行 `sagy list` 确认。纯数字参数优先作为序号，纯数字标签仍可用 `sagy run 标签` 启动。周额度门槛仅用于自动选号，`use` 允许手动指定低额度账号。用 `sagy-profile run work@example.com` 可原样启动某个账号，在第二个终端用 `sagy-profile run personal@example.com` 可同时使用另一个账号。`sagy-profile list` 列出本地标签。账号被撤销授权时，重新运行对应的 `login`。
 
-运行 `sagy desktop` 会使用同一套 Gemini 自动选号规则，选择后打开该账号的 Antigravity 桌面实例。桌面实例使用独立的私有 HOME 和窗口数据目录；登录凭据从 sagy 账号目录复制到桌面专用文件，桌面端刷新凭据不会覆盖 CLI 文件。该命令会一直前台运行并持有账号会话；请从 Antigravity 菜单退出应用后再结束终端命令。同一账号的 CLI agent 可并行运行；若该账号的 sagy 桌面实例已在运行，重复命令会提示并退出。桌面命令没有账号参数，也不会把普通 Antigravity 实例切换到该账号；已有的普通桌面实例和聊天记录保持独立。macOS 默认查找 `/Applications/Antigravity.app` 和 `~/Applications/Antigravity.app`；Linux 或自定义安装可设置 `SAGY_DESKTOP_BIN` 指向桌面应用的可执行文件。桌面仅在启动时自动选号，运行中不会因 429 重启或换号。当前需要用户验证实际桌面登录和 token 刷新行为。
+运行 `sagy desktop` 会先并行刷新所有账号的 Gemini 额度（每个账号最多等待 25 秒），更新快照后直接用本次查询结果按 auto 规则选号，再打开该账号的 Antigravity 桌面实例。本次未查到完整 5h 和 weekly 额度的账号会跳过；若所有账号均不符合条件则退出，不使用旧快照兜底。桌面实例使用独立的私有 HOME 和窗口数据目录；登录凭据从 sagy 账号目录复制到桌面专用文件，桌面端刷新凭据不会覆盖 CLI 文件。该命令会一直前台运行并持有账号会话；请从 Antigravity 菜单退出应用后再结束终端命令。同一账号的 CLI agent 可并行运行；若该账号的 sagy 桌面实例已在运行，重复命令会提示并退出。也可执行 `sagy desktop user@example.com` 或 `sagy desktop 1` 指定账号，序号与当前 `sagy list` 一致；手动指定时直接使用该账号，不走启动前自动刷新或额度筛选。此命令不会把普通 Antigravity 实例切换到该账号；已有的普通桌面实例和聊天记录保持独立。macOS 默认查找 `/Applications/Antigravity.app` 和 `~/Applications/Antigravity.app`；Linux 或自定义安装可设置 `SAGY_DESKTOP_BIN` 指向桌面应用的可执行文件。桌面仅在启动时自动选号，运行中不会因 429 重启或换号。当前需要用户验证实际桌面登录和 token 刷新行为。
 
 `sagy list` 只读取本地 `~/.local/share/sagy-profiles/quota.json` 中的 Gemini 额度快照，不发起网络查询。表格的 `Quota age` 显示采样距今多久；没有快照时显示 `--`。快照是 agy 最近报告的额度，在其他客户端使用账号或服务端数据尚未同步时可能滞后。查询失败时保留上次成功值及其原始时间。
 

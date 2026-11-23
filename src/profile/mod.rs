@@ -524,12 +524,13 @@ fn select(
     binary: &Binary,
     group: Option<&str>,
     attempted: &HashSet<String>,
+    strict_refresh: bool,
 ) -> Result<Option<Selected>> {
     let before = snapshot(root)?;
     let names = before
         .profiles
         .iter()
-        .filter(|n| !attempted.contains(*n) && !cooling(&before, n))
+        .filter(|n| !attempted.contains(*n) && (strict_refresh || !cooling(&before, n)))
         .cloned()
         .collect();
     let results = measurements(
@@ -538,10 +539,13 @@ fn select(
         names,
         Some(binary),
         group,
-        Duration::from_secs(8),
+        Duration::from_secs(if strict_refresh { 25 } else { 8 }),
     )?;
     if group == Some("gemini") {
         if let Err(error) = record_measurements(root, &before, &results) {
+            if strict_refresh {
+                return Err(error);
+            }
             note(format!("Could not update the quota snapshot: {error}"));
         }
     }
@@ -560,6 +564,8 @@ fn select(
         .filter_map(|name| {
             let data = results.get(&name)?;
             (data.status == "ready"
+                // 桌面不能运行中自动换号，必须确认本轮两个额度窗口均有效。
+                && (!strict_refresh || data.windows.iter().all(Option::is_some))
                 && data.score() != Some(0.)
                 && data.windows[1].is_none_or(|weekly| weekly >= 0.05)
                 && !cooling(&state, &name)
@@ -614,14 +620,37 @@ fn remember_selection(root: &Path, name: &str) -> Result<()> {
     store::write_state(root, &state)
 }
 
-fn launch_desktop(root: &Path, binary: &Binary) -> Result<i32> {
+fn launch_desktop(root: &Path, binary: &Binary, label: Option<String>) -> Result<i32> {
     let _signals = observer::SignalGuard::install()?;
-    // 桌面与 CLI 共用选号器；共享 lease 必须覆盖整个桌面进程生命周期。
-    let selected = select(root, binary, Some("gemini"), &HashSet::new())?;
+    // 手动选择与 use 一致，不用自动选号的额度阈值覆盖用户选择。
+    // 共享 lease 必须覆盖整个桌面进程生命周期。
+    let selected = if let Some(name) = label {
+        let _registry = store::lock_registry(root)?;
+        let state = store::read_state(root)?;
+        if !state.profiles.contains(&name) {
+            bail!("This profile has not completed login.");
+        }
+        let home = store::profile_home(root, &state, &name, false)?;
+        let lock = store::try_shared_lease(&home)?.ok_or_else(|| {
+            anyhow!("The selected profile is being managed; retry when that operation finishes.")
+        })?;
+        if !store::token_ready(&home)? {
+            bail!("The selected profile needs login again.");
+        }
+        Selected {
+            name,
+            home,
+            score: None,
+            _lease: lock,
+        }
+    } else {
+        // 复用并行查询并直接用本轮结果选号，避免 refresh 后再次查询造成双倍等待。
+        note("Refreshing quotas before desktop selection.");
+        select(root, binary, Some("gemini"), &HashSet::new(), true)?.ok_or_else(|| {
+            anyhow!("No eligible profile after quota refresh. Check unavailable quota, login, cooldowns, exhausted quota, or weekly quota below 5%.")
+        })?
+    };
     observer::check_interrupted()?;
-    let selected = selected.ok_or_else(|| {
-        anyhow!("No eligible profile. Check login, cooldowns, exhausted quota, or weekly quota below 5%.")
-    })?;
     remember_selection(root, &selected.name)?;
     note(format!(
         "Opening Antigravity with profile {}.",
@@ -652,7 +681,7 @@ fn auto(root: &Path, binary: &Binary, args: &[OsString]) -> Result<i32> {
     let mut attempted = HashSet::new();
     let mut selected = {
         let _signals = observer::SignalGuard::install()?;
-        let candidate = select(root, binary, group, &attempted)?;
+        let candidate = select(root, binary, group, &attempted, false)?;
         observer::check_interrupted()?;
         candidate.ok_or_else(|| anyhow!("No eligible idle profile. Check login, cooldowns, exhausted quota, or weekly quota below 5%."))?
     };
@@ -691,7 +720,7 @@ fn auto(root: &Path, binary: &Binary, args: &[OsString]) -> Result<i32> {
                     return Ok(false);
                 }
                 if allow_restart && quota::can_restart_interactive(args) {
-                    successor = match select(root, binary, group, &attempted) {
+                    successor = match select(root, binary, group, &attempted, false) {
                         Ok(candidate) => candidate,
                         Err(error) => {
                             note(format!(
@@ -789,14 +818,20 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
             repo_sync::run(&store::root_directory()?, action == "push", extra)
         }
         (Some("list"), []) => list(&store::root_directory()?),
-        (Some("desktop"), []) => {
+        (Some("desktop"), extra) => {
+            if extra.len() > 1 {
+                bail!(
+                    "desktop accepts at most one profile label or list index. Run sagy desktop --help."
+                );
+            }
+            let root = store::root_directory()?;
+            // 序号按用户看到的列表快照解析，不能先刷新改变排序。
+            let label = extra
+                .first()
+                .map(|label| use_name(&root, label))
+                .transpose()?;
             let binary = verify()?;
-            launch_desktop(&store::root_directory()?, &binary)
-        }
-        (Some("desktop"), _) => {
-            bail!(
-                "desktop does not accept an account or additional arguments. Run sagy desktop --help."
-            )
+            launch_desktop(&root, &binary, label)
         }
         (Some("refresh"), extra) => {
             let (strict, raw_name) = cli::refresh_options(extra)?;

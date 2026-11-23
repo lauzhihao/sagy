@@ -66,10 +66,12 @@ fn public_docs_match_authorized_user_and_degraded_selection_policy() {
 }
 
 #[test]
-fn installation_docs_do_not_present_unpublished_artifacts_as_available() {
-    assert!(README_EN.contains("No GitHub Release has been published yet"));
-    assert!(README_EN.contains("build from source"));
-    assert!(README_ZH.contains("尚未发布 GitHub Release"));
-    assert!(README_ZH.contains("源码编译"));
-    assert!(ARCHITECTURE.contains("No GitHub Release exists yet"));
+fn installation_docs_point_to_published_releases_and_preserve_source_instructions() {
+    for document in [README_EN, README_ZH, ARCHITECTURE] {
+        assert!(document.contains("https://github.com/lauzhihao/sagy/releases/latest"));
+    }
+    assert!(README_EN.contains("cargo build --release"));
+    assert!(README_ZH.contains("cargo build --release"));
+    assert!(!README_EN.contains("No GitHub Release has been published yet"));
+    assert!(!README_ZH.contains("尚未发布 GitHub Release"));
 }
