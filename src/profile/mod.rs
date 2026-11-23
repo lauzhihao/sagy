@@ -813,6 +813,20 @@ fn dispatch(args: &[OsString], shortcut: bool, verify: fn() -> Result<Binary>) -
         cli::print_root_help();
         return Ok(0);
     }
+    if matches!(action.to_str(), Some("update" | "upgrade")) {
+        use clap::Parser;
+
+        let arguments = std::iter::once(OsString::from("sagy")).chain(args.iter().cloned());
+        let parsed = match crate::cli::Cli::try_parse_from(arguments) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print()?;
+                return Ok(code);
+            }
+        };
+        return crate::cli::run(parsed);
+    }
     match (action.to_str(), rest) {
         (Some("push" | "pull"), extra) => {
             repo_sync::run(&store::root_directory()?, action == "push", extra)

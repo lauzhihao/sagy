@@ -30,6 +30,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "sagy refresh [--strict] [NAME]\nRefresh quota, including profiles with active sessions.",
     ),
     (
+        "update",
+        "sagy update [-f|--force]\nInstall the latest release; --force reinstalls the same version.",
+    ),
+    (
         "push",
         "sagy push [REPO] [options]\nPush encrypted native profiles.",
     ),
@@ -83,6 +87,11 @@ pub(super) fn print_root_help() {
 }
 
 fn print_command_help(command: &str) -> Option<i32> {
+    let command = if command == "upgrade" {
+        "update"
+    } else {
+        command
+    };
     if matches!(command, "push" | "pull") {
         return super::repo_sync::help(command == "push", &[OsString::from("--help")]);
     }
@@ -96,6 +105,12 @@ fn print_command_help(command: &str) -> Option<i32> {
         }
         if command == "refresh" {
             eprintln!("--strict exits nonzero if any requested quota probe is incomplete.");
+        }
+        if command == "update" {
+            eprintln!(
+                "-f, --force reinstalls the latest release when the version already matches."
+            );
+            eprintln!("Updates never downgrade the installed version.");
         }
         if command == "desktop" {
             eprintln!(
