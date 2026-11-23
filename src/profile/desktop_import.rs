@@ -130,6 +130,24 @@ impl Candidate {
 }
 
 impl Importer {
+    #[cfg(test)]
+    pub(super) fn with_test_verifier(
+        root: PathBuf,
+        token_path: PathBuf,
+        mut verify: impl FnMut(&str) -> Result<String> + Send + 'static,
+    ) -> Self {
+        Self {
+            root,
+            token_path,
+            verify: Box::new(move |access_token| {
+                let email = verify(access_token)?;
+                Ok(Identity {
+                    email: normalized_email(&email)?,
+                })
+            }),
+        }
+    }
+
     pub(super) fn new(root: PathBuf, token_path: PathBuf) -> Result<Self> {
         if !root.is_absolute() || !token_path.is_absolute() {
             bail!("Desktop account synchronization requires absolute paths.");
