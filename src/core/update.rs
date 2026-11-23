@@ -94,11 +94,6 @@ fn update_decision(remote: &str, current: &str, force: bool) -> Result<UpdateDec
 pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
     let executable_path =
         env::current_exe().context("failed to resolve current executable path")?;
-    // 源码安装的三个入口共用此文件，旧发布包可能没有原生订阅入口。
-    #[cfg(target_os = "macos")]
-    if executable_path.canonicalize()?.file_name() == Some(OsStr::new("sagy-profile")) {
-        bail!("Update this shared profile installation with scripts/install-profiles.sh.");
-    }
     let previous_version = env!("CARGO_PKG_VERSION").to_string();
     let asset = resolve_release_asset()?;
 
@@ -117,9 +112,7 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
     let binary = download_release_binary(&asset)?;
     let staged = stage_release_binary(state_dir, &binary)?;
 
-    self_replace::self_replace(&staged.binary)
-        .with_context(|| format!("failed to replace {}", executable_path.display()))?;
-    discard_staging_dir(&staged);
+    replace_staged_binary(&staged, &executable_path)?;
 
     Ok(UpdateOutcome {
         status: UpdateStatus::Updated,
@@ -127,6 +120,59 @@ pub fn self_update(state_dir: &Path, force: bool) -> Result<UpdateOutcome> {
         installed_version: asset.version,
         executable_path,
     })
+}
+
+#[cfg(unix)]
+fn replace_executable(staged_binary: &Path, executable_path: &Path) -> Result<()> {
+    // current_exe 在 macOS 上可能仍是相对目标的链接；完整解析后只替换实体文件，
+    // 不能把链接目标当作当前工作目录下的路径，也不能破坏调用方已有的命令别名。
+    let target = executable_path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", executable_path.display()))?;
+    let metadata =
+        fs::metadata(&target).with_context(|| format!("failed to stat {}", target.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "replacement target is not a regular file: {}",
+            target.display()
+        );
+    }
+    let parent = target
+        .parent()
+        .context("replacement target has no parent directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to stage replacement in {}", parent.display()))?;
+    let mut source = fs::File::open(staged_binary)
+        .with_context(|| format!("failed to open {}", staged_binary.display()))?;
+    std::io::copy(&mut source, temporary.as_file_mut())
+        .with_context(|| format!("failed to copy {}", staged_binary.display()))?;
+    // 保留原安装权限；同目录暂存保证即使下载目录在其它文件系统上也能原子替换。
+    temporary
+        .as_file()
+        .set_permissions(metadata.permissions())
+        .with_context(|| format!("failed to preserve permissions for {}", target.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync replacement for {}", target.display()))?;
+    temporary
+        .persist(&target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to publish replacement for {}", target.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn replace_executable(staged_binary: &Path, _executable_path: &Path) -> Result<()> {
+    self_replace::self_replace(staged_binary).context("failed to replace running executable")
+}
+
+fn replace_staged_binary(staged: &StagedBinary, executable_path: &Path) -> Result<()> {
+    let result = replace_executable(&staged.binary, executable_path)
+        .with_context(|| format!("failed to replace {}", executable_path.display()));
+    // 替换失败同样清理下载暂存，只返回原始替换错误，避免遗留可执行副本。
+    discard_staging_dir(staged);
+    result
 }
 
 /// 本次自更新创建的一次性 staging 目录及其中的二进制。
@@ -163,26 +209,32 @@ fn stage_release_binary(state_dir: &Path, binary: &[u8]) -> Result<StagedBinary>
     storage::create_secure_dir_all(&temp_root)?;
     let temp_dir = temp_root.join(format!("update-{}", Uuid::new_v4()));
     storage::create_secure_dir_all(&temp_dir)?;
-    let temp_binary = temp_dir.join(binary_filename_for_current_platform("sagy"));
-    fs::write(&temp_binary, binary)
-        .with_context(|| format!("failed to write {}", temp_binary.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(&temp_binary)
-            .with_context(|| format!("failed to stat {}", temp_binary.display()))?
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&temp_binary, permissions)
-            .with_context(|| format!("failed to chmod {}", temp_binary.display()))?;
-    }
-
-    Ok(StagedBinary {
+    let staged = StagedBinary {
+        binary: temp_dir.join(binary_filename_for_current_platform("sagy")),
         dir: temp_dir,
-        binary: temp_binary,
-    })
+    };
+    let result = (|| -> Result<()> {
+        fs::write(&staged.binary, binary)
+            .with_context(|| format!("failed to write {}", staged.binary.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&staged.binary)
+                .with_context(|| format!("failed to stat {}", staged.binary.display()))?
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&staged.binary, permissions)
+                .with_context(|| format!("failed to chmod {}", staged.binary.display()))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        discard_staging_dir(&staged);
+        return Err(error);
+    }
+    Ok(staged)
 }
 
 fn resolve_release_asset() -> Result<ReleaseAsset> {
@@ -755,6 +807,218 @@ mod tests {
 
         // 目录已经不在时再删一次不得报警：清理是幂等的。
         discard_staging_dir(&mine);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_replacement_resolves_relative_alias_chains_and_preserves_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let root = tempfile::TempDir::new().expect("fixture");
+        let bin_dir = root.path().join("bin");
+        let other_cwd = root.path().join("another-cwd");
+        fs::create_dir(&bin_dir).expect("binary directory");
+        fs::create_dir(&other_cwd).expect("other working directory");
+        let physical = bin_dir.join("sagy-profile");
+        let alias = bin_dir.join("sagy");
+        let bridge = bin_dir.join("bridge");
+        let source = root.path().join("verified-download");
+        fs::write(&physical, b"old executable").expect("old executable");
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o751)).expect("mode");
+        fs::write(&source, b"verified replacement").expect("replacement");
+        symlink("bridge", &alias).expect("relative entry alias");
+        symlink("sagy-profile", &bridge).expect("relative intermediate alias");
+        let old_inode = fs::metadata(&physical).expect("old metadata").ino();
+        let alias_inode = fs::symlink_metadata(&alias).expect("alias metadata").ino();
+        let mut old_file = fs::File::open(&physical).expect("open original");
+
+        // 从与安装位置无关的路径进入，所有相对链接仍以各自所在目录解析。
+        replace_executable(&source, &other_cwd.join("../bin/sagy")).expect("replace aliases");
+
+        assert_eq!(
+            fs::read(&physical).expect("new executable"),
+            b"verified replacement"
+        );
+        let metadata = fs::metadata(&physical).expect("new metadata");
+        assert_ne!(
+            metadata.ino(),
+            old_inode,
+            "replacement must publish a new inode"
+        );
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o751);
+        let mut original_bytes = Vec::new();
+        old_file
+            .read_to_end(&mut original_bytes)
+            .expect("read open original");
+        assert_eq!(
+            original_bytes, b"old executable",
+            "the original file was overwritten in place"
+        );
+        assert_eq!(
+            fs::read_link(&alias).expect("entry alias"),
+            Path::new("bridge")
+        );
+        assert_eq!(
+            fs::read_link(&bridge).expect("intermediate alias"),
+            Path::new("sagy-profile")
+        );
+        assert_eq!(
+            fs::symlink_metadata(&alias).expect("alias preserved").ino(),
+            alias_inode
+        );
+        assert_eq!(
+            fs::read(&alias).expect("alias reads replacement"),
+            b"verified replacement"
+        );
+        assert_eq!(fs::read_dir(&bin_dir).expect("binary entries").count(), 3);
+        assert_eq!(
+            fs::read_dir(&other_cwd)
+                .expect("working directory entries")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_copy_failure_leaves_original_and_aliases_without_temporary_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::TempDir::new().expect("fixture");
+        let bin_dir = root.path().join("bin");
+        fs::create_dir(&bin_dir).expect("binary directory");
+        let physical = bin_dir.join("sagy");
+        let alias = bin_dir.join("alias");
+        fs::write(&physical, b"keep original").expect("original");
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o711)).expect("mode");
+        symlink("sagy", &alias).expect("entry alias");
+        let directory_source = root.path().join("not-a-binary");
+        fs::create_dir(&directory_source).expect("directory source");
+
+        for source in [root.path().join("missing-source"), directory_source] {
+            assert!(replace_executable(&source, &alias).is_err());
+            assert_eq!(
+                fs::read(&physical).expect("original preserved"),
+                b"keep original"
+            );
+            assert_eq!(
+                fs::metadata(&physical)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o711
+            );
+            assert_eq!(
+                fs::read_link(&alias).expect("alias preserved"),
+                Path::new("sagy")
+            );
+            assert_eq!(fs::read_dir(&bin_dir).expect("binary entries").count(), 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_replacement_rejects_directory_targets_without_writing_them() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().expect("fixture");
+        let target = root.path().join("directory-target");
+        let alias = root.path().join("sagy");
+        let source = root.path().join("verified-download");
+        fs::create_dir(&target).expect("target directory");
+        fs::write(target.join("keep"), b"untouched").expect("sentinel");
+        fs::write(&source, b"verified replacement").expect("source");
+        symlink("directory-target", &alias).expect("directory alias");
+
+        let error = replace_executable(&source, &alias).expect_err("directory rejected");
+        assert!(format!("{error:#}").contains("replacement target is not a regular file"));
+        assert_eq!(
+            fs::read(target.join("keep")).expect("sentinel retained"),
+            b"untouched"
+        );
+        assert_eq!(
+            fs::read_link(&alias).expect("alias retained"),
+            Path::new("directory-target")
+        );
+        assert_eq!(fs::read_dir(&target).expect("target entries").count(), 1);
+        assert_eq!(
+            fs::read_dir(root.path()).expect("fixture entries").count(),
+            3
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_replacement_cleans_only_its_download_staging_directory() {
+        let state_dir = tempfile::TempDir::new().expect("state dir");
+        let mine = stage_release_binary(state_dir.path(), b"replacement").expect("stage mine");
+        let other = stage_release_binary(state_dir.path(), b"other").expect("stage other");
+        let target_dir = tempfile::TempDir::new().expect("installation");
+        let target = target_dir.path().join("sagy");
+        fs::write(&target, b"old executable").expect("original");
+
+        replace_staged_binary(&mine, &target).expect("install staged binary");
+
+        assert_eq!(fs::read(&target).expect("new executable"), b"replacement");
+        assert!(!mine.dir.exists());
+        assert_eq!(
+            fs::read(&other.binary).expect("other download retained"),
+            b"other"
+        );
+        assert_eq!(
+            fs::read_dir(target_dir.path())
+                .expect("installation entries")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_replacement_preserves_its_error_and_cleans_only_its_download_staging() {
+        let state_dir = tempfile::TempDir::new().expect("state dir");
+        let mine = stage_release_binary(state_dir.path(), b"replacement").expect("stage mine");
+        let other = stage_release_binary(state_dir.path(), b"other").expect("stage other");
+        let bystander = storage::tmp_dir(state_dir.path()).join("keep");
+        fs::write(&bystander, b"unrelated").expect("bystander");
+        let target_dir = tempfile::TempDir::new().expect("installation");
+        let target = target_dir.path().join("sagy");
+        fs::write(&target, b"keep original").expect("original");
+        fs::remove_file(&mine.binary).expect("simulate unreadable staged download");
+
+        let error = replace_staged_binary(&mine, &target).expect_err("missing source rejected");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("failed to replace"), "{rendered}");
+        assert!(rendered.contains("failed to open"), "{rendered}");
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .expect("original IO error")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!mine.dir.exists());
+        assert_eq!(
+            fs::read(&other.binary).expect("other download retained"),
+            b"other"
+        );
+        assert_eq!(
+            fs::read(&bystander).expect("bystander retained"),
+            b"unrelated"
+        );
+        assert_eq!(
+            fs::read(&target).expect("original retained"),
+            b"keep original"
+        );
+        assert_eq!(
+            fs::read_dir(target_dir.path())
+                .expect("installation entries")
+                .count(),
+            1
+        );
     }
 
     #[test]
