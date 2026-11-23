@@ -142,6 +142,19 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_EXIT_CODE"):
     }
 
     fn prepare_profiles(&self, quotas: &[(&str, f64, f64)]) {
+        // 首次导入由注入合成源的 unit tests 覆盖，integration 不读取真实 HOME。
+        let desktop_home = self.root.join("desktop-home");
+        fs::create_dir(&desktop_home).unwrap();
+        fs::set_permissions(&desktop_home, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(desktop_home.join(".gemini")).unwrap();
+        fs::set_permissions(
+            desktop_home.join(".gemini"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let marker = desktop_home.join(".sagy-desktop-history-v1");
+        fs::write(&marker, b"sagy desktop history v1\n").unwrap();
+        fs::set_permissions(marker, fs::Permissions::from_mode(0o600)).unwrap();
         let mut names = Vec::new();
         for (name, _, _) in quotas {
             self.add_profile(name);
@@ -214,8 +227,8 @@ if os.environ.get("SAGY_FIXTURE_DESKTOP_EXIT_CODE"):
         self.root.join("profiles").join(name).join("home")
     }
 
-    fn desktop_capture(&self, name: &str) -> serde_json::Value {
-        let desktop_home = self.root.join("profiles").join(name).join("desktop-home");
+    fn desktop_capture(&self, _name: &str) -> serde_json::Value {
+        let desktop_home = self.root.join("desktop-home");
         serde_json::from_slice(&fs::read(desktop_home.join("fixture-capture.json")).unwrap())
             .unwrap()
     }
@@ -289,7 +302,7 @@ fn desktop_uses_auto_quota_policy_and_copies_token_into_an_isolated_home() {
     let capture = fixture.desktop_capture("z-best");
     let desktop_home = fixture
         .root
-        .join("profiles/z-best/desktop-home")
+        .join("desktop-home")
         .to_string_lossy()
         .into_owned();
     assert_eq!(capture["home"], desktop_home);
@@ -363,16 +376,16 @@ fn desktop_inherits_a_configured_proxy_and_help_and_invalid_args_have_no_side_ef
 fn desktop_holds_profile_lease_allows_cli_run_and_releases_locks_on_exit() {
     let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
     let fixture = Fixture::new();
-    fixture.prepare_profiles(&[("one", 0.9, 0.9)]);
-    let usage_map = r#"{"one":[0.9,0.9]}"#;
+    fixture.prepare_profiles(&[("one", 0.9, 0.9), ("two", 0.8, 0.8)]);
+    let usage_map = r#"{"one":[0.9,0.9],"two":[0.8,0.8]}"#;
     let child = fixture
-        .command(&["desktop"], usage_map, None)
+        .command(&["desktop", "one"], usage_map, None)
         .env("SAGY_FIXTURE_DESKTOP_WAIT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let desktop_home = fixture.root.join("profiles/one/desktop-home");
+    let desktop_home = fixture.root.join("desktop-home");
     let ready = desktop_home.join("fixture-ready");
     let release = desktop_home.join("fixture-release");
     let mut desktop = RunningDesktop { child, release };
@@ -401,7 +414,7 @@ fn desktop_holds_profile_lease_allows_cli_run_and_releases_locks_on_exit() {
     assert!(!remove.status.success());
     assert!(String::from_utf8_lossy(&remove.stderr).contains("busy"));
 
-    let second = fixture.invoke(&["desktop"], usage_map, None);
+    let second = fixture.invoke(&["desktop", "two"], usage_map, None);
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains("desktop instance running"));
     assert_eq!(
@@ -607,5 +620,52 @@ fn desktop_rejects_unknown_profiles_and_invalid_indices_without_launching() {
         assert!(!output.status.success(), "{argument}");
         assert!(!fixture.root.join("profiles/one/desktop-home").exists());
         assert!(!fixture._temp.path().join("probes.log").exists());
+    }
+}
+
+#[test]
+fn switching_desktop_accounts_preserves_the_shared_history_and_replaces_only_the_token() {
+    let _guard = DESKTOP_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new();
+    fixture.prepare_profiles(&[("first", 0.9, 0.9), ("second", 0.8, 0.8)]);
+    let history = fixture
+        .root
+        .join("desktop-home/.gemini/antigravity/conversations");
+    fs::create_dir_all(&history).unwrap();
+    fs::write(history.join("synthetic.pb"), b"synthetic conversation").unwrap();
+    for name in ["first", "second"] {
+        let output = fixture.invoke(
+            &["desktop", name],
+            r#"{"first":[0.9,0.9],"second":[0.8,0.8]}"#,
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let capture = fixture.desktop_capture(name);
+        assert_eq!(
+            capture["home"],
+            fixture.root.join("desktop-home").to_string_lossy().as_ref()
+        );
+        assert!(
+            capture["token"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("synthetic-refresh-{name}"))
+        );
+        assert_eq!(
+            fs::read(history.join("synthetic.pb")).unwrap(),
+            b"synthetic conversation"
+        );
+        assert!(
+            !fixture
+                .root
+                .join("profiles")
+                .join(name)
+                .join("desktop-home")
+                .exists()
+        );
     }
 }

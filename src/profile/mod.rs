@@ -2,6 +2,7 @@
 mod cache;
 mod cli;
 mod desktop;
+mod desktop_history;
 mod observer;
 mod quota;
 mod remove;
@@ -656,7 +657,7 @@ fn launch_desktop(root: &Path, binary: &Binary, label: Option<String>) -> Result
         "Opening Antigravity with profile {}.",
         selected.name
     ));
-    let code = desktop::launch(&selected.home)?;
+    let code = desktop::launch(root, &selected.home)?;
     // 退出刷新会安装自己的 signal guard，先释放会话 guard，避免重入同一把锁。
     drop(_signals);
     refresh_after_exit(root, binary, &selected.name, &selected.home, code);

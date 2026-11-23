@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 
-use super::{observer, runtime, store};
+use super::{desktop_history, observer, runtime, store};
 use crate::core::credential::StrictValue;
 
 const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
@@ -136,7 +136,15 @@ struct Prepared {
     _lock: File,
 }
 
-fn prepare(profile_home: &Path) -> Result<Prepared> {
+fn prepare(root: &Path, profile_home: &Path) -> Result<Prepared> {
+    prepare_with(root, profile_home, || desktop_history::initialize(root))
+}
+
+fn prepare_with(
+    root: &Path,
+    profile_home: &Path,
+    initialize: impl FnOnce() -> Result<PathBuf>,
+) -> Result<Prepared> {
     if !profile_home.is_absolute() {
         bail!("The selected profile home must be absolute.");
     }
@@ -144,19 +152,22 @@ fn prepare(profile_home: &Path) -> Result<Prepared> {
         .parent()
         .context("The selected profile has no directory.")?;
     store::check_private_dir(profile)?;
-    let lock = store::open_private_file(&profile.join(".desktop.lock"), true)?;
+    store::check_private_dir(root)?;
+    let lock = store::open_private_file(&root.join(".desktop.lock"), true)?;
     match lock.try_lock_exclusive() {
         Ok(()) => (),
         Err(error)
             if error.kind() == fs2::lock_contended_error().kind()
                 || error.kind() == io::ErrorKind::WouldBlock =>
         {
-            bail!("The selected profile already has a sagy desktop instance running.");
+            bail!(
+                "There is already a sagy desktop instance running. Quit it before switching accounts."
+            );
         }
         Err(error) => return Err(error).context("Could not lock the desktop profile."),
     }
     let bytes = read_token(profile_home)?;
-    let home = profile.join("desktop-home");
+    let home = initialize()?;
     for path in [
         home.clone(),
         home.join(".gemini"),
@@ -330,10 +341,10 @@ fn wait_for_desktop(
     result
 }
 
-pub(super) fn launch(profile_home: &Path) -> Result<i32> {
+pub(super) fn launch(root: &Path, profile_home: &Path) -> Result<i32> {
     let binary = resolve_binary()?;
     observer::check_interrupted()?;
-    let prepared = prepare(profile_home)?;
+    let prepared = prepare(root, profile_home)?;
     let mut command = desktop_command(&binary, &prepared)?;
     observer::check_interrupted()?;
     let child = command
@@ -369,11 +380,17 @@ mod tests {
         home
     }
 
+    fn test_prepare(root: &Path, home: &Path) -> Result<Prepared> {
+        prepare_with(root, home, || {
+            desktop_history::initialize_from(root, &root.join("absent-source"), || Ok(()))
+        })
+    }
+
     #[test]
     fn credentials_are_copied_byte_for_byte_to_the_desktop_root_and_kept_private() {
         let temp = tempfile::tempdir().unwrap();
         let home = profile(temp.path());
-        let prepared = prepare(&home).unwrap();
+        let prepared = test_prepare(temp.path(), &home).unwrap();
         let target = prepared.home.join(TOKEN_TARGET);
         assert_eq!(fs::read(&target).unwrap(), SYNTHETIC_TOKEN);
         assert_eq!(fs::read(home.join(TOKEN_SOURCE)).unwrap(), SYNTHETIC_TOKEN);
@@ -400,17 +417,17 @@ mod tests {
     fn an_active_desktop_lock_prevents_overwriting_its_refreshed_credentials() {
         let temp = tempfile::tempdir().unwrap();
         let home = profile(temp.path());
-        let first = prepare(&home).unwrap();
+        let first = test_prepare(temp.path(), &home).unwrap();
         let target = first.home.join(TOKEN_TARGET);
         fs::write(&target, b"desktop-refreshed-synthetic-token").unwrap();
-        let error = prepare(&home).err().unwrap().to_string();
-        assert!(error.contains("already has a sagy desktop"));
+        let error = test_prepare(temp.path(), &home).err().unwrap().to_string();
+        assert!(error.contains("already a sagy desktop"));
         assert_eq!(
             fs::read(&target).unwrap(),
             b"desktop-refreshed-synthetic-token"
         );
         drop(first);
-        let second = prepare(&home).unwrap();
+        let second = test_prepare(temp.path(), &home).unwrap();
         assert_eq!(
             fs::read(second.home.join(TOKEN_TARGET)).unwrap(),
             SYNTHETIC_TOKEN
@@ -425,10 +442,10 @@ mod tests {
         let original = home.join(".gemini/original-token");
         fs::rename(&source, &original).unwrap();
         symlink(&original, &source).unwrap();
-        assert!(prepare(&home).is_err());
+        assert!(test_prepare(temp.path(), &home).is_err());
         fs::remove_file(&source).unwrap();
         fs::hard_link(&original, &source).unwrap();
-        assert!(prepare(&home).is_err());
+        assert!(test_prepare(temp.path(), &home).is_err());
         fs::remove_file(&source).unwrap();
         fs::rename(&original, &source).unwrap();
         for invalid in [
@@ -438,32 +455,32 @@ mod tests {
             b"not-json",
         ] {
             fs::write(&source, invalid).unwrap();
-            assert!(prepare(&home).is_err());
-            assert!(!home.parent().unwrap().join("desktop-home").exists());
+            assert!(test_prepare(temp.path(), &home).is_err());
+            assert!(!temp.path().join("desktop-home").exists());
         }
         fs::write(&source, vec![b' '; MAX_TOKEN_BYTES as usize + 1]).unwrap();
-        assert!(prepare(&home).is_err());
-        assert!(!home.parent().unwrap().join("desktop-home").exists());
+        assert!(test_prepare(temp.path(), &home).is_err());
+        assert!(!temp.path().join("desktop-home").exists());
     }
 
     #[test]
     fn target_links_and_shared_directory_permissions_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let home = profile(temp.path());
-        let prepared = prepare(&home).unwrap();
+        let prepared = test_prepare(temp.path(), &home).unwrap();
         let target = prepared.home.join(TOKEN_TARGET);
         let desktop_home = prepared.home.clone();
         drop(prepared);
         fs::remove_file(&target).unwrap();
         symlink(home.join(TOKEN_SOURCE), &target).unwrap();
-        assert!(prepare(&home).is_err());
+        assert!(test_prepare(temp.path(), &home).is_err());
         assert_eq!(fs::read(home.join(TOKEN_SOURCE)).unwrap(), SYNTHETIC_TOKEN);
         fs::remove_file(&target).unwrap();
         fs::hard_link(home.join(TOKEN_SOURCE), &target).unwrap();
-        assert!(prepare(&home).is_err());
+        assert!(test_prepare(temp.path(), &home).is_err());
         fs::remove_file(&target).unwrap();
         fs::set_permissions(&desktop_home, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(prepare(&home).is_err());
+        assert!(test_prepare(temp.path(), &home).is_err());
     }
 
     #[test]
@@ -471,7 +488,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("a 'quoted' root");
         let home = profile(&root);
-        let prepared = prepare(&home).unwrap();
+        let prepared = test_prepare(&root, &home).unwrap();
         let output = Command::new(prepared.home.join(".desktop-shell"))
             .args(["-ilc", "/usr/bin/env"])
             .env("HOME", "/unrelated/home")
@@ -506,7 +523,7 @@ mod tests {
     fn desktop_command_uses_its_own_user_data_and_discards_engine_overrides() {
         let temp = tempfile::tempdir().unwrap();
         let home = profile(temp.path());
-        let prepared = prepare(&home).unwrap();
+        let prepared = test_prepare(temp.path(), &home).unwrap();
         let binary = runtime::Binary::from_path(PathBuf::from("/bin/sh")).unwrap();
         let command = desktop_command(&binary, &prepared).unwrap();
         assert_eq!(command.get_program(), OsStr::new("/bin/sh"));
